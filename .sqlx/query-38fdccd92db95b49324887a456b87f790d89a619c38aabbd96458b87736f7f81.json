@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            insert into underway.task_schedule (\n              name,\n              schedule,\n              timezone,\n              input\n            ) values ($1, $2, $3, $4)\n            on conflict (name) do update\n            set \n              schedule = excluded.schedule,\n              timezone = excluded.timezone,\n              input = excluded.input\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "38fdccd92db95b49324887a456b87f790d89a619c38aabbd96458b87736f7f81"
+}

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            insert into underway.task_queue (name) values ($1)\n            on conflict do nothing\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f3388664b9d07ca787a450e25b7559c92d8b2ed917ff8313ab75fa411f23ffe2"
+}

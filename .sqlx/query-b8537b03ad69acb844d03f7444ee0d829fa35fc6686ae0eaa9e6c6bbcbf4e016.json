@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            update underway.task\n            set state = $2,\n                succeeded_at = now(),\n                updated_at = now()\n            where id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        {
+          "Custom": {
+            "name": "underway.task_state",
+            "kind": {
+              "Enum": [
+                "pending",
+                "in_progress",
+                "succeeded",
+                "cancelled",
+                "failed"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b8537b03ad69acb844d03f7444ee0d829fa35fc6686ae0eaa9e6c6bbcbf4e016"
+}
