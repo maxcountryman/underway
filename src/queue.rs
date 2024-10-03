@@ -3,8 +3,8 @@ use std::marker::PhantomData;
 use builder_states::{Initial, NameSet, PoolSet};
 use chrono_tz::Tz;
 use cron::Schedule;
+use jiff::Zoned;
 use sqlx::{postgres::types::PgInterval, Acquire, PgExecutor, PgPool, Postgres};
-use time::OffsetDateTime;
 use tracing::instrument;
 use ulid::Ulid;
 use uuid::Uuid;
@@ -48,6 +48,10 @@ impl<T: Task> Clone for Queue<T> {
         }
     }
 }
+
+#[derive(sqlx::Type)]
+#[sqlx(transparent)]
+struct Timestamp(i64);
 
 impl<T: Task> Queue<T> {
     pub async fn create<'a, E>(executor: E, name: impl Into<String>) -> Result
@@ -104,8 +108,8 @@ impl<T: Task> Queue<T> {
             id,
             self.name,
             input_value,
-            timeout as _,
-            available_at,
+            std::time::Duration::try_from(timeout).unwrap() as _,
+            crate::timestamp::Timestamp(available_at.timestamp()) as _,
             retry_policy.max_attempts,
             retry_policy.initial_interval_ms,
             retry_policy.max_interval_ms,
@@ -310,11 +314,12 @@ impl<T: Task> Queue<T> {
         executor: E,
         task_id: TaskId,
         retry_count: i32,
-        next_available_at: OffsetDateTime,
+        next_available_at: Zoned,
     ) -> Result
     where
         E: PgExecutor<'a>,
     {
+        let next_available_at = next_available_at.timestamp();
         let result = sqlx::query!(
             r#"
             update underway.task
@@ -325,7 +330,7 @@ impl<T: Task> Queue<T> {
             where id = $3
             "#,
             retry_count,
-            next_available_at,
+            crate::timestamp::Timestamp(next_available_at) as _,
             task_id,
             TaskState::Pending as _
         )

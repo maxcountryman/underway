@@ -1,7 +1,7 @@
 use std::future::Future;
 
+use jiff::{tz::TimeZone, Span, Timestamp, Zoned};
 use serde::{de::DeserializeOwned, Serialize};
-use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 use crate::queue::TaskRow;
@@ -168,12 +168,12 @@ pub trait Task: Send + 'static {
     ///
     /// The default expiration is set to 15 minutes. Override this if your tasks
     /// need to have shorter or longer timeouts.
-    fn timeout(&self) -> Duration {
-        Duration::minutes(15)
+    fn timeout(&self) -> Span {
+        Span::new().minutes(15)
     }
 
-    fn available_at(&self) -> OffsetDateTime {
-        OffsetDateTime::now_utc()
+    fn available_at(&self) -> Zoned {
+        Timestamp::now().to_zoned(TimeZone::UTC)
     }
 
     /// Provides an optional concurrency key for the task.
@@ -268,10 +268,11 @@ pub struct RetryPolicy {
 }
 
 impl RetryPolicy {
-    pub fn calculate_delay(&self, retry_count: i32) -> i32 {
-        let delay =
-            (self.initial_interval_ms as f32) * self.backoff_coefficient.powi(retry_count - 1);
-        delay.min(self.max_interval_ms as f32) as i32
+    pub fn calculate_delay(&self, retry_count: i32) -> Span {
+        let base_delay = self.initial_interval_ms as f32;
+        let backoff_delay = base_delay * self.backoff_coefficient.powi(retry_count - 1);
+        let delay = backoff_delay.min(self.max_interval_ms as f32);
+        Span::new().milliseconds(delay as i64)
     }
 }
 

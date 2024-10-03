@@ -3,9 +3,9 @@ use std::{future::Future, marker::PhantomData, pin::Pin, sync::Arc};
 use builder_states::{ExecutorSet, Initial, QueueSet};
 use chrono_tz::Tz;
 use cron::Schedule;
+use jiff::{tz::TimeZone, Span, Zoned};
 use serde::{de::DeserializeOwned, Serialize};
 use sqlx::PgExecutor;
-use time::{Duration, OffsetDateTime};
 
 use crate::{
     queue::{Error as QueueError, Queue},
@@ -43,8 +43,8 @@ where
     pub(crate) queue: Queue<Self>,
     execute_fn: ExecuteFn<I>,
     retry_policy: RetryPolicy,
-    timeout: Duration,
-    available_at: OffsetDateTime,
+    timeout: Span,
+    available_at: Zoned,
     concurrency_key: Option<String>,
     priority: i32,
 }
@@ -162,8 +162,8 @@ where
 {
     state: S,
     retry_policy: RetryPolicy,
-    timeout: Duration,
-    available_at: OffsetDateTime,
+    timeout: Span,
+    available_at: Zoned,
     concurrency_key: Option<String>,
     priority: i32,
     _marker: PhantomData<I>,
@@ -178,12 +178,12 @@ where
         self
     }
 
-    pub fn timeout(mut self, timeout: Duration) -> Self {
+    pub fn timeout(mut self, timeout: Span) -> Self {
         self.timeout = timeout;
         self
     }
 
-    pub fn available_at(mut self, available_at: OffsetDateTime) -> Self {
+    pub fn available_at(mut self, available_at: Zoned) -> Self {
         self.available_at = available_at;
         self
     }
@@ -208,8 +208,8 @@ where
         JobBuilder::<I, _> {
             state: QueueSet { queue },
             retry_policy: RetryPolicy::default(),
-            timeout: Duration::minutes(15),
-            available_at: OffsetDateTime::now_utc(),
+            timeout: Span::new().minutes(15),
+            available_at: Zoned::now().with_time_zone(TimeZone::UTC),
             concurrency_key: None,
             priority: 0,
             _marker: PhantomData,
@@ -276,12 +276,12 @@ where
         self.retry_policy.clone()
     }
 
-    fn timeout(&self) -> Duration {
+    fn timeout(&self) -> Span {
         self.timeout
     }
 
-    fn available_at(&self) -> OffsetDateTime {
-        self.available_at
+    fn available_at(&self) -> Zoned {
+        self.available_at.clone()
     }
 
     fn concurrency_key(&self) -> Option<String> {

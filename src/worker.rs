@@ -1,7 +1,7 @@
 use chrono::Utc;
+use jiff::{tz::TimeZone, Span, Zoned};
 use serde::{de::DeserializeOwned, Serialize};
 use sqlx::{postgres::types::PgInterval, PgConnection};
-use time::{Duration, OffsetDateTime};
 use tracing::instrument;
 
 use crate::{
@@ -113,7 +113,7 @@ impl<T: Task> Worker<T> {
 
             let input: T::Input = serde_json::from_value(task_row.input.clone())?;
 
-            let timeout = pg_interval_to_time_duration(&task_row.timeout)
+            let timeout = pg_interval_to_span(&task_row.timeout)
                 .try_into()
                 .expect("Task timeout should be compatible with std::time");
 
@@ -219,8 +219,10 @@ impl<T: Task> Worker<T> {
     ) -> Result {
         tracing::info!("Retry policy available, scheduling retry");
 
-        let delay_ms = retry_policy.calculate_delay(retry_count);
-        let next_available_at = OffsetDateTime::now_utc() + Duration::milliseconds(delay_ms as i64);
+        let delay = retry_policy.calculate_delay(retry_count);
+        let next_available_at = Zoned::now()
+            .with_time_zone(TimeZone::UTC)
+            .saturating_add(delay);
 
         self.queue
             .reschedule_task_for_retry(&mut *conn, task_id, retry_count, next_available_at)
@@ -244,11 +246,9 @@ impl<T: Task> Worker<T> {
     }
 }
 
-fn pg_interval_to_time_duration(pg_interval: &PgInterval) -> Duration {
-    const DAYS_IN_MONTH: i64 = 30; // Approximation for converting months to days
-
-    let total_days = (pg_interval.months as i64 * DAYS_IN_MONTH) + pg_interval.days as i64;
-    let microseconds = pg_interval.microseconds;
-
-    Duration::days(total_days) + Duration::microseconds(microseconds)
+fn pg_interval_to_span(pg_interval: &PgInterval) -> Span {
+    Span::new()
+        .months(pg_interval.months)
+        .days(pg_interval.days)
+        .microseconds(pg_interval.microseconds)
 }

@@ -415,8 +415,8 @@ pub use crate::{
 
 pub mod job;
 pub mod queue;
-pub mod schedule;
 pub mod task;
+mod timestamp;
 pub mod worker;
 
 pub static MIGRATOR: Migrator = sqlx::migrate!();

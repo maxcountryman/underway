@@ -4,6 +4,8 @@ use chrono_tz::UTC;
 use sqlx::PgPool;
 use underway::{JobBuilder, QueueBuilder};
 
+const QUEUE_NAME: &str = "hello-world";
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Set up the database connection pool.
@@ -15,7 +17,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create the task queue.
     let queue = QueueBuilder::new()
-        .name("example_queue")
+        .name(QUEUE_NAME)
         .pool(pool)
         .build()
         .await?;
