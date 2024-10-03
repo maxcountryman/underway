@@ -1,7 +1,6 @@
 use std::{future::Future, marker::PhantomData, pin::Pin, sync::Arc};
 
 use builder_states::{ExecutorSet, Initial, QueueSet};
-use chrono_tz::Tz;
 use cron::Schedule;
 use jiff::{tz::TimeZone, Span, Zoned};
 use serde::{de::DeserializeOwned, Serialize};
@@ -24,9 +23,12 @@ pub enum Error {
     #[error(transparent)]
     Database(#[from] sqlx::Error),
 
-    /// Error return from queue operations.
+    /// Error returned from queue operations.
     #[error(transparent)]
     Queue(#[from] QueueError),
+
+    #[error("For now, time zones must be specified as IANA-compatible.")]
+    IANANameRequired,
 
     /// Custom error that accepts any string. This allows for more flexible
     /// error reporting.
@@ -81,7 +83,7 @@ where
         &self,
         executor: E,
         schedule: Schedule,
-        timezone: Tz,
+        timezone: TimeZone,
         input: <Job<I> as Task>::Input,
     ) -> Result
     where
@@ -97,7 +99,7 @@ where
     pub async fn schedule(
         &self,
         schedule: Schedule,
-        timezone: Tz,
+        timezone: TimeZone,
         input: <Job<I> as Task>::Input,
     ) -> Result {
         let mut conn = self.queue.pool.acquire().await?;

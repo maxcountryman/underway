@@ -1,15 +1,17 @@
 use std::marker::PhantomData;
 
 use builder_states::{Initial, NameSet, PoolSet};
-use chrono_tz::Tz;
 use cron::Schedule;
-use jiff::Zoned;
+use jiff::{tz::TimeZone, Zoned};
 use sqlx::{postgres::types::PgInterval, Acquire, PgExecutor, PgPool, Postgres};
 use tracing::instrument;
 use ulid::Ulid;
 use uuid::Uuid;
 
-use crate::task::{Id as TaskId, State as TaskState, Task};
+use crate::{
+    task::{Id as TaskId, State as TaskState, Task},
+    timestamp,
+};
 
 type Result<T = ()> = std::result::Result<T, Error>;
 
@@ -27,8 +29,14 @@ pub enum Error {
     #[error(transparent)]
     Cron(#[from] cron::error::Error),
 
+    #[error(transparent)]
+    Jiff(#[from] jiff::Error),
+
     #[error("Task with ID {0} not found.")]
     TaskNotFound(Uuid),
+
+    #[error("For now a time zone with an IANA name is required.")]
+    IncompatibleTimeZone,
 }
 
 pub struct Queue<T: Task> {
@@ -108,8 +116,8 @@ impl<T: Task> Queue<T> {
             id,
             self.name,
             input_value,
-            std::time::Duration::try_from(timeout).unwrap() as _,
-            crate::timestamp::Timestamp(available_at.timestamp()) as _,
+            std::time::Duration::try_from(timeout)? as _,
+            timestamp::Timestamp(available_at.timestamp()) as _,
             retry_policy.max_attempts,
             retry_policy.initial_interval_ms,
             retry_policy.max_interval_ms,
@@ -174,7 +182,7 @@ impl<T: Task> Queue<T> {
         &self,
         executor: E,
         schedule: Schedule,
-        timezone: Tz,
+        timezone: TimeZone,
         input: T::Input,
     ) -> Result
     where
@@ -182,7 +190,11 @@ impl<T: Task> Queue<T> {
     {
         let input_value = serde_json::to_value(&input)?;
         let schedule = schedule.to_string();
-        let timezone = serde_json::to_string(&timezone)?;
+
+        // TODO: Unclear if this will be addressed upstream or not.
+        //
+        // This is also needed until `cron` is updated or replaced.
+        let tz_iana_name = timezone.iana_name().ok_or(Error::IncompatibleTimeZone)?;
 
         sqlx::query!(
             r#"
@@ -200,7 +212,7 @@ impl<T: Task> Queue<T> {
             "#,
             self.name,
             schedule,
-            timezone,
+            tz_iana_name,
             input_value
         )
         .execute(executor)
@@ -210,7 +222,7 @@ impl<T: Task> Queue<T> {
     }
 
     #[instrument(skip(self, executor), err)]
-    pub async fn task_schedule<'a, E>(&self, executor: E) -> Result<(Schedule, Tz, T::Input)>
+    pub async fn task_schedule<'a, E>(&self, executor: E) -> Result<(Schedule, TimeZone, T::Input)>
     where
         E: PgExecutor<'a>,
     {
@@ -224,7 +236,7 @@ impl<T: Task> Queue<T> {
         .await?;
 
         let schedule = schedule_row.schedule.parse()?;
-        let timezone = serde_json::from_str(&schedule_row.timezone)?;
+        let timezone = TimeZone::get(&schedule_row.timezone)?;
         let input = serde_json::from_value(schedule_row.input)?;
 
         Ok((schedule, timezone, input))
