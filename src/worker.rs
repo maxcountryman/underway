@@ -1,4 +1,4 @@
-use jiff::{tz::TimeZone, Span, Zoned};
+use jiff::Span;
 use serde::{de::DeserializeOwned, Serialize};
 use sqlx::{postgres::types::PgInterval, PgConnection};
 use tracing::instrument;
@@ -221,12 +221,9 @@ impl<T: Task> Worker<T> {
         tracing::info!("Retry policy available, scheduling retry");
 
         let delay = retry_policy.calculate_delay(retry_count);
-        let next_available_at = Zoned::now()
-            .with_time_zone(TimeZone::UTC)
-            .saturating_add(delay);
 
         self.queue
-            .reschedule_task_for_retry(&mut *conn, task_id, retry_count, next_available_at)
+            .reschedule_task_for_retry(&mut *conn, task_id, retry_count, delay)
             .await?;
 
         Ok(())

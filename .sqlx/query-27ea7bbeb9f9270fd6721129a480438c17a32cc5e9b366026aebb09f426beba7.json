@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            select\n              id,\n              input,\n              timeout,\n              retry_count,\n              max_attempts,\n              initial_interval_ms,\n              max_interval_ms,\n              backoff_coefficient,\n              concurrency_key\n            from underway.task\n            where task_queue_name = $1\n              and state = $2\n              and available_at <= now()\n            order by priority desc, created_at, id\n            limit 1\n            for update skip locked\n            ",
+  "query": "\n            select\n              id,\n              input,\n              timeout,\n              retry_count,\n              max_attempts,\n              initial_interval_ms,\n              max_interval_ms,\n              backoff_coefficient,\n              concurrency_key\n            from underway.task\n            where task_queue_name = $1\n              and state = $2\n              and created_at + delay <= now()\n            order by priority desc, created_at, id\n            limit 1\n            for update skip locked\n            ",
   "describe": {
     "columns": [
       {
@@ -80,5 +80,5 @@
       true
     ]
   },
-  "hash": "66b801a0ad31122faa31fb737192c613b83eb29e7cfc8f5d3ce4a922fa0cf384"
+  "hash": "27ea7bbeb9f9270fd6721129a480438c17a32cc5e9b366026aebb09f426beba7"
 }

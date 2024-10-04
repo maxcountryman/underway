@@ -42,7 +42,7 @@ create table underway.task (
     backoff_coefficient real not null default 2.0,
     timeout             interval not null default interval '15 minutes',
     ttl                 interval not null default interval '14 days',
-    available_at        timestamp with time zone not null default now(),
+    delay               interval not null default interval '0',
     created_at          timestamp with time zone not null default now(),
     updated_at          timestamp with time zone not null default now(),
     started_at          timestamp with time zone,

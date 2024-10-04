@@ -1,7 +1,7 @@
 use std::{future::Future, marker::PhantomData, pin::Pin, sync::Arc};
 
 use builder_states::{ExecutorSet, Initial, QueueSet};
-use jiff::{tz::TimeZone, Span, Zoned};
+use jiff::Span;
 use serde::{de::DeserializeOwned, Serialize};
 use sqlx::PgExecutor;
 
@@ -43,7 +43,7 @@ where
     retry_policy: RetryPolicy,
     timeout: Span,
     ttl: Span,
-    available_at: Zoned,
+    delay: Span,
     concurrency_key: Option<String>,
     priority: i32,
 }
@@ -158,7 +158,7 @@ where
     retry_policy: RetryPolicy,
     timeout: Span,
     ttl: Span,
-    available_at: Zoned,
+    delay: Span,
     concurrency_key: Option<String>,
     priority: i32,
     _marker: PhantomData<I>,
@@ -183,8 +183,8 @@ where
         self
     }
 
-    pub fn available_at(mut self, available_at: Zoned) -> Self {
-        self.available_at = available_at;
+    pub fn delay(mut self, delay: Span) -> Self {
+        self.delay = delay;
         self
     }
 
@@ -210,7 +210,7 @@ where
             retry_policy: RetryPolicy::default(),
             timeout: Span::new().minutes(15),
             ttl: Span::new().days(14),
-            available_at: Zoned::now().with_time_zone(TimeZone::UTC),
+            delay: Span::new(),
             concurrency_key: None,
             priority: 0,
             _marker: PhantomData,
@@ -238,7 +238,7 @@ where
             retry_policy: self.retry_policy,
             timeout: self.timeout,
             ttl: self.ttl,
-            available_at: self.available_at,
+            delay: self.delay,
             concurrency_key: self.concurrency_key,
             priority: self.priority,
             _marker: PhantomData,
@@ -258,7 +258,7 @@ where
             retry_policy: self.retry_policy,
             timeout: self.timeout,
             ttl: self.ttl,
-            available_at: self.available_at,
+            delay: self.delay,
             concurrency_key: self.concurrency_key,
             priority: self.priority,
         })
@@ -287,8 +287,8 @@ where
         self.ttl
     }
 
-    fn available_at(&self) -> Zoned {
-        self.available_at.clone()
+    fn delay(&self) -> Span {
+        self.delay
     }
 
     fn concurrency_key(&self) -> Option<String> {

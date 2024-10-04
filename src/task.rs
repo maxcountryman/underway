@@ -1,6 +1,6 @@
 use std::future::Future;
 
-use jiff::{tz::TimeZone, Span, Timestamp, Zoned};
+use jiff::Span;
 use serde::{de::DeserializeOwned, Serialize};
 use uuid::Uuid;
 
@@ -175,11 +175,9 @@ pub trait Task: Send + 'static {
         Span::new().days(14)
     }
 
-    /// Provides the time at which the task is available for processing.
-    ///
-    /// Any future value will delay the task execution until that point in time.
-    fn available_at(&self) -> Zoned {
-        Timestamp::now().to_zoned(TimeZone::UTC)
+    /// Provides a delay before which the task won't be dequeued.
+    fn delay(&self) -> Span {
+        Span::new()
     }
 
     /// Provides an optional concurrency key for the task.
