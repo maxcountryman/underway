@@ -1,4 +1,3 @@
-use chrono::Utc;
 use jiff::{tz::TimeZone, Span, Zoned};
 use serde::{de::DeserializeOwned, Serialize};
 use sqlx::{postgres::types::PgInterval, PgConnection};
@@ -26,10 +25,6 @@ pub enum Error {
     /// deserializing task input.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
-
-    /// Error returned by the `chrono_tz` crate when parsing time zones.
-    #[error(transparent)]
-    ChronoTz(#[from] chrono_tz::ParseError),
 
     /// Error returned from queue operations.
     #[error(transparent)]
@@ -148,21 +143,10 @@ impl<T: Task> Worker<T> {
 
     #[instrument(skip(self), err)]
     pub async fn process_next_schedule(&self) -> Result {
-        let (schedule, timezone, input) = self.queue.task_schedule(&self.queue.pool).await?;
+        let (zoned_schedule, input) = self.queue.task_schedule(&self.queue.pool).await?;
 
-        // TODO: We need to map jiff to chrono for the time being. Ideally the cron
-        // parser would support jiff directly, but for now we'll do this.
-        let schedule_tz: chrono_tz::Tz = timezone
-            .iana_name()
-            .ok_or(QueueError::IncompatibleTimeZone)?
-            .parse()?;
-        let now_with_tz = Utc::now().with_timezone(&schedule_tz);
-
-        if let Some(next_timestamp) = schedule.upcoming(schedule_tz).next() {
-            let duration_until_next = next_timestamp.signed_duration_since(now_with_tz);
-            let deadline = duration_until_next.to_std().unwrap_or_default(); // TODO: Is default
-                                                                             // what we want?
-            tokio::time::sleep(deadline).await;
+        if let Some(until_next) = zoned_schedule.duration_until_next()? {
+            tokio::time::sleep(until_next).await;
             self.queue
                 .enqueue(&self.queue.pool, &self.task, input)
                 .await?;

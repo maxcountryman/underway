@@ -43,17 +43,20 @@ pub enum Error {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 
+    /// Error returned by the `cron` crate.
     #[error(transparent)]
     Cron(#[from] cron::error::Error),
 
+    /// Error returned by the `jiff` crate.
     #[error(transparent)]
     Jiff(#[from] jiff::Error),
 
+    /// Error returned by the `chrono_tz` crate when parsing time zones.
+    #[error(transparent)]
+    ChronoTz(#[from] chrono_tz::ParseError),
+
     #[error("Task with ID {0} not found.")]
     TaskNotFound(Uuid),
-
-    #[error("For now a time zone with an IANA name is required.")]
-    IncompatibleTimeZone,
 }
 
 pub struct Queue<T: Task> {
@@ -195,23 +198,17 @@ impl<T: Task> Queue<T> {
     }
 
     /// Creates a schedule for the queue.
-    #[instrument(skip(self, executor, timezone, input), err)]
+    #[instrument(skip(self, executor, zoned_schedule, input), err)]
     pub async fn schedule<'a, E>(
         &self,
         executor: E,
-        ZonedSchedule { schedule, timezone }: ZonedSchedule,
+        zoned_schedule: ZonedSchedule,
         input: T::Input,
     ) -> Result
     where
         E: PgExecutor<'a>,
     {
         let input_value = serde_json::to_value(&input)?;
-        let schedule = schedule.to_string();
-
-        // TODO: Unclear if this will be addressed upstream or not.
-        //
-        // This is also needed until `cron` is updated or replaced.
-        let tz_iana_name = timezone.iana_name().ok_or(Error::IncompatibleTimeZone)?;
 
         sqlx::query!(
             r#"
@@ -228,8 +225,8 @@ impl<T: Task> Queue<T> {
               input = excluded.input
             "#,
             self.name,
-            schedule,
-            tz_iana_name,
+            zoned_schedule.cron_expr(),
+            zoned_schedule.iana_name(),
             input_value
         )
         .execute(executor)
@@ -238,9 +235,9 @@ impl<T: Task> Queue<T> {
         Ok(())
     }
 
-    /// Returns a triple of schedule, time zone, and the task input.
+    /// Returns a tuple of the zoned schedule and task input.
     #[instrument(skip(self, executor), err)]
-    pub async fn task_schedule<'a, E>(&self, executor: E) -> Result<(Schedule, TimeZone, T::Input)>
+    pub async fn task_schedule<'a, E>(&self, executor: E) -> Result<(ZonedSchedule, T::Input)>
     where
         E: PgExecutor<'a>,
     {
@@ -253,11 +250,10 @@ impl<T: Task> Queue<T> {
         .fetch_one(executor)
         .await?;
 
-        let schedule = schedule_row.schedule.parse()?;
-        let timezone = TimeZone::get(&schedule_row.timezone)?;
+        let zoned_schedule = ZonedSchedule::new(&schedule_row.schedule, &schedule_row.timezone)?;
         let input = serde_json::from_value(schedule_row.input)?;
 
-        Ok((schedule, timezone, input))
+        Ok((zoned_schedule, input))
     }
 
     /// Runs an infinite loop that deletes expired tasks on an interval.
@@ -646,6 +642,35 @@ impl ZonedSchedule {
         let timezone = TimeZone::get(time_zone_name)?;
 
         Ok(Self { schedule, timezone })
+    }
+
+    fn cron_expr(&self) -> String {
+        self.schedule.to_string()
+    }
+
+    fn iana_name(&self) -> &str {
+        self.timezone
+            .iana_name()
+            .expect("iana_name should always be Some because new ensures valid time zone")
+    }
+
+    pub(crate) fn duration_until_next(&self) -> Result<Option<std::time::Duration>> {
+        // TODO: We need to map jiff to chrono for the time being. Ideally the cron
+        // parser would support jiff directly, but for now we'll do this.
+
+        // Convert to Chrono's time zone.
+        let schedule_tz: chrono_tz::Tz = self.iana_name().parse()?;
+
+        // Construct a date-time with the schedule's time zone.
+        let now_with_tz = chrono::Utc::now().with_timezone(&schedule_tz);
+
+        if let Some(next_timestamp) = self.schedule.upcoming(schedule_tz).next() {
+            let until_next = next_timestamp.signed_duration_since(now_with_tz);
+            // N.B. We're assigning default on failure here.
+            return Ok(Some(until_next.to_std().unwrap_or_default()));
+        }
+
+        Ok(None)
     }
 }
 
