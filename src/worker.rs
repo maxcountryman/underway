@@ -145,7 +145,7 @@ impl<T: Task> Worker<T> {
     pub async fn process_next_schedule(&self) -> Result {
         let (zoned_schedule, input) = self.queue.task_schedule(&self.queue.pool).await?;
 
-        if let Some(until_next) = zoned_schedule.duration_until_next()? {
+        if let Some(until_next) = zoned_schedule.duration_until_next() {
             tokio::time::sleep(until_next).await;
             self.queue
                 .enqueue(&self.queue.pool, &self.task, input)

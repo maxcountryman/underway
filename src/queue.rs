@@ -632,6 +632,9 @@ impl<T: Task> QueueBuilder<T, PoolSet> {
 /// the surrounding application.
 pub struct ZonedSchedule {
     schedule: Schedule,
+    schedule_tz: chrono_tz::Tz,
+
+    // TODO: Not really needed for now and could be removed entirely.
     timezone: TimeZone,
 }
 
@@ -639,9 +642,22 @@ impl ZonedSchedule {
     /// Create a new schedule which is associated with a time zone.
     pub fn new(cron_expr: &str, time_zone_name: &str) -> Result<Self> {
         let schedule = cron_expr.parse()?;
+
+        // Is it worth checking the jiff database here? For compatibility with jiff,
+        // we risk a mismatch between the two datasets by not checking, so we do. That
+        // said, in practice we don't use jiff's time zones directly within the
+        // scope of schedules.
         let timezone = TimeZone::get(time_zone_name)?;
 
-        Ok(Self { schedule, timezone })
+        // We can use `time_zone_name` directly, but this further reinforces
+        // compatibility between jiff and chrono_tz.
+        let schedule_tz: chrono_tz::Tz = timezone.iana_name().unwrap().parse()?;
+
+        Ok(Self {
+            schedule,
+            schedule_tz,
+            timezone,
+        })
     }
 
     fn cron_expr(&self) -> String {
@@ -654,23 +670,20 @@ impl ZonedSchedule {
             .expect("iana_name should always be Some because new ensures valid time zone")
     }
 
-    pub(crate) fn duration_until_next(&self) -> Result<Option<std::time::Duration>> {
+    pub(crate) fn duration_until_next(&self) -> Option<std::time::Duration> {
         // TODO: We need to map jiff to chrono for the time being. Ideally the cron
         // parser would support jiff directly, but for now we'll do this.
 
-        // Convert to Chrono's time zone.
-        let schedule_tz: chrono_tz::Tz = self.iana_name().parse()?;
-
         // Construct a date-time with the schedule's time zone.
-        let now_with_tz = chrono::Utc::now().with_timezone(&schedule_tz);
+        let now_with_tz = chrono::Utc::now().with_timezone(&self.schedule_tz);
 
-        if let Some(next_timestamp) = self.schedule.upcoming(schedule_tz).next() {
+        if let Some(next_timestamp) = self.schedule.upcoming(self.schedule_tz).next() {
             let until_next = next_timestamp.signed_duration_since(now_with_tz);
             // N.B. We're assigning default on failure here.
-            return Ok(Some(until_next.to_std().unwrap_or_default()));
+            return Some(until_next.to_std().unwrap_or_default());
         }
 
-        Ok(None)
+        None
     }
 }
 
