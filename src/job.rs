@@ -7,7 +7,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use sqlx::PgExecutor;
 
 use crate::{
-    queue::{Error as QueueError, Queue},
+    queue::{Error as QueueError, Queue, ZonedSchedule},
     task::{Id as TaskId, Result as TaskResult, RetryPolicy, Task},
     worker::{Result as WorkerResult, Worker},
 };
@@ -27,9 +27,6 @@ pub enum Error {
     #[error(transparent)]
     Queue(#[from] QueueError),
 
-    #[error("For now, time zones must be specified as IANA-compatible.")]
-    IANANameRequired,
-
     /// Custom error that accepts any string. This allows for more flexible
     /// error reporting.
     #[error("{0}")]
@@ -46,6 +43,7 @@ where
     execute_fn: ExecuteFn<I>,
     retry_policy: RetryPolicy,
     timeout: Span,
+    ttl: Span,
     available_at: Zoned,
     concurrency_key: Option<String>,
     priority: i32,
@@ -82,29 +80,24 @@ where
     pub async fn schedule_using<'a, E>(
         &self,
         executor: E,
-        schedule: Schedule,
-        timezone: TimeZone,
+        zoned_schedule: ZonedSchedule,
         input: <Job<I> as Task>::Input,
     ) -> Result
     where
         E: PgExecutor<'a>,
     {
-        self.queue
-            .schedule(executor, schedule, timezone, input)
-            .await?;
+        self.queue.schedule(executor, zoned_schedule, input).await?;
 
         Ok(())
     }
 
     pub async fn schedule(
         &self,
-        schedule: Schedule,
-        timezone: TimeZone,
+        zoned_schedule: ZonedSchedule,
         input: <Job<I> as Task>::Input,
     ) -> Result {
         let mut conn = self.queue.pool.acquire().await?;
-        self.schedule_using(&mut *conn, schedule, timezone, input)
-            .await
+        self.schedule_using(&mut *conn, zoned_schedule, input).await
     }
 
     /// Marks the given task as cancelled using a connection from the queue's
@@ -165,6 +158,7 @@ where
     state: S,
     retry_policy: RetryPolicy,
     timeout: Span,
+    ttl: Span,
     available_at: Zoned,
     concurrency_key: Option<String>,
     priority: i32,
@@ -182,6 +176,11 @@ where
 
     pub fn timeout(mut self, timeout: Span) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    pub fn ttl(mut self, ttl: Span) -> Self {
+        self.ttl = ttl;
         self
     }
 
@@ -211,6 +210,7 @@ where
             state: QueueSet { queue },
             retry_policy: RetryPolicy::default(),
             timeout: Span::new().minutes(15),
+            ttl: Span::new().days(14),
             available_at: Zoned::now().with_time_zone(TimeZone::UTC),
             concurrency_key: None,
             priority: 0,
@@ -238,6 +238,7 @@ where
             },
             retry_policy: self.retry_policy,
             timeout: self.timeout,
+            ttl: self.ttl,
             available_at: self.available_at,
             concurrency_key: self.concurrency_key,
             priority: self.priority,
@@ -257,6 +258,7 @@ where
             execute_fn,
             retry_policy: self.retry_policy,
             timeout: self.timeout,
+            ttl: self.ttl,
             available_at: self.available_at,
             concurrency_key: self.concurrency_key,
             priority: self.priority,
@@ -280,6 +282,10 @@ where
 
     fn timeout(&self) -> Span {
         self.timeout
+    }
+
+    fn ttl(&self) -> Span {
+        self.ttl
     }
 
     fn available_at(&self) -> Zoned {

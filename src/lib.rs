@@ -404,6 +404,7 @@
 
 #![forbid(unsafe_code)]
 
+use jiff::Span;
 use sqlx::migrate::Migrator;
 
 pub use crate::{

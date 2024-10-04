@@ -1,8 +1,25 @@
+//! Queues provide an interface for managing task execution.
+//!
+//! ## Example
+//! ```rust
+//! let queue = QueueBuilder::new()
+//!     .name("example_queue")
+//!     .dead_letter_queue("example_dlq")
+//!     .pool(pg_pool)
+//!     .build()
+//!     .await?;
+//!
+//! let task_id = queue.enqueue(&pg_pool, &my_task, task_input).await?;
+//!
+//! if let Some(task) = queue.dequeue(&pg_pool).await? {
+//!     // Process the task here
+//! }
+//! ```
 use std::marker::PhantomData;
 
 use builder_states::{Initial, NameSet, PoolSet};
 use cron::Schedule;
-use jiff::{tz::TimeZone, Zoned};
+use jiff::{tz::TimeZone, Span, Zoned};
 use sqlx::{postgres::types::PgInterval, Acquire, PgExecutor, PgPool, Postgres};
 use tracing::instrument;
 use ulid::Ulid;
@@ -57,23 +74,18 @@ impl<T: Task> Clone for Queue<T> {
     }
 }
 
-#[derive(sqlx::Type)]
-#[sqlx(transparent)]
-struct Timestamp(i64);
-
 impl<T: Task> Queue<T> {
+    /// Creates a new queue with the given name.
     pub async fn create<'a, E>(executor: E, name: impl Into<String>) -> Result
     where
         E: PgExecutor<'a>,
     {
-        let name: String = name.into();
-
         sqlx::query!(
             r#"
             insert into underway.task_queue (name) values ($1)
             on conflict do nothing
             "#,
-            name
+            name.into()
         )
         .execute(executor)
         .await?;
@@ -81,6 +93,7 @@ impl<T: Task> Queue<T> {
         Ok(())
     }
 
+    /// Enqueues a new task, returning the task ID.
     #[instrument(skip(self, executor, task, input), fields(task.id = tracing::field::Empty), err)]
     pub async fn enqueue<'a, E>(&self, executor: E, task: &T, input: T::Input) -> Result<TaskId>
     where
@@ -91,7 +104,8 @@ impl<T: Task> Queue<T> {
 
         let retry_policy = task.retry_policy();
         let timeout = task.timeout();
-        let available_at = task.available_at();
+        let ttl = task.ttl();
+        let available_at = task.available_at().timestamp();
         let concurrency_key = task.concurrency_key();
         let priority = task.priority();
 
@@ -104,6 +118,7 @@ impl<T: Task> Queue<T> {
               task_queue_name,
               input,
               timeout,
+              ttl,
               available_at,
               max_attempts,
               initial_interval_ms,
@@ -111,13 +126,14 @@ impl<T: Task> Queue<T> {
               backoff_coefficient,
               concurrency_key,
               priority
-            ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             "#,
             id,
             self.name,
             input_value,
             std::time::Duration::try_from(timeout)? as _,
-            timestamp::Timestamp(available_at.timestamp()) as _,
+            std::time::Duration::try_from(ttl)? as _,
+            timestamp::Timestamp(available_at) as _,
             retry_policy.max_attempts,
             retry_policy.initial_interval_ms,
             retry_policy.max_interval_ms,
@@ -131,6 +147,7 @@ impl<T: Task> Queue<T> {
         Ok(id)
     }
 
+    /// Returns the next available task.
     #[instrument(skip(self, conn), fields(task.id = tracing::field::Empty), err)]
     pub async fn dequeue<'a, A>(&self, conn: A) -> Result<Option<TaskRow>>
     where
@@ -177,12 +194,12 @@ impl<T: Task> Queue<T> {
         Ok(task_row)
     }
 
+    /// Creates a schedule for the queue.
     #[instrument(skip(self, executor, timezone, input), err)]
     pub async fn schedule<'a, E>(
         &self,
         executor: E,
-        schedule: Schedule,
-        timezone: TimeZone,
+        ZonedSchedule { schedule, timezone }: ZonedSchedule,
         input: T::Input,
     ) -> Result
     where
@@ -221,6 +238,7 @@ impl<T: Task> Queue<T> {
         Ok(())
     }
 
+    /// Returns a triple of schedule, time zone, and the task input.
     #[instrument(skip(self, executor), err)]
     pub async fn task_schedule<'a, E>(&self, executor: E) -> Result<(Schedule, TimeZone, T::Input)>
     where
@@ -240,6 +258,16 @@ impl<T: Task> Queue<T> {
         let input = serde_json::from_value(schedule_row.input)?;
 
         Ok((schedule, timezone, input))
+    }
+
+    /// Runs an infinite loop that deletes expired tasks on an interval.
+    pub async fn continuously_delete_expired(&self, period: Span) -> Result {
+        let mut interval = tokio::time::interval(period.try_into()?);
+        interval.tick().await;
+        loop {
+            self.delete_expired(&self.pool).await?;
+            interval.tick().await;
+        }
     }
 
     #[instrument(skip(self, executor, task_id), fields(task.id = %task_id.as_hyphenated()), err)]
@@ -342,7 +370,7 @@ impl<T: Task> Queue<T> {
             where id = $3
             "#,
             retry_count,
-            crate::timestamp::Timestamp(next_available_at) as _,
+            timestamp::Timestamp(next_available_at) as _,
             task_id,
             TaskState::Pending as _
         )
@@ -445,16 +473,50 @@ impl<T: Task> Queue<T> {
     }
 
     #[instrument(skip(self, executor), err)]
-    pub(crate) async fn lock_task<'a, E>(&self, executor: E, concurrency_key: &str) -> Result
+    pub(crate) async fn delete_expired<'a, E>(&self, executor: E) -> Result
     where
         E: PgExecutor<'a>,
     {
-        sqlx::query!(
-            "select pg_advisory_xact_lock(hashtext($1))",
-            concurrency_key,
-        )
-        .execute(executor)
-        .await?;
+        if let Some(dlq_name) = &self.dlq_name {
+            sqlx::query!(
+                r#"
+                delete from underway.task
+                where (task_queue_name = $1 or task_queue_name = $2) and
+                       state != $3 and
+                       created_at + ttl < now()
+                "#,
+                self.name,
+                dlq_name,
+                TaskState::InProgress as _
+            )
+            .execute(executor)
+            .await?;
+        } else {
+            sqlx::query!(
+                r#"
+                delete from underway.task
+                where task_queue_name = $1 and
+                      state != $2 and
+                      created_at + ttl < now()
+                "#,
+                self.name,
+                TaskState::InProgress as _
+            )
+            .execute(executor)
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    #[instrument(skip(self, executor), err)]
+    pub(crate) async fn lock_task<'a, E>(&self, executor: E, key: &str) -> Result
+    where
+        E: PgExecutor<'a>,
+    {
+        sqlx::query!("select pg_advisory_xact_lock(hashtext($1))", key,)
+            .execute(executor)
+            .await?;
 
         Ok(())
     }
@@ -558,8 +620,39 @@ impl<T: Task> QueueBuilder<T, PoolSet> {
     }
 }
 
+/// Schedule paired with its time zone.
+///
+/// # Note
+///
+/// This is something of a bandage: `jiff` doesn't offer a way to serialize time
+/// zone identifiers, which makes them difficult to use as types in an API.
+/// Likewise, because `cron` depends on `chrono` and `chrono_tz`, IANA names are
+/// necessary for the time being.
+///
+/// In the future, removing `chrono` and `chrono_tz` as dependencies is a goal
+/// at which point we'll prefer to remove this type and avoid directly parsing
+/// cron expressions and time zone names, offloading that responsibility to the
+/// requisite crates and relocating this particular flavor of falibility with
+/// the surrounding application.
+pub struct ZonedSchedule {
+    schedule: Schedule,
+    timezone: TimeZone,
+}
+
+impl ZonedSchedule {
+    /// Create a new schedule which is associated with a time zone.
+    pub fn new(cron_expr: &str, time_zone_name: &str) -> Result<Self> {
+        let schedule = cron_expr.parse()?;
+        let timezone = TimeZone::get(time_zone_name)?;
+
+        Ok(Self { schedule, timezone })
+    }
+}
+
 mod tests {
     use std::collections::HashSet;
+
+    use jiff::{Span, Timestamp};
 
     use super::*;
     use crate::task::Result as TaskResult;
@@ -762,16 +855,21 @@ mod tests {
 
         // Reschedule the task for retry
         let retry_count = 1;
-        let next_available_at = OffsetDateTime::now_utc() + time::Duration::seconds(60);
+        let next_available_at = Timestamp::now() + Span::new().seconds(60);
 
         queue
-            .reschedule_task_for_retry(&pool, task_id, retry_count, next_available_at)
+            .reschedule_task_for_retry(
+                &pool,
+                task_id,
+                retry_count,
+                next_available_at.to_zoned(TimeZone::UTC),
+            )
             .await?;
 
         // Query to verify rescheduled task
         let task_row = sqlx::query!(
             r#"
-            select id, retry_count, available_at from underway.task where id = $1
+            select id, retry_count, available_at as "available_at: timestamp::Timestamp" from underway.task where id = $1
             "#,
             task_id
         )
@@ -783,7 +881,7 @@ mod tests {
         assert_eq!(task_row.retry_count, retry_count);
 
         // Verify the next available time
-        assert_eq!(task_row.available_at, next_available_at);
+        assert_eq!(task_row.available_at.0, next_available_at);
 
         Ok(())
     }

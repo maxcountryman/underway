@@ -7,7 +7,7 @@ use tracing::instrument;
 use crate::{
     job::Job,
     queue::{Error as QueueError, Queue, TaskRow},
-    task::{Error as TaskError, Id as TaskId, RetryPolicy, Task},
+    task::{Error as TaskError, Id as TaskId, RetryCount, RetryPolicy, Task},
 };
 pub(crate) type Result = std::result::Result<(), Error>;
 
@@ -27,11 +27,11 @@ pub enum Error {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 
-    /// Error return by the `chrono_tz` crate when parsing time zones.
+    /// Error returned by the `chrono_tz` crate when parsing time zones.
     #[error(transparent)]
     ChronoTz(#[from] chrono_tz::ParseError),
 
-    /// Error return from queue operations.
+    /// Error returned from queue operations.
     #[error(transparent)]
     Queue(#[from] QueueError),
 
@@ -180,6 +180,11 @@ impl<T: Task> Worker<T> {
     ) -> Result {
         tracing::error!(err = %err, "Task execution encountered an error");
 
+        // Short-circuit on fatal errors.
+        if matches!(err, TaskError::Fatal(_)) {
+            return self.finalize_task_failure(conn, task_id).await;
+        }
+
         let retry_count = task_row.retry_count + 1;
         let retry_policy: RetryPolicy = task_row.into();
 
@@ -226,7 +231,7 @@ impl<T: Task> Worker<T> {
         &self,
         conn: &mut PgConnection,
         task_id: TaskId,
-        retry_count: i32,
+        retry_count: RetryCount,
         retry_policy: &RetryPolicy,
     ) -> Result {
         tracing::info!("Retry policy available, scheduling retry");

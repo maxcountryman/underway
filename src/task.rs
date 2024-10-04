@@ -18,10 +18,13 @@ pub enum Error {
     #[error(transparent)]
     Database(#[from] sqlx::Error),
 
-    /// Custom error that accepts any string. This allows for more flexible
-    /// error reporting.
+    /// Error indicating that the task has encountered an unrecoverable state.
     #[error("{0}")]
-    Custom(String),
+    Fatal(String),
+
+    /// Error indicating that the task has encountered a retriable state.
+    #[error("{0}")]
+    Generic(String),
 }
 
 /// A task which defines an input type and a function that is executed using
@@ -152,19 +155,11 @@ pub trait Task: Send + 'static {
     /// the event of failure, and the interval between retries. This is useful
     /// for handling transient failures like network issues or external API
     /// errors.
-    ///
-    /// By default, this method returns the `RetryPolicy::default()` which can
-    /// be overridden by the task to customize retry behavior (e.g.,
-    /// exponential backoff).
     fn retry_policy(&self) -> RetryPolicy {
         RetryPolicy::default()
     }
 
-    /// Sets the expiration duration of the task.
-    ///
-    /// Tasks may have a limited time during which they can be processed. This
-    /// method specifies the expiration time, after which the task will no
-    /// longer be processed.
+    /// Provides the task execution timeout.
     ///
     /// The default expiration is set to 15 minutes. Override this if your tasks
     /// need to have shorter or longer timeouts.
@@ -172,16 +167,26 @@ pub trait Task: Send + 'static {
         Span::new().minutes(15)
     }
 
+    /// Provides task time-to-live duration in queue.
+    ///
+    /// After the duration has elapsed, a task may be removed from the queue,
+    /// e.g. via [`delete_expired`](Queue.delete_expired).
+    fn ttl(&self) -> Span {
+        Span::new().days(14)
+    }
+
+    /// Provides the time at which the task is available for processing.
+    ///
+    /// Any future value will delay the task execution until that point in time.
     fn available_at(&self) -> Zoned {
         Timestamp::now().to_zoned(TimeZone::UTC)
     }
 
     /// Provides an optional concurrency key for the task.
     ///
-    /// Concurrency keys are used to limit how many tasks of a specific type or
-    /// with specific input are allowed to run concurrently. By providing a
-    /// unique key, tasks with the same key can be processed sequentially
-    /// rather than in parallel.
+    /// Concurrency keys are used to limit how many tasks of a specific type are
+    /// allowed to run concurrently. By providing a unique key, tasks with
+    /// the same key can be processed sequentially rather than in parallel.
     ///
     /// This can be useful when working with shared resources or preventing race
     /// conditions. If no concurrency key is provided, tasks will be
@@ -194,22 +199,21 @@ pub trait Task: Send + 'static {
     /// simultaneously.
     ///
     /// ```
-    /// use underway::{task::Error as TaskError, Task};
+    /// use std::path::PathBuf;
     ///
-    /// struct MyUniqueTask;
+    /// use underway::{task::Result as TaskResult, Task};
+    ///
+    /// struct MyUniqueTask(PathBuf);
     ///
     /// impl Task for MyUniqueTask {
     ///     type Input = ();
     ///
-    ///     fn execute(
-    ///         &self,
-    ///         _input: Self::Input,
-    ///     ) -> impl std::future::Future<Output = Result<(), TaskError>> + Send {
-    ///         async { Ok(()) }
+    ///     async fn execute(&self, _input: Self::Input) -> TaskResult {
+    ///         Ok(())
     ///     }
     ///
     ///     fn concurrency_key(&self) -> Option<String> {
-    ///         Some("my-unique-key".to_string())
+    ///         Some(self.0.display().to_string())
     ///     }
     /// }
     /// ```
@@ -229,18 +233,15 @@ pub trait Task: Send + 'static {
     /// # Example:
     ///
     /// ```
-    /// use underway::{task::Error as TaskError, Task};
+    /// use underway::{task::Result as TaskRsult, Task};
     ///
     /// struct HighPriorityTask;
     ///
     /// impl Task for HighPriorityTask {
     ///     type Input = ();
     ///
-    ///     fn execute(
-    ///         &self,
-    ///         _input: Self::Input,
-    ///     ) -> impl std::future::Future<Output = Result<(), TaskError>> + Send {
-    ///         async { Ok(()) }
+    ///     async fn execute(&self, _input: Self::Input) -> TaskResult {
+    ///         Ok(())
     ///     }
     ///
     ///     fn priority(&self) -> i32 {
@@ -267,8 +268,10 @@ pub struct RetryPolicy {
     pub(crate) backoff_coefficient: f32,
 }
 
+pub(crate) type RetryCount = i32;
+
 impl RetryPolicy {
-    pub fn calculate_delay(&self, retry_count: i32) -> Span {
+    pub fn calculate_delay(&self, retry_count: RetryCount) -> Span {
         let base_delay = self.initial_interval_ms as f32;
         let backoff_delay = base_delay * self.backoff_coefficient.powi(retry_count - 1);
         let delay = backoff_delay.min(self.max_interval_ms as f32);
@@ -417,7 +420,7 @@ mod tests {
         async fn execute(&self, input: Self::Input) -> Result {
             println!("Executing task with message: {}", input.message);
             if input.message == "fail" {
-                return Err(Error::Custom("Task failed".to_string()));
+                return Err(Error::Generic("Task failed".to_string()));
             }
             Ok(())
         }

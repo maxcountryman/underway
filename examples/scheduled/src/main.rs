@@ -1,8 +1,7 @@
 use std::env;
 
-use jiff::tz::TimeZone;
 use sqlx::PgPool;
-use underway::{JobBuilder, QueueBuilder};
+use underway::{queue::ZonedSchedule, JobBuilder, QueueBuilder};
 
 const QUEUE_NAME: &str = "hello-world";
 
@@ -32,9 +31,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     // Schedule the job to run every minute in the given time zone.
-    let every_minute = "0 * * * * *".parse()?;
-    let tz = TimeZone::get("America/Los_Angeles").expect("Should be a recognized time zone");
-    job.schedule(every_minute, tz, ()).await?;
+    let every_minute = ZonedSchedule::new("0 * * * * *", "America/Los_Angeles")?;
+    job.schedule(every_minute, ()).await?;
 
     // Run the scheduler and worker concurrently.
     let _ = tokio::join!(job.run_scheduler(), job.run());
