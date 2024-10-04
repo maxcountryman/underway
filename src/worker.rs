@@ -5,7 +5,7 @@ use tracing::instrument;
 
 use crate::{
     job::Job,
-    queue::{Error as QueueError, Queue, TaskRow},
+    queue::{DequeuedTask, Error as QueueError, Queue},
     task::{Error as TaskError, Id as TaskId, RetryCount, RetryPolicy, Task},
 };
 pub(crate) type Result = std::result::Result<(), Error>;
@@ -160,7 +160,7 @@ impl<T: Task> Worker<T> {
         err: TaskError,
         conn: &mut PgConnection,
         task_id: TaskId,
-        task_row: TaskRow,
+        dequeued_task: DequeuedTask,
     ) -> Result {
         tracing::error!(err = %err, "Task execution encountered an error");
 
@@ -169,8 +169,8 @@ impl<T: Task> Worker<T> {
             return self.finalize_task_failure(conn, task_id).await;
         }
 
-        let retry_count = task_row.retry_count + 1;
-        let retry_policy: RetryPolicy = task_row.into();
+        let retry_count = dequeued_task.retry_count + 1;
+        let retry_policy: RetryPolicy = dequeued_task.into();
 
         self.queue
             .update_task_failure(&mut *conn, task_id, retry_count, &err.to_string())
@@ -190,12 +190,12 @@ impl<T: Task> Worker<T> {
         &self,
         conn: &mut PgConnection,
         task_id: TaskId,
-        task_row: TaskRow,
+        dequeued_task: DequeuedTask,
     ) -> Result {
         tracing::error!("Task execution timed out");
 
-        let retry_count = task_row.retry_count + 1;
-        let retry_policy: RetryPolicy = task_row.into();
+        let retry_count = dequeued_task.retry_count + 1;
+        let retry_policy: RetryPolicy = dequeued_task.into();
 
         self.queue
             .update_task_failure(&mut *conn, task_id, retry_count, "Task timed out")

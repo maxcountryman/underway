@@ -1,19 +1,45 @@
 //! Queues provide an interface for managing task execution.
 //!
-//! ## Example
+//! # Example
+//!
 //! ```rust
+//! # use tokio::runtime::Runtime;
+//! # use underway::Task;
+//! # use underway::task::Result as TaskResult;
+//! use sqlx::PgPool;
+//! use underway::QueueBuilder;
+//!
+//! # struct MyTask;
+//! # impl Task for MyTask {
+//! #    type Input = ();
+//! #    async fn execute(&self, input: Self::Input) -> TaskResult {
+//! #        Ok(())
+//! #    }
+//! # }
+//! # fn main() {
+//! # let rt = Runtime::new().unwrap();
+//! # rt.block_on(async {
+//! let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
+//!
 //! let queue = QueueBuilder::new()
 //!     .name("example_queue")
 //!     .dead_letter_queue("example_dlq")
-//!     .pool(pg_pool)
+//!     .pool(pool.clone())
 //!     .build()
 //!     .await?;
 //!
-//! let task_id = queue.enqueue(&pg_pool, &my_task, task_input).await?;
+//!  # /*
+//! let my_task = { /* A type that implements `Task`. */ };
+//! # */
+//! # let my_task = MyTask;
+//! let task_id = queue.enqueue(&pool, &my_task, ()).await?;
 //!
-//! if let Some(task) = queue.dequeue(&pg_pool).await? {
+//! if let Some(task) = queue.dequeue(&pool).await? {
 //!     // Process the task here
 //! }
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! # });
+//! # }
 //! ```
 use std::marker::PhantomData;
 
@@ -55,6 +81,10 @@ pub enum Error {
     #[error(transparent)]
     ChronoTz(#[from] chrono_tz::ParseError),
 
+    /// Indicates that the task couldn't be found.
+    ///
+    /// This could be due to the task not existing at all or other clauses in
+    /// the query that prevent a row from being returned.
     #[error("Task with ID {0} not found.")]
     TaskNotFound(Uuid),
 }
@@ -152,14 +182,14 @@ impl<T: Task> Queue<T> {
 
     /// Returns the next available task.
     #[instrument(skip(self, conn), fields(task.id = tracing::field::Empty), err)]
-    pub async fn dequeue<'a, A>(&self, conn: A) -> Result<Option<TaskRow>>
+    pub async fn dequeue<'a, A>(&self, conn: A) -> Result<Option<DequeuedTask>>
     where
         A: Acquire<'a, Database = Postgres>,
     {
         let mut tx = conn.begin().await?;
 
         let task_row = sqlx::query_as!(
-            TaskRow,
+            DequeuedTask,
             r#"
             select
               id,
@@ -519,7 +549,7 @@ impl<T: Task> Queue<T> {
 }
 
 #[derive(Debug, sqlx::FromRow)]
-pub struct TaskRow {
+pub struct DequeuedTask {
     pub id: Uuid,
     pub input: serde_json::Value,
     pub timeout: PgInterval,
@@ -687,6 +717,7 @@ impl ZonedSchedule {
     }
 }
 
+#[cfg(test)]
 mod tests {
     use std::collections::HashSet;
 

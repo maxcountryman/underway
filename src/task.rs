@@ -4,7 +4,7 @@ use jiff::{tz::TimeZone, Span, Timestamp, Zoned};
 use serde::{de::DeserializeOwned, Serialize};
 use uuid::Uuid;
 
-use crate::queue::TaskRow;
+use crate::queue::DequeuedTask;
 
 /// A type alias for task identifiers.
 pub type Id = Uuid;
@@ -233,7 +233,7 @@ pub trait Task: Send + 'static {
     /// # Example:
     ///
     /// ```
-    /// use underway::{task::Result as TaskRsult, Task};
+    /// use underway::{task::Result as TaskResult, Task};
     ///
     /// struct HighPriorityTask;
     ///
@@ -279,15 +279,15 @@ impl RetryPolicy {
     }
 }
 
-impl From<TaskRow> for RetryPolicy {
+impl From<DequeuedTask> for RetryPolicy {
     fn from(
-        TaskRow {
+        DequeuedTask {
             max_attempts,
             initial_interval_ms,
             max_interval_ms,
             backoff_coefficient,
             ..
-        }: TaskRow,
+        }: DequeuedTask,
     ) -> Self {
         Self {
             max_attempts,

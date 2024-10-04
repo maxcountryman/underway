@@ -107,7 +107,7 @@
 //! use sqlx::PgPool;
 //! use underway::{JobBuilder, QueueBuilder};
 //!
-//! #[derive(Debug, Deserialize, Serialize)]
+//! #[derive(Debug, Clone, Deserialize, Serialize)]
 //! struct DataProcessingInput {
 //!     data_id: u64,
 //! }
@@ -119,7 +119,7 @@
 //!     // Create a queue.
 //!     let queue = QueueBuilder::new()
 //!         .name("data_processing_queue")
-//!         .pool(pool.clone())
+//!         .pool(pool)
 //!         .build()
 //!         .await?;
 //!
@@ -156,7 +156,7 @@
 //!     queue::Error as QueueError, task::Result as TaskResult, Queue, QueueBuilder, Task,
 //! };
 //!
-//! #[derive(Debug, Deserialize, Serialize)]
+//! #[derive(Debug, Clone, Deserialize, Serialize)]
 //! struct MyTaskInput {
 //!     data: String,
 //! }
@@ -192,7 +192,7 @@
 //! use sqlx::PgPool;
 //! use underway::{task::Result as TaskResult, QueueBuilder, Task, Worker};
 //!
-//! #[derive(Debug, Deserialize, Serialize)]
+//! #[derive(Debug, Clone, Deserialize, Serialize)]
 //! struct MyTaskInput {
 //!     data: String,
 //! }
@@ -235,7 +235,7 @@
 //! use sqlx::PgPool;
 //! use underway::{JobBuilder, QueueBuilder};
 //!
-//! #[derive(Debug, Deserialize, Serialize)]
+//! #[derive(Debug, Clone, Deserialize, Serialize)]
 //! struct WelcomeEmail {
 //!     user_id: i32,
 //!     email: String,
@@ -404,7 +404,6 @@
 
 #![forbid(unsafe_code)]
 
-use jiff::Span;
 use sqlx::migrate::Migrator;
 
 pub use crate::{

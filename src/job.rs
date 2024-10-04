@@ -1,7 +1,6 @@
 use std::{future::Future, marker::PhantomData, pin::Pin, sync::Arc};
 
 use builder_states::{ExecutorSet, Initial, QueueSet};
-use cron::Schedule;
 use jiff::{tz::TimeZone, Span, Zoned};
 use serde::{de::DeserializeOwned, Serialize};
 use sqlx::PgExecutor;
