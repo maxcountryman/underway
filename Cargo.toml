@@ -6,13 +6,7 @@ edition = "2021"
 license = "MIT"
 
 [dependencies]
-# chrono and chrono-tz should be removed once cron can be replaced.
-chrono = "0.4.38"
-chrono-tz = { version = "0.10.0" }
-
-# candidate for removal since it depends on chrono
-cron = "0.12.1"
-
+jiff-cron = "0.1.0"
 jiff = { version = "0.1.13", features = ["serde"] }
 serde = "1.0.210"
 serde_json = "1.0.128"

@@ -1,3 +1,17 @@
+//! Tasks are functions over a well-defined input.
+//!
+//! The `Task` trait is used to define tasks. It requires an associated type,
+//! which defines the input and an execute method, which defines the behavior of
+//! the task.
+//!
+//! Specific behavior, such as retry attempts, is defined by providing
+//! implementations of the default methods.
+//!
+//! # Tasks and jobs
+//!
+//! Often applications will use the higher-level abstraction over tasks: `Job`.
+//! Jobs are an implementation of `Task` that provide an ergonomic API for
+//! defining arbitrary tasks at the cost of dynamic dispatch.
 use std::future::Future;
 
 use jiff::Span;
@@ -84,14 +98,6 @@ pub enum Error {
 /// # });
 /// # }
 /// ```
-///
-/// ## Associated Types:
-///
-/// - `Input`: The type that represents the input for this task. The input must
-///   implement `DeserializeOwned` and `Serialize` to allow seamless
-///   serialization and deserialization when enqueuing or executing jobs. This
-///   ensures that the input can be sent across the queue and passed to workers
-///   in a structured format.
 pub trait Task: Send + 'static {
     /// Type used by the executor.
     ///
@@ -303,20 +309,13 @@ const DEFAULT_RETRY_POLICY: RetryPolicy = RetryPolicy {
     backoff_coefficient: 2.0,
 };
 
-/// The default implementation of the `RetryPolicy` provides a baseline retry
-/// configuration for most tasks, with 5 retry attempts, an initial 1-second
-/// delay, and exponential backoff.
 impl Default for RetryPolicy {
     fn default() -> Self {
         DEFAULT_RETRY_POLICY
     }
 }
 
-/// A builder for constructing custom `RetryPolicy` objects.
-///
-/// The `RetryPolicyBuilder` allows for more flexible configuration of retry
-/// behavior. You can specify the number of retry attempts, the initial and
-/// maximum retry intervals, and the backoff coefficient.
+/// A builder for constructing `RetryPolicy`.
 ///
 /// # Example:
 ///
@@ -326,7 +325,7 @@ impl Default for RetryPolicy {
 /// let retry_policy = RetryPolicyBuilder::new()
 ///     .max_attempts(3)
 ///     .initial_interval_ms(500)
-///     .max_interval_ms(5000)
+///     .max_interval_ms(5_000)
 ///     .backoff_coefficient(1.5)
 ///     .build();
 /// ```
@@ -344,24 +343,32 @@ impl RetryPolicyBuilder {
     }
 
     /// Sets the maximum number of retry attempts.
+    ///
+    /// Default is `5`.
     pub const fn max_attempts(mut self, max_attempts: i32) -> Self {
         self.inner.max_attempts = max_attempts;
         self
     }
 
     /// Sets the initial interval before the first retry (in milliseconds).
+    ///
+    /// Default is `1_000`.
     pub const fn initial_interval_ms(mut self, initial_interval_ms: i32) -> Self {
         self.inner.initial_interval_ms = initial_interval_ms;
         self
     }
 
     /// Sets the maximum interval between retries (in milliseconds).
+    ///
+    /// Default is `60_000`.
     pub const fn max_interval_ms(mut self, max_interval_ms: i32) -> Self {
         self.inner.max_interval_ms = max_interval_ms;
         self
     }
 
     /// Sets the backoff coefficient to apply after each retry.
+    ///
+    /// Default is `2.0`.
     pub const fn backoff_coefficient(mut self, backoff_coefficient: f32) -> Self {
         self.inner.backoff_coefficient = backoff_coefficient;
         self
@@ -373,27 +380,23 @@ impl RetryPolicyBuilder {
     }
 }
 
-/// Represents the possible states of a task in the `underway` system.
-///
-/// Task states track the progress of tasks as they move through the system.
-/// Each state represents a specific phase of a task's lifecycle, from being
-/// queued to being completed or cancelled.
+/// Represents the possible states a task can be in.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, sqlx::Type)]
 #[sqlx(type_name = "underway.task_state", rename_all = "snake_case")]
 pub enum State {
-    /// Task is waiting to be executed.
+    /// Awaiting execution.
     Pending,
 
-    /// Task is currently being processed by a worker.
+    /// Currently being processed.
     InProgress,
 
-    /// Task has completed successfully.
+    /// Execute completed successfully.
     Succeeded,
 
-    /// Task has been cancelled.
+    /// Execute cancelled.
     Cancelled,
 
-    /// Task has failed and will not be retried further.
+    /// Execute completed unsucessfully.
     Failed,
 }
 
@@ -403,17 +406,15 @@ mod tests {
 
     use super::*;
 
-    /// A basic task for testing purposes.
     #[derive(Debug, Deserialize, Serialize)]
-    struct TestTask {
+    struct TestTaskInput {
         message: String,
     }
 
-    /// Task implementation for testing.
-    struct PrintTask;
+    struct TestTask;
 
-    impl Task for PrintTask {
-        type Input = TestTask;
+    impl Task for TestTask {
+        type Input = TestTaskInput;
 
         async fn execute(&self, input: Self::Input) -> Result {
             println!("Executing task with message: {}", input.message);
@@ -426,8 +427,8 @@ mod tests {
 
     #[tokio::test]
     async fn task_execution_success() {
-        let task = PrintTask;
-        let input = TestTask {
+        let task = TestTask;
+        let input = TestTaskInput {
             message: "Hello, World!".to_string(),
         };
 
@@ -437,8 +438,8 @@ mod tests {
 
     #[tokio::test]
     async fn task_execution_failure() {
-        let task = PrintTask;
-        let input = TestTask {
+        let task = TestTask;
+        let input = TestTaskInput {
             message: "fail".to_string(),
         };
 

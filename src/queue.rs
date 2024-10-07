@@ -54,11 +54,11 @@
 //! # });
 //! # }
 //! ```
-use std::marker::PhantomData;
+use std::{marker::PhantomData, time::Duration as StdDuration};
 
 use builder_states::{Initial, NameSet, PoolSet};
-use cron::Schedule;
-use jiff::{tz::TimeZone, Span};
+use jiff::{tz::TimeZone, Span, Zoned};
+use jiff_cron::Schedule;
 use sqlx::{postgres::types::PgInterval, Acquire, PgExecutor, PgPool, Postgres};
 use tracing::instrument;
 use ulid::Ulid;
@@ -82,15 +82,11 @@ pub enum Error {
 
     /// Error returned by the `cron` crate.
     #[error(transparent)]
-    Cron(#[from] cron::error::Error),
+    Cron(#[from] jiff_cron::error::Error),
 
     /// Error returned by the `jiff` crate.
     #[error(transparent)]
     Jiff(#[from] jiff::Error),
-
-    /// Error returned by the `chrono_tz` crate when parsing time zones.
-    #[error(transparent)]
-    ChronoTz(#[from] chrono_tz::ParseError),
 
     /// Indicates that the task couldn't be found.
     ///
@@ -122,7 +118,7 @@ impl<T: Task> Clone for Queue<T> {
 impl<T: Task> Queue<T> {
     /// Creates a new queue with the given name.
     ///
-    /// Note that the name must be unique. If the name already exists, nothing
+    /// Note that `name` must be unique. If `name` already exists, nothing
     /// happens and we carry on with the assumption that the database is
     /// already configured appropriately.
     pub async fn create<'a, E>(executor: E, name: impl Into<String>) -> Result
@@ -142,7 +138,7 @@ impl<T: Task> Queue<T> {
         Ok(())
     }
 
-    /// Enqueues a new task, returning the task ID.
+    /// Enqueues a new task, returning the enqueued task's ID.
     ///
     /// Task configuration is defined by the implementation of `Task`.
     #[instrument(skip(self, executor, task, input), fields(task.id = tracing::field::Empty), err)]
@@ -151,6 +147,7 @@ impl<T: Task> Queue<T> {
         E: PgExecutor<'a>,
     {
         let id: TaskId = Ulid::new().into();
+
         let input_value = serde_json::to_value(&input)?;
 
         let retry_policy = task.retry_policy();
@@ -182,9 +179,9 @@ impl<T: Task> Queue<T> {
             id,
             self.name,
             input_value,
-            std::time::Duration::try_from(timeout)? as _,
-            std::time::Duration::try_from(ttl)? as _,
-            std::time::Duration::try_from(delay)? as _,
+            StdDuration::try_from(timeout)? as _,
+            StdDuration::try_from(ttl)? as _,
+            StdDuration::try_from(delay)? as _,
             retry_policy.max_attempts,
             retry_policy.initial_interval_ms,
             retry_policy.max_interval_ms,
@@ -575,9 +572,10 @@ impl<T: Task> Queue<T> {
     }
 }
 
+/// Task that's been "taken off" the queue.
 #[derive(Debug, sqlx::FromRow)]
 pub struct DequeuedTask {
-    pub id: Uuid,
+    pub id: TaskId,
     pub input: serde_json::Value,
     pub timeout: PgInterval,
     pub retry_count: i32,
@@ -674,46 +672,25 @@ impl<T: Task> QueueBuilder<T, PoolSet> {
 }
 
 /// Schedule paired with its time zone.
-///
-/// # Note
-///
-/// This is something of a bandage: `jiff` doesn't offer a way to serialize time
-/// zone identifiers, which makes them difficult to use as types in an API.
-/// Likewise, because `cron` depends on `chrono` and `chrono_tz`, IANA names are
-/// necessary for the time being.
-///
-/// In the future, removing `chrono` and `chrono_tz` as dependencies is a goal
-/// at which point we'll prefer to remove this type and avoid directly parsing
-/// cron expressions and time zone names, offloading that responsibility to the
-/// requisite crates and relocating this particular flavor of falibility with
-/// the surrounding application.
 pub struct ZonedSchedule {
     schedule: Schedule,
-    schedule_tz: chrono_tz::Tz,
-
-    // TODO: Not really needed for now and could be removed entirely.
-    timezone: TimeZone,
+    schedule_tz: TimeZone,
 }
 
 impl ZonedSchedule {
     /// Create a new schedule which is associated with a time zone.
     pub fn new(cron_expr: &str, time_zone_name: &str) -> Result<Self> {
         let schedule = cron_expr.parse()?;
+        let schedule_tz = TimeZone::get(time_zone_name)?;
 
-        // Is it worth checking the jiff database here? For compatibility with jiff,
-        // we risk a mismatch between the two datasets by not checking, so we do. That
-        // said, in practice we don't use jiff's time zones directly within the
-        // scope of schedules.
-        let timezone = TimeZone::get(time_zone_name)?;
-
-        // We can use `time_zone_name` directly, but this further reinforces
-        // compatibility between jiff and chrono_tz.
-        let schedule_tz: chrono_tz::Tz = timezone.iana_name().unwrap().parse()?;
+        assert!(
+            schedule_tz.iana_name().is_some(),
+            "Time zones must use IANA names for now"
+        );
 
         Ok(Self {
             schedule,
             schedule_tz,
-            timezone,
         })
     }
 
@@ -722,22 +699,18 @@ impl ZonedSchedule {
     }
 
     fn iana_name(&self) -> &str {
-        self.timezone
+        self.schedule_tz
             .iana_name()
             .expect("iana_name should always be Some because new ensures valid time zone")
     }
 
     pub(crate) fn duration_until_next(&self) -> Option<std::time::Duration> {
-        // TODO: We need to map jiff to chrono for the time being. Ideally the cron
-        // parser would support jiff directly, but for now we'll do this.
-
         // Construct a date-time with the schedule's time zone.
-        let now_with_tz = chrono::Utc::now().with_timezone(&self.schedule_tz);
-
-        if let Some(next_timestamp) = self.schedule.upcoming(self.schedule_tz).next() {
-            let until_next = next_timestamp.signed_duration_since(now_with_tz);
+        let now_with_tz = Zoned::now().with_time_zone(self.schedule_tz.clone());
+        if let Some(next_timestamp) = self.schedule.upcoming(self.schedule_tz.clone()).next() {
+            let until_next = next_timestamp.duration_since(&now_with_tz);
             // N.B. We're assigning default on failure here.
-            return Some(until_next.to_std().unwrap_or_default());
+            return Some(until_next.try_into().unwrap_or_default());
         }
 
         None

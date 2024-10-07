@@ -6,7 +6,6 @@ publish = false
 
 [dependencies]
 cron = "0.12.1"
-jiff = "0.1.13"
 serde = { version = "1.0.210", features = ["derive"] }
 sqlx = { version = "0.8.2", features = ["postgres", "runtime-tokio-rustls"] }
 tokio = { version = "1.34.0", features = ["full"] }
