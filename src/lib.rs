@@ -9,43 +9,12 @@
 //! storage and coordination. It is designed to be simple, scalable, and
 //! resilient, making it suitable for a wide range of applications.
 //!
-//! **Key Features:**
 //!
-//! - **Distributed Task Execution:** Easily distribute tasks across multiple
-//!   workers and machines.
-//! - **Reliable Persistence:** Tasks are stored in PostgreSQL, ensuring
-//!   durability and reliability.
-//! - **Strongly Typed Tasks:** Define tasks with strongly typed inputs using
-//!   Rust's type system.
-//! - **Flexible Retry Policies:** Configure custom retry strategies with
-//!   exponential backoff.
-//! - **Concurrency Control:** Limit task execution with concurrency keys to
-//!   prevent race conditions.
-//! - **Priority Queueing:** Assign priorities to tasks to control execution
-//!   order.
-//! - **Dead Letter Queue (DLQ):** Automatically handle failed tasks by moving
-//!   them to a DLQ for later inspection.
 //!
-//! ## Getting Started
+//! ## Overview
 //!
-//! ### Database Setup
-//!
-//! Underway requires a PostgreSQL database. You need to apply the necessary
-//! migrations before using the library. You can apply the migrations using
-//! `sqlx`:
-//! ```rust,no_run
-//! use sqlx::PgPool;
-//! use underway::MIGRATOR;
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<(), sqlx::Error> {
-//!     let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
-//!     MIGRATOR.run(&pool).await?;
-//!     Ok(())
-//! }
-//! ```
-//!
-//! ## Concepts
+//! Underway is composed of several key concepts that are designed to make
+//! authoring well-structured background jobs straightforward.
 //!
 //! - [Task](#task)
 //! - [Job](#job)
@@ -54,9 +23,14 @@
 //!
 //! ### Task
 //!
-//! A `Task` defines the core behavior and input type of a unit of work to be
+//! A [`Task`] defines the core behavior and input type of a unit of work to be
 //! executed. Tasks are strongly typed, ensuring that the data passed to the
 //! task is well-formed and predictable.
+//!
+//! Implementations of `Task` also may provide various configuration of the task
+//! itself. For instance, tasks may define a custom
+//! [`RetryPolicy`](task::RetryPolicy) or configure their priority.
+//!
 //! ```rust
 //! use serde::{Deserialize, Serialize};
 //! use underway::{task::Error as TaskError, Task};
@@ -95,13 +69,9 @@
 //!
 //! ### Job
 //!
-//! A `Job` is a specialized implementation of a `Task` that provides additional
-//! functionality for task management within the queueing system. It not only
-//! defines how to execute a task but also includes methods to enqueue, cancel,
-//! and run tasks, integrating tightly with the queue infrastructure.
+//! A [`Job`] is a provided implementation of [`Task`] that offers a
+//! higher-level abstraction for interacting with its queue and workers.
 //!
-//! **In essence, `Job` is a higher-level abstraction built on top of `Task`,
-//! providing a richer API and convenience methods for common task operations.**
 //! ```rust,no_run
 //! use serde::{Deserialize, Serialize};
 //! use sqlx::PgPool;
@@ -146,9 +116,17 @@
 //!
 //! ### Queue
 //!
-//! A `Queue` manages tasks, including enqueuing and dequeuing them from the
-//! database. It serves as a conduit between tasks/jobs and the underlying
-//! storage system.
+//! A [`Queue`] manages tasks, including enqueuing and dequeuing them from the
+//! database. It serves as a conduit between tasks and the underlying storage
+//! system.
+//!
+//! Queues provide tasks in accordance with their configuration. For example, a
+//! task may define a priority, but otherwise is dequeued in a first-in,
+//! first-out manner.
+//!
+//! Because queues are generic over the task, there is always a one-to-one
+//! relationship between a queue and the concrete task type it contains.
+//!
 //! ```rust,no_run
 //! use serde::{Deserialize, Serialize};
 //! use sqlx::PgPool;
@@ -184,9 +162,11 @@
 //!
 //! ### Worker
 //!
-//! A `Worker` continuously polls the queue for tasks and executes them. It
-//! works with any type that implements the `Task` trait, including both custom
-//! `Task` implementations and `Job`s.
+//! A [`Worker`] continuously polls the queue for tasks and executes them. It
+//! works with any type that implements [`Task`].
+//!
+//! Until a worker is run, tasks remain on their queue, waiting to be processed.
+//!
 //! ```rust,no_run
 //! use serde::{Deserialize, Serialize};
 //! use sqlx::PgPool;
@@ -229,7 +209,8 @@
 //! ## Example
 //!
 //! Combining the concepts, here's how you can set up a task queue and worker to
-//! send welcome emails using `Job` for added convenience:
+//! send welcome emails using [`Job`] for added convenience:
+//!
 //! ```rust,no_run
 //! use serde::{Deserialize, Serialize};
 //! use sqlx::PgPool;
@@ -285,122 +266,6 @@
 //!     Ok(())
 //! }
 //! ```
-//!
-//! ## Advanced Features
-//!
-//! ### Retry Policies
-//!
-//! Customize how tasks are retried upon failure using `RetryPolicy`. Both
-//! `Task` and `Job` can specify retry policies.
-//! ```rust
-//! use underway::{
-//!     task::{Result as TaskResult, RetryPolicy, RetryPolicyBuilder},
-//!     Task,
-//! };
-//!
-//! struct MyTask;
-//!
-//! impl Task for MyTask {
-//!     type Input = ();
-//!
-//!     async fn execute(&self, _input: Self::Input) -> TaskResult {
-//!         // Task logic here.
-//!         Ok(())
-//!     }
-//!
-//!     fn retry_policy(&self) -> RetryPolicy {
-//!         RetryPolicyBuilder::new()
-//!             .max_attempts(3)
-//!             .initial_interval_ms(500)
-//!             .backoff_coefficient(2.0)
-//!             .build()
-//!     }
-//! }
-//! ```
-//!
-//! ### Concurrency Keys
-//!
-//! Prevent multiple tasks with the same concurrency key from executing
-//! simultaneously. This is useful for avoiding race conditions when tasks
-//! operate on shared resources.
-//! ```rust
-//! use std::path::PathBuf;
-//!
-//! use underway::{task::Result as TaskResult, Task};
-//!
-//! struct FileProcessingTask {
-//!     path: PathBuf,
-//! };
-//!
-//! impl Task for FileProcessingTask {
-//!     type Input = ();
-//!
-//!     async fn execute(&self, input: Self::Input) -> TaskResult {
-//!         // Process the file.
-//!         Ok(())
-//!     }
-//!
-//!     fn concurrency_key(&self) -> Option<String> {
-//!         // Use the file path as the concurrency key.
-//!         self.path.to_str().map(String::from)
-//!     }
-//! }
-//! ```
-//!
-//! ### Dead Letter Queues
-//!
-//! Handle failed tasks by specifying a dead letter queue. Tasks that exceed the
-//! maximum retry attempts are moved to the DLQ for inspection or manual
-//! intervention.
-//! ```rust,no_run
-//! use sqlx::PgPool;
-//! use underway::{
-//!     queue::Error as QueueError, task::Result as TaskResult, Queue, QueueBuilder, Task,
-//! };
-//!
-//! struct MyTask;
-//!
-//! impl Task for MyTask {
-//!     type Input = ();
-//!
-//!     async fn execute(&self, _input: Self::Input) -> TaskResult {
-//!         // Task logic here.
-//!         Ok(())
-//!     }
-//! }
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
-//!
-//!     let queue: Queue<MyTask> = QueueBuilder::new()
-//!         .name("main_queue")
-//!         .dead_letter_queue("dead_letter_queue")
-//!         .pool(pool)
-//!         .build()
-//!         .await?;
-//!
-//!     Ok(())
-//! }
-//! ```
-//!
-//! ## Tasks and Jobs
-//!
-//! The relationship between `Task` and `Job` is central to Underway's design:
-//!
-//! - **`Task` Trait**: Represents the core interface for any unit of work. It
-//!   defines the input type and the execution logic. Developers can implement
-//!   `Task` directly for maximum flexibility.
-//!
-//! - **`Job` Struct**: A specialized implementation of `Task` that provides
-//!   additional management capabilities, such as enqueuing, cancelling, and
-//!   running tasks. It abstracts over the lower-level building blocks, offering
-//!   a higher-level API for common operations.
-//!
-//! **In other words, `Job` is a kind of `Task` with extra features to simplify
-//! task management within the queueing system.** This design allows developers
-//! to choose between implementing `Task` directly or using `Job` for
-//! convenience, depending on their needs.
 
 #![forbid(unsafe_code)]
 
@@ -416,7 +281,6 @@ pub use crate::{
 pub mod job;
 pub mod queue;
 pub mod task;
-mod timestamp;
 pub mod worker;
 
 pub static MIGRATOR: Migrator = sqlx::migrate!();

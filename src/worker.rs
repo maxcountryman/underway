@@ -1,4 +1,4 @@
-use jiff::Span;
+use jiff::{Span, ToSpan};
 use serde::{de::DeserializeOwned, Serialize};
 use sqlx::{postgres::types::PgInterval, PgConnection};
 use tracing::instrument;
@@ -25,6 +25,10 @@ pub enum Error {
     /// deserializing task input.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+
+    /// Error returned by the `jiff` crate.
+    #[error(transparent)]
+    Jiff(#[from] jiff::Error),
 
     /// Error returned from queue operations.
     #[error(transparent)]
@@ -65,16 +69,11 @@ impl<T: Task> Worker<T> {
     }
 
     pub async fn run(&self) -> Result {
-        let period = tokio::time::Duration::from_secs(1);
-        let mut interval = tokio::time::interval(period);
-        interval.tick().await;
-        loop {
-            self.process_next_task().await?;
-            interval.tick().await;
-        }
+        self.run_every(1.seconds()).await
     }
 
-    pub async fn run_on(&self, interval: &mut tokio::time::Interval) -> Result {
+    pub async fn run_every(&self, span: Span) -> Result {
+        let mut interval = tokio::time::interval(span.try_into()?);
         interval.tick().await;
         loop {
             self.process_next_task().await?;
@@ -83,12 +82,11 @@ impl<T: Task> Worker<T> {
     }
 
     pub async fn run_scheduler(&self) -> Result {
-        let period = tokio::time::Duration::from_secs(1);
-        let mut interval = tokio::time::interval(period);
-        self.run_scheduler_on(&mut interval).await
+        self.run_scheduler_every(1.seconds()).await
     }
 
-    pub async fn run_scheduler_on(&self, interval: &mut tokio::time::Interval) -> Result {
+    pub async fn run_scheduler_every(&self, span: Span) -> Result {
+        let mut interval = tokio::time::interval(span.try_into()?);
         interval.tick().await;
         loop {
             self.process_next_schedule().await?;
