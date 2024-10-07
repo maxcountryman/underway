@@ -7,7 +7,7 @@ use sqlx::PgExecutor;
 
 use crate::{
     queue::{Error as QueueError, Queue, ZonedSchedule},
-    task::{Id as TaskId, Result as TaskResult, RetryPolicy, Task},
+    task::{Error as TaskError, Id as TaskId, Result as TaskResult, RetryPolicy, Task},
     worker::{Result as WorkerResult, Worker},
 };
 
@@ -18,18 +18,17 @@ type Result<T = ()> = std::result::Result<T, Error>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// Error returned by the `sqlx` crate during database operations.
-    #[error(transparent)]
-    Database(#[from] sqlx::Error),
-
     /// Error returned from queue operations.
     #[error(transparent)]
     Queue(#[from] QueueError),
 
-    /// Custom error that accepts any string. This allows for more flexible
-    /// error reporting.
-    #[error("{0}")]
-    Custom(String),
+    /// Error returned from task execution.
+    #[error(transparent)]
+    Task(#[from] TaskError),
+
+    /// Error returned from database operations.
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
 }
 
 #[derive(Clone)]

@@ -20,7 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool = PgPool::connect(database_url).await?;
 
     // Run migrations.
-    underway::MIGRATOR.run(&pool.clone()).await?;
+    underway::MIGRATOR.run(&pool).await?;
 
     // Create the task queue.
     let queue = QueueBuilder::new()
@@ -30,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     // Build the job.
-    let job = JobBuilder::new(queue.clone())
+    let job = JobBuilder::new(queue)
         .execute(
             |WelcomeEmail {
                  user_id,

@@ -3,7 +3,7 @@
 </h1>
 
 <p align="center">
-    ⏳ <strong>Underway</strong> is a distributed task queue built on top of PostgreSQL.
+    ⏳ <strong>Underway</strong> is a PostgreSQL-backed job queue for reliable background task processing.
 </p>
 
 <div align="center">
@@ -20,17 +20,15 @@
 
 ## 🎨 Overview
 
-Underway provides a reliable and efficient way to execute asynchronous tasks in a distributed environment, leveraging PostgreSQL as a backend for task storage and coordination. It is designed to be simple, scalable, and resilient, making it suitable for a wide range of applications.
+Underway provides a robust and efficient way to execute asynchronous tasks using PostgreSQL as the backend for task storage and coordination. It is designed to be simple, scalable, and resilient, handling job processing in a way that ensures safe concurrency and reliable task execution. Whether you're processing tasks on a single server or across multiple workers, Underway makes it easy to manage background jobs with confidence.
 
 Key Features:
 
-- **Distributed Task Execution**: Easily distribute tasks across multiple workers and machines.
-- **Reliable Persistence**: Tasks are stored in PostgreSQL, ensuring durability and reliability.
-- **Strongly Typed Tasks**: Define tasks with strongly typed inputs using Rust’s type system.
-- **Flexible Retry Policies**: Configure custom retry strategies with exponential backoff.
-- **Concurrency Control**: Limit task execution with concurrency keys to prevent race conditions.
-- **Priority Queueing**: Assign priorities to tasks to control execution order.
-- **Dead Letter Queue (DLQ)**: Automatically handle failed tasks by moving them to a DLQ for later inspection.
+- **PostgreSQL-Backed** Leverages PostgreSQL for reliable task storage and coordination, ensuring high consistency and safe concurrency.
+- **Transactional Task Enqueueing** Supports enqueuing tasks within a provided database transaction, ensuring they are only added if the transaction commits successfully—ideal for operations like user registration.
+- **Automatic Retries** Offers customizable retry strategies for failed jobs, ensuring tasks are reliably completed even after transient failures.
+- **Cron-Like Scheduling** Supports scheduling recurring tasks with cron-like expressions, enabling automated, time-based job execution.
+- **Scalable and Flexible** Scales from a single worker to multiple workers with minimal configuration, allowing seamless background job processing.
 
 ## 🤸 Usage
 

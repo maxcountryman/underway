@@ -17,7 +17,15 @@ pub struct Worker<T: Task> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// Error returned by the `sqlx` crate during database operations.
+    /// Error returned from queue operations.
+    #[error(transparent)]
+    Queue(#[from] QueueError),
+
+    /// Error returned from task execution.
+    #[error(transparent)]
+    Task(#[from] TaskError),
+
+    /// Error return from database operations.
     #[error(transparent)]
     Database(#[from] sqlx::Error),
 
@@ -29,14 +37,6 @@ pub enum Error {
     /// Error returned by the `jiff` crate.
     #[error(transparent)]
     Jiff(#[from] jiff::Error),
-
-    /// Error returned from queue operations.
-    #[error(transparent)]
-    Queue(#[from] QueueError),
-
-    /// Error returned from task execution.
-    #[error(transparent)]
-    Task(#[from] TaskError),
 }
 
 impl<I> From<Job<I>> for Worker<Job<I>>
