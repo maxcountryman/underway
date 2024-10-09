@@ -1,3 +1,46 @@
+//! Jobs are a higher-level abstraction over the [`Task`] trait.
+//!
+//! # Defining jobs
+//!
+//! A builder is provided allowing applications to define the configuration of
+//! their jobs. Minimally an execute method must be provided. Reasonable
+//! defaults are provided for other configuration and these may be defined with
+//! their respective builder methods.
+//!
+//! ```rust
+//! # use sqlx::PgPool;
+//! # use underway::Queue;
+//! use serde::{Deserialize, Serialize};
+//! use underway::Job;
+//!
+//! # use tokio::runtime::Runtime;
+//! # fn main() {
+//! # let rt = Runtime::new().unwrap();
+//! # rt.block_on(async {
+//! # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
+//! # let queue = Queue::builder()
+//! #    .name("example_queue")
+//! #    .pool(pool)
+//! #    .build()
+//! #    .await?;
+//! # /*
+//! let queue = { /* The queue we've defined for our job */ };
+//! # */
+//! #[derive(Clone, Serialize, Deserialize)]
+//! struct Message {
+//!     content: String,
+//! }
+//! let job = Job::builder()
+//!     .queue(queue)
+//!     .execute(|Message { content }| async move {
+//!         println!("Received: {content}");
+//!         Ok(())
+//!     })
+//!     .build();
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! # });
+//! # }
+//! ```
 use std::{future::Future, marker::PhantomData, pin::Pin, sync::Arc};
 
 use builder_states::{ExecutorSet, Initial, QueueSet};
@@ -11,11 +54,14 @@ use crate::{
     worker::{Result as WorkerResult, Worker},
 };
 
+type JobInput<I> = <Job<I> as Task>::Input;
+
 type ExecuteFn<I> =
     Arc<dyn Fn(I) -> Pin<Box<dyn Future<Output = TaskResult> + Send>> + Send + Sync>;
 
 type Result<T = ()> = std::result::Result<T, Error>;
 
+/// Job errors.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// Error returned from queue operations.
@@ -31,6 +77,7 @@ pub enum Error {
     Database(#[from] sqlx::Error),
 }
 
+/// An ergnomic implementation of the `Task` trait.
 #[derive(Clone)]
 pub struct Job<I>
 where
@@ -52,8 +99,13 @@ where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
     Self: Task,
 {
+    /// Create a new job builder.
+    pub fn builder() -> JobBuilder<I, Initial> {
+        JobBuilder::default()
+    }
+
     /// Enqueue the job using a connection from the queue's pool.
-    pub async fn enqueue(&self, input: <Job<I> as Task>::Input) -> Result<TaskId> {
+    pub async fn enqueue(&self, input: JobInput<I>) -> Result<TaskId> {
         let mut conn = self.queue.pool.acquire().await?;
         self.enqueue_using(&mut *conn, input).await
     }
@@ -62,11 +114,7 @@ where
     ///
     /// This allows jobs to be enqueued using the same transaction as an
     /// application may already be using in a given context.
-    pub async fn enqueue_using<'a, E>(
-        &self,
-        executor: E,
-        input: <Job<I> as Task>::Input,
-    ) -> Result<TaskId>
+    pub async fn enqueue_using<'a, E>(&self, executor: E, input: JobInput<I>) -> Result<TaskId>
     where
         E: PgExecutor<'a>,
     {
@@ -75,11 +123,21 @@ where
         Ok(id)
     }
 
+    /// Schedule the job using a connection from the queue's pool.
+    pub async fn schedule(&self, zoned_schedule: ZonedSchedule, input: JobInput<I>) -> Result {
+        let mut conn = self.queue.pool.acquire().await?;
+        self.schedule_using(&mut *conn, zoned_schedule, input).await
+    }
+
+    /// Schedule the job using the provided executor.
+    ///
+    /// This allows jobs to be scheduled using the same transaction as an
+    /// application may already be using in a given context.
     pub async fn schedule_using<'a, E>(
         &self,
         executor: E,
         zoned_schedule: ZonedSchedule,
-        input: <Job<I> as Task>::Input,
+        input: JobInput<I>,
     ) -> Result
     where
         E: PgExecutor<'a>,
@@ -87,15 +145,6 @@ where
         self.queue.schedule(executor, zoned_schedule, input).await?;
 
         Ok(())
-    }
-
-    pub async fn schedule(
-        &self,
-        zoned_schedule: ZonedSchedule,
-        input: <Job<I> as Task>::Input,
-    ) -> Result {
-        let mut conn = self.queue.pool.acquire().await?;
-        self.schedule_using(&mut *conn, zoned_schedule, input).await
     }
 
     /// Marks the given task as cancelled using a connection from the queue's
@@ -149,6 +198,8 @@ mod builder_states {
     }
 }
 
+/// A builder of [`Job`].
+#[derive(Debug)]
 pub struct JobBuilder<I, S = Initial>
 where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
@@ -167,31 +218,44 @@ impl<I, S> JobBuilder<I, S>
 where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
 {
+    /// Sets the job's retry policy.
     pub fn retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
         self.retry_policy = retry_policy;
         self
     }
 
+    /// Sets the job's timeout.
     pub fn timeout(mut self, timeout: Span) -> Self {
         self.timeout = timeout;
         self
     }
 
+    /// Sets the job's time-to-live (TTL).
     pub fn ttl(mut self, ttl: Span) -> Self {
         self.ttl = ttl;
         self
     }
 
+    /// Sets the job's delay.
+    ///
+    /// The job will not be processed before this delay has elapsed.
     pub fn delay(mut self, delay: Span) -> Self {
         self.delay = delay;
         self
     }
 
+    /// Sets the job's concurrency key.
+    ///
+    /// Concurrency keys ensure that only one job of the given key may be
+    /// processed at a time.
     pub fn concurrency_key(mut self, concurrency_key: impl Into<String>) -> Self {
         self.concurrency_key = Some(concurrency_key.into());
         self
     }
 
+    /// Sets the job's priority.
+    ///
+    /// Higher priorities are processed first.
     pub fn priority(mut self, priority: i32) -> Self {
         self.priority = priority;
         self
@@ -202,10 +266,10 @@ impl<I> JobBuilder<I, Initial>
 where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
 {
-    /// Create a job builder that will use the provided queue.
-    pub fn new(queue: Queue<Job<I>>) -> JobBuilder<I, QueueSet<I>> {
+    /// Create a job builder.
+    pub fn new() -> JobBuilder<I, Initial> {
         JobBuilder::<I, _> {
-            state: QueueSet { queue },
+            state: Initial,
             retry_policy: RetryPolicy::default(),
             timeout: Span::new().minutes(15),
             ttl: Span::new().days(14),
@@ -215,12 +279,36 @@ where
             _marker: PhantomData,
         }
     }
+
+    /// Set the queue name.
+    pub fn queue(self, queue: Queue<Job<I>>) -> JobBuilder<I, QueueSet<I>> {
+        JobBuilder {
+            state: QueueSet { queue },
+            retry_policy: self.retry_policy,
+            timeout: self.timeout,
+            ttl: self.ttl,
+            delay: self.delay,
+            concurrency_key: self.concurrency_key,
+            priority: self.priority,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<I> Default for JobBuilder<I, Initial>
+where
+    I: Clone + DeserializeOwned + Serialize + Send + 'static,
+{
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<I> JobBuilder<I, QueueSet<I>>
 where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
 {
+    /// Set's the job's execute method.
     pub fn execute<F, Fut>(self, f: F) -> JobBuilder<I, ExecutorSet<I>>
     where
         F: Fn(I) -> Fut + Send + Sync + 'static,
@@ -249,9 +337,10 @@ impl<I> JobBuilder<I, ExecutorSet<I>>
 where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
 {
-    pub async fn build(self) -> Result<Job<I>> {
+    /// Returns a configured [`Job`].
+    pub fn build(self) -> Job<I> {
         let ExecutorSet { queue, execute_fn } = self.state;
-        Ok(Job {
+        Job {
             queue,
             execute_fn,
             retry_policy: self.retry_policy,
@@ -260,7 +349,7 @@ where
             delay: self.delay,
             concurrency_key: self.concurrency_key,
             priority: self.priority,
-        })
+        }
     }
 }
 
@@ -275,7 +364,7 @@ where
     }
 
     fn retry_policy(&self) -> RetryPolicy {
-        self.retry_policy.clone()
+        self.retry_policy
     }
 
     fn timeout(&self) -> Span {

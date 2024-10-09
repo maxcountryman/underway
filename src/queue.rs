@@ -1,70 +1,45 @@
 //! Queues provide an interface for managing task execution.
 //!
-//! Tasks are put on, i.e. "enqueued", to a given queue and then may be later
-//! taken off, i.e. "dequeued", from the queue. This happens in a "first-in,
-//! first-out" ordering (FIFO).
+//! Tasks are enqueued onto the queue, using the [`Queue::enqueue`] method, and
+//! later dequeued, using the [`Queue::dequeue`] method, when they're executed.
 //!
-//! Note that tasks may also specify a priority, which further dictates orderin.
-//! Higher-priority tasks are processed before lower-priority tasks.
+//! The semantics for retrieving a task from the queue are defined by the order
+//! of insertion (first-in, first-out) or the priority of the task
+//! defines. If a priority is defined, then it's considered before the order the
+//! task was inserted.
 //!
-//! # Dead-letter Queues
+//! Queues may also define an optional "dead-letter" queue, which provides a
+//! secondary queue where failed tasks can be stored for later inspection.
 //!
-//! An optional dead-letter queue may be specified. When a task has entered a
-//! fatal state it will be moved onto the dead-letter queue where it can be
-//! further processed.
+//! # Processing tasks
 //!
-//! # Example
+//! Note that while queues provide methods for enqueuing and dequeuing tasks,
+//! you will generaly not use these methods directly and instead use jobs and
+//! their workers, respectively.
 //!
-//! ```rust
-//! # use tokio::runtime::Runtime;
-//! # use underway::Task;
-//! # use underway::task::Result as TaskResult;
-//! use sqlx::PgPool;
-//! use underway::QueueBuilder;
+//! For example, `Job` provides an [`enqueue`](crate::Job::enqueue) method,
+//! which wraps its queue's enqueue method. Likewise, when a job spins up a
+//! worker via its [`run`](crate::Job::run) method, that worker uses its queue's
+//! dequeue method.
 //!
-//! # struct MyTask;
-//! # impl Task for MyTask {
-//! #    type Input = ();
-//! #    async fn execute(&self, input: Self::Input) -> TaskResult {
-//! #        Ok(())
-//! #    }
-//! # }
-//! # fn main() {
-//! # let rt = Runtime::new().unwrap();
-//! # rt.block_on(async {
-//! let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
+//! # Scheduling tasks
 //!
-//! let queue = QueueBuilder::new()
-//!     .name("example_queue")
-//!     .dead_letter_queue("example_dlq")
-//!     .pool(pool.clone())
-//!     .build()
-//!     .await?;
-//!
-//!  # /*
-//! let my_task = { /* A type that implements `Task`. */ };
-//! # */
-//! # let my_task = MyTask;
-//! let task_id = queue.enqueue(&pool, &my_task, ()).await?;
-//!
-//! if let Some(task) = queue.dequeue(&pool).await? {
-//!     // Process the task here
-//! }
-//! # Ok::<(), Box<dyn std::error::Error>>(())
-//! # });
-//! # }
-//! ```
+//! In order to enable cron-like task scheduling, a schedule must be set on the
+//! queue. This can be done via the [`schedule`](Queue::schedule) method. Once
+//! set, a worker can be used to run the schedule via the
+//! [`run_scheduler`](crate::Job::run_scheduler) method.
+
 use std::{marker::PhantomData, time::Duration as StdDuration};
 
 use builder_states::{Initial, NameSet, PoolSet};
 use jiff::{tz::TimeZone, Span, Zoned};
 use jiff_cron::Schedule;
-use sqlx::{postgres::types::PgInterval, Acquire, PgExecutor, PgPool, Postgres};
+use sqlx::{Acquire, PgExecutor, PgPool, Postgres};
 use tracing::instrument;
 use ulid::Ulid;
 use uuid::Uuid;
 
-use crate::task::{Id as TaskId, State as TaskState, Task};
+use crate::task::{DequeuedTask, Id as TaskId, State as TaskState, Task};
 
 type Result<T = ()> = std::result::Result<T, Error>;
 
@@ -96,7 +71,62 @@ pub enum Error {
     TaskNotFound(Uuid),
 }
 
-/// Queue over a task.
+/// Task queue.
+///
+/// Queues are responsible for managing tasks that implement the `Task` trait.
+/// They are generic over task types, meaning that each queue contains only a
+/// specific type of task, ensuring type safety and correctness at compile time.
+///
+/// # Dead-letter queues
+///
+/// When a dead-letter queue name is provided, a secondary queue is created with
+/// this name. This is a queue of "dead letters". In other words, it's a queue
+/// of tasks that have failed on the queue and can't be retried. This can be
+/// useful for identifying patterns of failures or reprocessing failed tasks
+/// when they're likely to succeed again.
+///
+/// # Example
+///
+/// ```rust
+/// # use tokio::runtime::Runtime;
+/// # use underway::Task;
+/// # use underway::task::Result as TaskResult;
+/// use sqlx::PgPool;
+/// use underway::Queue;
+///
+/// # struct MyTask;
+/// # impl Task for MyTask {
+/// #    type Input = ();
+/// #    async fn execute(&self, input: Self::Input) -> TaskResult {
+/// #        Ok(())
+/// #    }
+/// # }
+/// # fn main() {
+/// # let rt = Runtime::new().unwrap();
+/// # rt.block_on(async {
+/// let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
+///
+/// let queue = Queue::builder()
+///     .name("example_queue")
+///     .dead_letter_queue("example_dlq")
+///     .pool(pool.clone())
+///     .build()
+///     .await?;
+///
+///  # /*
+/// let my_task = { /* A type that implements `Task`. */ };
+/// # */
+/// # let my_task = MyTask;
+/// let task_id = queue.enqueue(&pool, &my_task, ()).await?;
+///
+/// if let Some(task) = queue.dequeue(&pool).await? {
+///     // Process the task here
+/// }
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// # });
+/// # }
+/// ```
+#[derive(Debug)]
 pub struct Queue<T: Task> {
     name: String,
     pub(crate) dlq_name: Option<String>,
@@ -116,31 +146,28 @@ impl<T: Task> Clone for Queue<T> {
 }
 
 impl<T: Task> Queue<T> {
-    /// Creates a new queue with the given name.
-    ///
-    /// Note that `name` must be unique. If `name` already exists, nothing
-    /// happens and we carry on with the assumption that the database is
-    /// already configured appropriately.
-    pub async fn create<'a, E>(executor: E, name: impl Into<String>) -> Result
-    where
-        E: PgExecutor<'a>,
-    {
-        sqlx::query!(
-            r#"
-            insert into underway.task_queue (name) values ($1)
-            on conflict do nothing
-            "#,
-            name.into()
-        )
-        .execute(executor)
-        .await?;
-
-        Ok(())
+    /// Creates a builder for a new queue.
+    pub fn builder() -> QueueBuilder<T, Initial> {
+        QueueBuilder::default()
     }
 
-    /// Enqueues a new task, returning the enqueued task's ID.
+    /// Enqueues a new task into the task queue, returning the task's unique ID.
     ///
-    /// Task configuration is defined by the implementation of `Task`.
+    /// This function inserts a new task into the database using the provided
+    /// executor. By using a transaction as the executor, you can ensure
+    /// that the task is only enqueued if the transaction successfully
+    /// commits.
+    ///
+    /// The enqueued task will have its retry policy, timeout, time-to-live,
+    /// delay, concurrency key, and priority configured as specified by the task
+    /// type.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if:
+    ///
+    /// - The `input` cannot be serialized to JSON.
+    /// - The database operation fails during the insertion.
     #[instrument(skip(self, executor, task, input), fields(task.id = tracing::field::Empty), err)]
     pub async fn enqueue<'a, E>(&self, executor: E, task: &T, input: T::Input) -> Result<TaskId>
     where
@@ -196,8 +223,6 @@ impl<T: Task> Queue<T> {
     }
 
     /// Returns the next available task.
-    ///
-    /// When a task is available, `DequeuedTask` is returned.
     #[instrument(skip(self, conn), fields(task.id = tracing::field::Empty), err)]
     pub async fn dequeue<'a, A>(&self, conn: A) -> Result<Option<DequeuedTask>>
     where
@@ -285,12 +310,23 @@ impl<T: Task> Queue<T> {
         Ok(())
     }
 
-    /// Returns a tuple of the zoned schedule and task input.
+    /// Runs an infinite loop that deletes expired tasks on an interval.
     ///
-    /// Tasks may only have a single schedule. Separate tasks should be defined
-    /// for each schedule.
+    /// Task time-to-live semantics are only enforced when this method is used.
+    pub async fn continuously_delete_expired(&self, period: Span) -> Result {
+        let mut interval = tokio::time::interval(period.try_into()?);
+        interval.tick().await;
+        loop {
+            self.delete_expired(&self.pool).await?;
+            interval.tick().await;
+        }
+    }
+
     #[instrument(skip(self, executor), err)]
-    pub async fn task_schedule<'a, E>(&self, executor: E) -> Result<(ZonedSchedule, T::Input)>
+    pub(crate) async fn task_schedule<'a, E>(
+        &self,
+        executor: E,
+    ) -> Result<(ZonedSchedule, T::Input)>
     where
         E: PgExecutor<'a>,
     {
@@ -309,16 +345,21 @@ impl<T: Task> Queue<T> {
         Ok((zoned_schedule, input))
     }
 
-    /// Runs an infinite loop that deletes expired tasks on an interval.
-    ///
-    /// Task time-to-live semantics are only enforced when this method is used.
-    pub async fn continuously_delete_expired(&self, period: Span) -> Result {
-        let mut interval = tokio::time::interval(period.try_into()?);
-        interval.tick().await;
-        loop {
-            self.delete_expired(&self.pool).await?;
-            interval.tick().await;
-        }
+    pub(crate) async fn create<'a, E>(executor: E, name: impl Into<String>) -> Result
+    where
+        E: PgExecutor<'a>,
+    {
+        sqlx::query!(
+            r#"
+            insert into underway.task_queue (name) values ($1)
+            on conflict do nothing
+            "#,
+            name.into()
+        )
+        .execute(executor)
+        .await?;
+
+        Ok(())
     }
 
     #[instrument(skip(self, executor, task_id), fields(task.id = %task_id.as_hyphenated()), err)]
@@ -572,20 +613,6 @@ impl<T: Task> Queue<T> {
     }
 }
 
-/// Task that's been "taken off" the queue.
-#[derive(Debug, sqlx::FromRow)]
-pub struct DequeuedTask {
-    pub id: TaskId,
-    pub input: serde_json::Value,
-    pub timeout: PgInterval,
-    pub retry_count: i32,
-    pub max_attempts: i32,
-    pub initial_interval_ms: i32,
-    pub max_interval_ms: i32,
-    pub backoff_coefficient: f32,
-    pub concurrency_key: Option<String>,
-}
-
 mod builder_states {
     use sqlx::PgPool;
 
@@ -603,13 +630,21 @@ mod builder_states {
     }
 }
 
-#[derive(Debug, Default)]
+/// A builder for [`Queue`].
+#[derive(Debug)]
 pub struct QueueBuilder<T: Task, S> {
     state: S,
     _marker: PhantomData<T>,
 }
 
+impl<T: Task> Default for QueueBuilder<T, Initial> {
+    fn default() -> Self {
+        QueueBuilder::new()
+    }
+}
+
 impl<T: Task> QueueBuilder<T, Initial> {
+    /// Create a new queue builder.
     pub fn new() -> Self {
         Self {
             state: Initial,
@@ -617,6 +652,7 @@ impl<T: Task> QueueBuilder<T, Initial> {
         }
     }
 
+    /// Set the queue name.
     pub fn name(self, name: impl Into<String>) -> QueueBuilder<T, NameSet> {
         QueueBuilder {
             state: NameSet {
@@ -629,11 +665,13 @@ impl<T: Task> QueueBuilder<T, Initial> {
 }
 
 impl<T: Task> QueueBuilder<T, NameSet> {
+    /// Set the dead-letter queue name.
     pub fn dead_letter_queue(mut self, dlq_name: impl Into<String>) -> Self {
         self.state.dlq_name = Some(dlq_name.into());
         self
     }
 
+    /// Set the database connection pool.
     pub fn pool(self, pool: PgPool) -> QueueBuilder<T, PoolSet> {
         QueueBuilder {
             state: PoolSet {
@@ -647,6 +685,7 @@ impl<T: Task> QueueBuilder<T, NameSet> {
 }
 
 impl<T: Task> QueueBuilder<T, PoolSet> {
+    /// Builds the queue.
     pub async fn build(self) -> Result<Queue<T>> {
         let state = self.state;
 
@@ -674,24 +713,21 @@ impl<T: Task> QueueBuilder<T, PoolSet> {
 /// Schedule paired with its time zone.
 pub struct ZonedSchedule {
     schedule: Schedule,
-    schedule_tz: TimeZone,
+    timezone: TimeZone,
 }
 
 impl ZonedSchedule {
     /// Create a new schedule which is associated with a time zone.
     pub fn new(cron_expr: &str, time_zone_name: &str) -> Result<Self> {
         let schedule = cron_expr.parse()?;
-        let schedule_tz = TimeZone::get(time_zone_name)?;
+        let timezone = TimeZone::get(time_zone_name)?;
 
         assert!(
-            schedule_tz.iana_name().is_some(),
+            timezone.iana_name().is_some(),
             "Time zones must use IANA names for now"
         );
 
-        Ok(Self {
-            schedule,
-            schedule_tz,
-        })
+        Ok(Self { schedule, timezone })
     }
 
     fn cron_expr(&self) -> String {
@@ -699,15 +735,15 @@ impl ZonedSchedule {
     }
 
     fn iana_name(&self) -> &str {
-        self.schedule_tz
+        self.timezone
             .iana_name()
             .expect("iana_name should always be Some because new ensures valid time zone")
     }
 
-    pub(crate) fn duration_until_next(&self) -> Option<std::time::Duration> {
+    pub(crate) fn duration_until_next(&self) -> Option<StdDuration> {
         // Construct a date-time with the schedule's time zone.
-        let now_with_tz = Zoned::now().with_time_zone(self.schedule_tz.clone());
-        if let Some(next_timestamp) = self.schedule.upcoming(self.schedule_tz.clone()).next() {
+        let now_with_tz = Zoned::now().with_time_zone(self.timezone.clone());
+        if let Some(next_timestamp) = self.schedule.upcoming(self.timezone.clone()).next() {
             let until_next = next_timestamp.duration_since(&now_with_tz);
             // N.B. We're assigning default on failure here.
             return Some(until_next.try_into().unwrap_or_default());
@@ -738,7 +774,7 @@ mod tests {
 
     #[sqlx::test]
     async fn build_queue(pool: PgPool) -> sqlx::Result<(), Error> {
-        let queue: Queue<TestTask> = QueueBuilder::new()
+        let queue: Queue<TestTask> = Queue::builder()
             .name("test_queue")
             .pool(pool)
             .build()
@@ -752,7 +788,7 @@ mod tests {
 
     #[sqlx::test]
     async fn build_queue_with_dlq(pool: PgPool) -> sqlx::Result<(), Error> {
-        let queue: Queue<TestTask> = QueueBuilder::new()
+        let queue: Queue<TestTask> = Queue::builder()
             .name("test_queue_with_dlq")
             .dead_letter_queue("dlq_test")
             .pool(pool)
@@ -767,7 +803,7 @@ mod tests {
 
     #[sqlx::test]
     async fn enqueue_task(pool: PgPool) -> sqlx::Result<(), Error> {
-        let queue = QueueBuilder::new()
+        let queue = Queue::builder()
             .name("test_enqueue")
             .pool(pool.clone())
             .build()
@@ -820,7 +856,7 @@ mod tests {
 
     #[sqlx::test]
     async fn dequeue_task(pool: PgPool) -> sqlx::Result<(), Error> {
-        let queue = QueueBuilder::new()
+        let queue = Queue::builder()
             .name("test_dequeue")
             .pool(pool.clone())
             .build()
@@ -880,7 +916,7 @@ mod tests {
 
     #[sqlx::test]
     async fn concurrent_dequeue(pool: PgPool) -> sqlx::Result<(), Box<dyn std::error::Error>> {
-        let queue = QueueBuilder::new()
+        let queue = Queue::builder()
             .name("test_concurrent_dequeue")
             .pool(pool.clone())
             .build()
@@ -922,7 +958,7 @@ mod tests {
 
     #[sqlx::test]
     async fn dequeue_from_empty_queue(pool: PgPool) -> sqlx::Result<(), Error> {
-        let queue: Queue<TestTask> = QueueBuilder::new()
+        let queue: Queue<TestTask> = Queue::builder()
             .name("test_empty_dequeue")
             .pool(pool.clone())
             .build()
@@ -938,7 +974,7 @@ mod tests {
 
     #[sqlx::test]
     async fn mark_task_in_progress(pool: PgPool) -> sqlx::Result<(), Error> {
-        let queue = QueueBuilder::new()
+        let queue = Queue::builder()
             .name("test_in_progress")
             .pool(pool.clone())
             .build()
@@ -970,7 +1006,7 @@ mod tests {
 
     #[sqlx::test]
     async fn reschedule_task_for_retry(pool: PgPool) -> sqlx::Result<(), Error> {
-        let queue = QueueBuilder::new()
+        let queue = Queue::builder()
             .name("test_reschedule")
             .pool(pool.clone())
             .build()
@@ -1019,7 +1055,7 @@ mod tests {
 
     #[sqlx::test]
     async fn mark_task_cancelled(pool: PgPool) -> sqlx::Result<(), Error> {
-        let queue = QueueBuilder::new()
+        let queue = Queue::builder()
             .name("test_cancel")
             .pool(pool.clone())
             .build()
@@ -1051,7 +1087,7 @@ mod tests {
 
     #[sqlx::test]
     async fn mark_task_succeeded(pool: PgPool) -> sqlx::Result<(), Error> {
-        let queue = QueueBuilder::new()
+        let queue = Queue::builder()
             .name("test_success")
             .pool(pool.clone())
             .build()
@@ -1083,7 +1119,7 @@ mod tests {
 
     #[sqlx::test]
     async fn mark_nonexistent_task_succeeded(pool: PgPool) -> sqlx::Result<(), Error> {
-        let queue: Queue<TestTask> = QueueBuilder::new()
+        let queue: Queue<TestTask> = Queue::builder()
             .name("test_nonexistent_task")
             .pool(pool.clone())
             .build()
@@ -1110,7 +1146,7 @@ mod tests {
 
     #[sqlx::test]
     async fn mark_nonexistent_task_failed(pool: PgPool) -> sqlx::Result<(), Error> {
-        let queue: Queue<TestTask> = QueueBuilder::new()
+        let queue: Queue<TestTask> = Queue::builder()
             .name("test_nonexistent_task")
             .pool(pool.clone())
             .build()
@@ -1137,7 +1173,7 @@ mod tests {
 
     #[sqlx::test]
     async fn mark_task_failed(pool: PgPool) -> sqlx::Result<(), Error> {
-        let queue = QueueBuilder::new()
+        let queue = Queue::builder()
             .name("test_fail")
             .pool(pool.clone())
             .build()
@@ -1170,7 +1206,7 @@ mod tests {
 
     #[sqlx::test]
     async fn update_task_failure(pool: PgPool) -> sqlx::Result<(), Error> {
-        let queue = QueueBuilder::new()
+        let queue = Queue::builder()
             .name("test_update_failure")
             .pool(pool.clone())
             .build()
@@ -1210,7 +1246,7 @@ mod tests {
 
     #[sqlx::test]
     async fn move_task_to_dlq(pool: PgPool) -> sqlx::Result<(), Error> {
-        let queue = QueueBuilder::new()
+        let queue = Queue::builder()
             .name("test_move_to_dlq")
             .dead_letter_queue("test_dlq")
             .pool(pool.clone())

@@ -37,7 +37,7 @@
 //!
 //! use serde::{Deserialize, Serialize};
 //! use sqlx::PgPool;
-//! use underway::{JobBuilder, QueueBuilder};
+//! use underway::{Job, Queue};
 //!
 //! const QUEUE_NAME: &str = "email";
 //!
@@ -58,14 +58,11 @@
 //!     underway::MIGRATOR.run(&pool).await?;
 //!
 //!     // Create the task queue.
-//!     let queue = QueueBuilder::new()
-//!         .name(QUEUE_NAME)
-//!         .pool(pool)
-//!         .build()
-//!         .await?;
+//!     let queue = Queue::builder().name(QUEUE_NAME).pool(pool).build().await?;
 //!
 //!     // Build the job.
-//!     let job = JobBuilder::new(queue)
+//!     let job = Job::builder()
+//!         .queue(queue)
 //!         .execute(
 //!             |WelcomeEmail {
 //!                  user_id,
@@ -77,8 +74,7 @@
 //!                 Ok(())
 //!             },
 //!         )
-//!         .build()
-//!         .await?;
+//!         .build();
 //!
 //!     // Enqueue a task.
 //!     let task_id = job
@@ -104,210 +100,52 @@
 //!
 //! - [Tasks](#tasks) represent a well-structure unit of work.
 //! - [Jobs](#jobs) are a higher-level abstraction over the [`Task`] trait.
-//! - [Queues](#queues) manage the lifecycle of tasks.
+//! - [Queues](#queues) provide an interface for managing task execution.
 //! - [Workers](#workers) interface with queues to execute tasks.
-//!
-//! Each of these is described in more detail below. Additionally, each concept
-//! is contained by module that provides comprehensive documentation of its API
-//! and how you might use it in your own applications.
 //!
 //! ### Tasks
 //!
-//! A [`Task`] defines the core behavior and input type of a unit of work to be
-//! executed. Tasks are strongly typed, ensuring that the data passed to the
-//! task is well-formed and predictable.
+//! Tasks are units of work to be executed, with clearly defined behavior and
+//! input.
 //!
-//! Implementations of `Task` also may provide various configuration of the task
-//! itself. For instance, tasks may define a custom
-//! [`RetryPolicy`](task::RetryPolicy) or configure their priority.
+//! This is the lowest-level concept in our design, with everything else being
+//! built around this idea.
 //!
-//! ```rust
-//! use serde::{Deserialize, Serialize};
-//! use underway::{task::Error as TaskError, Task};
-//! # use tokio::runtime::Runtime;
-//! #
-//! # fn main() {
-//! # let rt = Runtime::new().unwrap();
-//! # rt.block_on(async {
-//!
-//! // Define the input data for the task.
-//! #[derive(Debug, Deserialize, Serialize)]
-//! struct WelcomeEmail {
-//!     user_id: i32,
-//!     email: String,
-//!     name: String,
-//! }
-//!
-//! // Implement the task.
-//! struct WelcomeEmailTask;
-//!
-//! impl Task for WelcomeEmailTask {
-//!     type Input = WelcomeEmail;
-//!
-//!     async fn execute(&self, input: Self::Input) -> Result<(), TaskError> {
-//!         // Simulate sending an email.
-//!         println!(
-//!             "Sending welcome email to {} <{}> (user_id: {})",
-//!             input.name, input.email, input.user_id
-//!         );
-//!         Ok(())
-//!     }
-//! }
-//! # });
-//! # }
-//! ```
+//! See [`task`] for more details about tasks.
 //!
 //! ### Jobs
 //!
-//! A [`Job`] is an implementation of [`Task`] that provides a higher-level API
-//! for defining and operating tasks.
+//! Jobs are a specialized task which provide a higher-level API for defining
+//! and operating tasks.
 //!
-//! Jobs are defined using the [`JobBuilder`]. Because jobs are tasks, they also
-//! encode the same configuration, such as retry policies. This configuration is
-//! achieved through the builder.
+//! In most cases, applications will use jobs to define tasks instead of using
+//! the task trait directly.
 //!
-//! ```rust,no_run
-//! use serde::{Deserialize, Serialize};
-//! use sqlx::PgPool;
-//! use underway::{JobBuilder, QueueBuilder};
-//!
-//! #[derive(Debug, Clone, Deserialize, Serialize)]
-//! struct DataProcessingInput {
-//!     data_id: u64,
-//! }
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
-//!
-//!     // Create a queue.
-//!     let queue = QueueBuilder::new()
-//!         .name("data_processing_queue")
-//!         .pool(pool)
-//!         .build()
-//!         .await?;
-//!
-//!     // Build a job.
-//!     let job = JobBuilder::new(queue)
-//!         .execute(|DataProcessingInput { data_id }| async move {
-//!             // Process the data.
-//!             println!("Processing data with ID: {data_id}");
-//!             Ok(())
-//!         })
-//!         .build()
-//!         .await?;
-//!
-//!     // Enqueue the job.
-//!     job.enqueue(DataProcessingInput { data_id: 42 }).await?;
-//!
-//!     // Optionally, run the job immediately.
-//!     // job.run().await?;
-//!
-//!     Ok(())
-//! }
-//! ```
+//! See [`job`] for more details about jobs.
 //!
 //! ### Queues
 //!
-//! A [`Queue`] manages tasks, including enqueuing and dequeuing them from the
-//! database. It serves as a conduit between tasks and the underlying storage
-//! system.
+//! Queues manage tasks, including enqueuing and dequeuing them from the
+//! database.
 //!
-//! Queues provide tasks in accordance with their configuration. For example, a
-//! task may define a priority, but otherwise is dequeued in a first-in,
-//! first-out manner.
-//!
-//! Because queues are generic over the task, there is always a one-to-one
-//! relationship between a queue and the concrete task type it contains.
-//!
-//! ```rust,no_run
-//! use serde::{Deserialize, Serialize};
-//! use sqlx::PgPool;
-//! use underway::{
-//!     queue::Error as QueueError, task::Result as TaskResult, Queue, QueueBuilder, Task,
-//! };
-//!
-//! #[derive(Debug, Clone, Deserialize, Serialize)]
-//! struct MyTaskInput {
-//!     data: String,
-//! }
-//!
-//! struct MyTask;
-//!
-//! impl Task for MyTask {
-//!     type Input = MyTaskInput;
-//!
-//!     async fn execute(&self, input: Self::Input) -> TaskResult {
-//!         println!("Executing task with data: {}", input.data);
-//!         Ok(())
-//!     }
-//! }
-//!
-//! async fn create_queue(pool: PgPool) -> Result<Queue<MyTask>, QueueError> {
-//!     let queue = QueueBuilder::new()
-//!         .name("my_task_queue")
-//!         .pool(pool)
-//!         .build()
-//!         .await?;
-//!     Ok(queue)
-//! }
-//! ```
+//! See [`queue`] for more details about queues.
 //!
 //! ### Workers
 //!
-//! A [`Worker`] continuously polls the queue for tasks and executes them. It
-//! works with any type that implements [`Task`].
+//! Workers are derived from tasks and use their queue to find new work to
+//! execute.
 //!
-//! Until a worker is run, tasks remain on their queue, waiting to be processed.
-//! ```rust,no_run
-//! use serde::{Deserialize, Serialize};
-//! use sqlx::PgPool;
-//! use underway::{task::Result as TaskResult, QueueBuilder, Task, Worker};
+//! Besides this polling style of work execution, workers are also used to
+//! manage cron-like schedules.
 //!
-//! #[derive(Debug, Clone, Deserialize, Serialize)]
-//! struct MyTaskInput {
-//!     data: String,
-//! }
-//!
-//! struct MyTask;
-//!
-//! impl Task for MyTask {
-//!     type Input = MyTaskInput;
-//!
-//!     async fn execute(&self, input: Self::Input) -> TaskResult {
-//!         println!("Executing task with data: {}", input.data);
-//!         Ok(())
-//!     }
-//! }
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
-//!
-//!     let queue = QueueBuilder::new()
-//!         .name("my_task_queue")
-//!         .pool(pool.clone())
-//!         .build()
-//!         .await?;
-//!
-//!     let task = MyTask;
-//!     let worker = Worker::new(queue, task);
-//!     worker.run().await?;
-//!
-//!     Ok(())
-//! }
-//! ```
+//! See [`worker`] for more details about workers.
 
+#![warn(clippy::all, nonstandard_style, future_incompatible, missing_docs)]
 #![forbid(unsafe_code)]
 
 use sqlx::migrate::Migrator;
 
-pub use crate::{
-    job::{Job, JobBuilder},
-    queue::{Queue, QueueBuilder},
-    task::Task,
-    worker::Worker,
-};
+pub use crate::{job::Job, queue::Queue, task::Task, worker::Worker};
 
 pub mod job;
 pub mod queue;

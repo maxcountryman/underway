@@ -1,7 +1,7 @@
 use std::env;
 
 use sqlx::PgPool;
-use underway::{queue::ZonedSchedule, JobBuilder, QueueBuilder};
+use underway::{queue::ZonedSchedule, Job, Queue};
 
 const QUEUE_NAME: &str = "hello-world";
 
@@ -15,20 +15,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     underway::MIGRATOR.run(&pool).await?;
 
     // Create the task queue.
-    let queue = QueueBuilder::new()
-        .name(QUEUE_NAME)
-        .pool(pool)
-        .build()
-        .await?;
+    let queue = Queue::builder().name(QUEUE_NAME).pool(pool).build().await?;
 
     // Build the job.
-    let job = JobBuilder::new(queue)
+    let job = Job::builder()
+        .queue(queue)
         .execute(|_| async move {
             println!("Hello, World!");
             Ok(())
         })
-        .build()
-        .await?;
+        .build();
 
     // Schedule the job to run every minute in the given time zone.
     let every_minute = ZonedSchedule::new("0 * * * * *", "America/Los_Angeles")?;

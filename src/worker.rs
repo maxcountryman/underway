@@ -1,3 +1,47 @@
+//! Workers interface with queues to execute tasks.
+//!
+//! A [`Worker`] continuously polls the queue for tasks and executes them.
+//! It works with any type that implements [`Task`].
+//!
+//! Until a worker is run, tasks remain on their queue, waiting to be processed.
+//!
+//! ```rust,no_run
+//! use serde::{Deserialize, Serialize};
+//! use sqlx::PgPool;
+//! use underway::{task::Result as TaskResult, Queue, Task, Worker};
+//!
+//! #[derive(Debug, Clone, Deserialize, Serialize)]
+//! struct MyTaskInput {
+//!     data: String,
+//! }
+//!
+//! struct MyTask;
+//!
+//! impl Task for MyTask {
+//!     type Input = MyTaskInput;
+//!
+//!     async fn execute(&self, input: Self::Input) -> TaskResult {
+//!         println!("Executing task with data: {}", input.data);
+//!         Ok(())
+//!     }
+//! }
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
+//!
+//!     let queue = Queue::builder()
+//!         .name("my_task_queue")
+//!         .pool(pool.clone())
+//!         .build()
+//!         .await?;
+//!
+//!     let task = MyTask;
+//!     let worker = Worker::new(queue, task);
+//!     worker.run().await?;
+//!
+//!     Ok(())
+//! }
 use jiff::{Span, ToSpan};
 use serde::{de::DeserializeOwned, Serialize};
 use sqlx::{postgres::types::PgInterval, PgConnection};
@@ -5,16 +49,19 @@ use tracing::instrument;
 
 use crate::{
     job::Job,
-    queue::{DequeuedTask, Error as QueueError, Queue},
-    task::{Error as TaskError, Id as TaskId, RetryCount, RetryPolicy, Task},
+    queue::{Error as QueueError, Queue},
+    task::{DequeuedTask, Error as TaskError, Id as TaskId, RetryCount, RetryPolicy, Task},
 };
 pub(crate) type Result = std::result::Result<(), Error>;
 
+/// A worker that's generic over the task it processes.
+#[derive(Debug)]
 pub struct Worker<T: Task> {
     queue: Queue<T>,
     task: T,
 }
 
+/// Worker errors.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// Error returned from queue operations.
@@ -25,7 +72,7 @@ pub enum Error {
     #[error(transparent)]
     Task(#[from] TaskError),
 
-    /// Error return from database operations.
+    /// Error returned from database operations.
     #[error(transparent)]
     Database(#[from] sqlx::Error),
 
@@ -64,14 +111,21 @@ where
 }
 
 impl<T: Task> Worker<T> {
+    /// Creates a new worker with the given queue and task.
     pub const fn new(queue: Queue<T>, task: T) -> Self {
         Self { queue, task }
     }
 
+    /// Runs the worker, processing tasks as they become available.
+    ///
+    /// Tasks are processed via polling in a loop. A one-second sleep occurs
+    /// between polls.
     pub async fn run(&self) -> Result {
         self.run_every(1.seconds()).await
     }
 
+    /// Same as `run` but allows for the configuration of the span between
+    /// polls.
     pub async fn run_every(&self, span: Span) -> Result {
         let mut interval = tokio::time::interval(span.try_into()?);
         interval.tick().await;
@@ -81,10 +135,18 @@ impl<T: Task> Worker<T> {
         }
     }
 
+    /// Runs the worker as a scheduler.
+    ///
+    /// Note that if the worker's queue is not configured with a task schedule,
+    /// this does nothing.
+    ///
+    /// Schedules are processed via polling in a loop. A one-minute sleep occurs
+    /// between polls.
     pub async fn run_scheduler(&self) -> Result {
-        self.run_scheduler_every(1.seconds()).await
+        self.run_scheduler_every(1.minutes()).await
     }
-
+    /// Same as `run_scheduler` but allows for the configuration of the span
+    /// between polls.
     pub async fn run_scheduler_every(&self, span: Span) -> Result {
         let mut interval = tokio::time::interval(span.try_into()?);
         interval.tick().await;
@@ -94,6 +156,19 @@ impl<T: Task> Worker<T> {
         }
     }
 
+    /// Processes the next available task in the queue.
+    ///
+    /// When a task is found, its execute method will be invoked with the
+    /// deqeued input.
+    ///
+    /// If the execution exceeds the task's timeout then the execute future is
+    /// cancelled. This can also result in the task being marked failed if its
+    /// retry policy has been exhausted.
+    ///
+    /// Tasks may also fail for other reasons during execution. Unless a failure
+    /// is [explicitly fatal](crate::task::Error::Fatal) or no more retries are
+    /// left, then the task will be re-queued in a
+    /// [`Pending`](crate::task::State::Pending) state.
     #[instrument(skip(self), fields(task.id = tracing::field::Empty), err)]
     pub async fn process_next_task(&self) -> Result {
         let mut tx = self.queue.pool.begin().await?;
@@ -139,6 +214,12 @@ impl<T: Task> Worker<T> {
         Ok(())
     }
 
+    /// Processes the next available schedule.
+    ///
+    /// # Errors
+    ///
+    /// If a task schedule has not already been set for the queue, this will
+    /// result in an error.
     #[instrument(skip(self), err)]
     pub async fn process_next_schedule(&self) -> Result {
         let (zoned_schedule, input) = self.queue.task_schedule(&self.queue.pool).await?;

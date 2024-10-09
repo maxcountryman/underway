@@ -1,24 +1,79 @@
-//! Tasks are functions over a well-defined input.
+//! Tasks represent a well-structure unit of work.
 //!
-//! The `Task` trait is used to define tasks. It requires an associated type,
-//! which defines the input and an execute method, which defines the behavior of
-//! the task.
+//! A task is defined by implementing the [`execute`](crate::Task::execute)
+//! method and specifying the associated type [`Input`](crate::Task::Input).
+//! This provides a strongly-typed interface to execute invocations.
 //!
-//! Specific behavior, such as retry attempts, is defined by providing
-//! implementations of the default methods.
+//! Once a task is implemented, it can be enqueued on a [`Queue`](crate::Queue)
+//! for processing. A [`Worker`](crate::Worker) can then dequeue the task and
+//! invoke its `execute` method, providing the input that has been deserialized
+//! into the specified [`Input`](crate::Task::Input) type.
 //!
-//! # Tasks and jobs
+//! Queues and workers operate over tasks to make them useful in the context of
+//! your application.
 //!
-//! Often applications will use the higher-level abstraction over tasks: `Job`.
-//! Jobs are an implementation of `Task` that provide an ergonomic API for
-//! defining arbitrary tasks at the cost of dynamic dispatch.
+//! # Implementing `Task`
+//!
+//! Generally you'll want to use the higher-level [`Job`](crate::Job)
+//! abstraction instead of implementing `Task` yourself. Its workflow is more
+//! ergonomic and therefore preferred for virtually all cases.
+//!
+//! However, it's possible to implement the trait directly. This may be useful
+//! for building more sophisticated behavior on top of the task concept that
+//! isn't already provided by `Job`.
+//!
+//! ```
+//! use serde::{Deserialize, Serialize};
+//! use underway::{task::Result as TaskResult, Task};
+//! # use tokio::runtime::Runtime;
+//! # fn main() {
+//! # let rt = Runtime::new().unwrap();
+//! # rt.block_on(async {
+//!
+//! // Task input representing the data needed to send a welcome email.
+//! #[derive(Debug, Deserialize, Serialize)]
+//! struct WelcomeEmail {
+//!     user_id: i32,
+//!     email: String,
+//!     name: String,
+//! }
+//!
+//! // Task that sends a welcome email to a user.
+//! struct WelcomeEmailTask;
+//!
+//! impl Task for WelcomeEmailTask {
+//!     type Input = WelcomeEmail;
+//!
+//!     /// Simulate sending a welcome email by printing a message to the console.
+//!     async fn execute(&self, input: Self::Input) -> TaskResult {
+//!         println!(
+//!             "Sending welcome email to {} <{}> (user_id: {})",
+//!             input.name, input.email, input.user_id
+//!         );
+//!
+//!         // Here you would integrate with an email service.
+//!         // If email sending fails, you could return an error to trigger retries.
+//!         Ok(())
+//!     }
+//! }
+//!
+//! # let task = WelcomeEmailTask;
+//! # let input = WelcomeEmail {
+//! #     user_id: 1,
+//! #     email: "user@example.com".to_string(),
+//! #     name: "Alice".to_string(),
+//! # };
+//!
+//! # task.execute(input).await.unwrap();
+//! # });
+//! # }
+//! ```
 use std::future::Future;
 
-use jiff::Span;
+use jiff::{Span, ToSpan};
 use serde::{de::DeserializeOwned, Serialize};
+use sqlx::postgres::types::PgInterval;
 use uuid::Uuid;
-
-use crate::queue::DequeuedTask;
 
 /// A type alias for task identifiers.
 pub type Id = Uuid;
@@ -26,6 +81,7 @@ pub type Id = Uuid;
 /// A type alias for task execution results.
 pub type Result = std::result::Result<(), Error>;
 
+/// Task errors.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// Error returned by the `sqlx` crate during database operations.
@@ -41,84 +97,18 @@ pub enum Error {
     Generic(String),
 }
 
-/// A task which defines an input type and a function that is executed using
-/// that type.
-///
-/// This trait allows you to define the behavior of tasks, including the input
-/// structure, the function that processes the input, and various task policies
-/// like retries, expiration, and concurrency. Tasks are strongly typed, which
-/// ensures that data passed to the task is well-formed and predictable.
-///
-/// # Example
-///
-/// ```
-/// use serde::{Deserialize, Serialize};
-/// use underway::{task::Error as TaskError, Task};
-/// # use tokio::runtime::Runtime;
-///
-/// # fn main() {
-/// # let rt = Runtime::new().unwrap();
-/// # rt.block_on(async {
-///
-/// // Task input representing the data needed to send a welcome email.
-/// #[derive(Debug, Deserialize, Serialize)]
-/// struct WelcomeEmail {
-///     user_id: i32,
-///     email: String,
-///     name: String,
-/// }
-///
-/// // Task that sends a welcome email to a user.
-/// struct WelcomeEmailTask;
-///
-/// impl Task for WelcomeEmailTask {
-///     type Input = WelcomeEmail;
-///
-///     /// Simulate sending a welcome email by printing a message to the console.
-///     async fn execute(&self, input: Self::Input) -> Result<(), TaskError> {
-///         println!(
-///             "Sending welcome email to {} <{}> (user_id: {})",
-///             input.name, input.email, input.user_id
-///         );
-///
-///         // Here you would integrate with an email service.
-///         // If email sending fails, you could return an error to trigger retries.
-///         Ok(())
-///     }
-/// }
-///
-/// # let task = WelcomeEmailTask;
-/// # let input = WelcomeEmail {
-/// #     user_id: 1,
-/// #     email: "user@example.com".to_string(),
-/// #     name: "Alice".to_string(),
-/// # };
-///
-/// # task.execute(input).await.unwrap();
-/// # });
-/// # }
-/// ```
+/// The task interface.
 pub trait Task: Send + 'static {
-    /// Type used by the executor.
+    /// The input type that the execute method will take.
     ///
-    /// This represents the structured input data required for the task. For
-    /// example, if you're sending an email, your input might include a
-    /// `recipient`, `subject`, and `body`. The type must be serializable to
-    /// allow safe transmission through the queue.
+    /// This type must be serialized to and deserialized from the database.
     type Input: DeserializeOwned + Serialize + Send + 'static;
 
     /// Executes the task with the provided input.
     ///
     /// The core of a task, this method is called when the task is picked up by
     /// a worker. The input type is passed to the method, and the task is
-    /// expected to handle it. The function returns a `Future` that resolves
-    /// to a `Result<(), Error>`, where `Ok(())` signals a successful task
-    /// execution, and `Err(Error)` indicates a failure.
-    ///
-    /// # Arguments
-    ///
-    /// - `input`: The data required to perform the task, defined by the
-    ///   associated type `Input`.
+    /// expected to handle it.
     ///
     /// # Example
     ///
@@ -170,18 +160,25 @@ pub trait Task: Send + 'static {
     /// The default expiration is set to 15 minutes. Override this if your tasks
     /// need to have shorter or longer timeouts.
     fn timeout(&self) -> Span {
-        Span::new().minutes(15)
+        15.minutes()
     }
 
-    /// Provides task time-to-live duration in queue.
+    /// Provides task time-to-live (TTL) duration in queue.
     ///
     /// After the duration has elapsed, a task may be removed from the queue,
     /// e.g. via [`delete_expired`](Queue.delete_expired).
     fn ttl(&self) -> Span {
-        Span::new().days(14)
+        14.days()
     }
 
     /// Provides a delay before which the task won't be dequeued.
+    ///
+    /// Delays are used to prevent a task from being run immediately.
+    ///
+    /// This may be useful when a task should not be run after it's been
+    /// constructed and enqueued. However, delays differ from scheduled tasks
+    /// and should not be used for recurring execution. Instead, use
+    /// [`Worker::run_scheduled`](crate::Worker::run_scheduler).
     fn delay(&self) -> Span {
         Span::new()
     }
@@ -260,11 +257,8 @@ pub trait Task: Send + 'static {
 
 /// Configuration of a policy for retries in case of task failure.
 ///
-/// The `RetryPolicy` struct defines how failed tasks are retried. It controls
-/// how many times the task should be retried, the intervals between retries,
-/// and how much time each retry will take. The retry interval can also grow
-/// over time using an exponential backoff coefficient.
-#[derive(Debug, Clone)]
+/// Use [`RetryPolicyBuilder`] to define a new policy.
+#[derive(Debug, Clone, Copy)]
 pub struct RetryPolicy {
     pub(crate) max_attempts: i32,
     pub(crate) initial_interval_ms: i32,
@@ -275,11 +269,17 @@ pub struct RetryPolicy {
 pub(crate) type RetryCount = i32;
 
 impl RetryPolicy {
+    /// Create a new builder.
+    pub fn builder() -> RetryPolicyBuilder {
+        RetryPolicyBuilder::default()
+    }
+
+    /// Returns the delay relative to the given retry count.
     pub fn calculate_delay(&self, retry_count: RetryCount) -> Span {
         let base_delay = self.initial_interval_ms as f32;
         let backoff_delay = base_delay * self.backoff_coefficient.powi(retry_count - 1);
-        let delay = backoff_delay.min(self.max_interval_ms as f32);
-        Span::new().milliseconds(delay as i64)
+        let delay = backoff_delay.min(self.max_interval_ms as f32) as i64;
+        delay.milliseconds()
     }
 }
 
@@ -344,7 +344,7 @@ impl RetryPolicyBuilder {
 
     /// Sets the maximum number of retry attempts.
     ///
-    /// Default is `5`.
+    /// Default value is `5`.
     pub const fn max_attempts(mut self, max_attempts: i32) -> Self {
         self.inner.max_attempts = max_attempts;
         self
@@ -352,7 +352,7 @@ impl RetryPolicyBuilder {
 
     /// Sets the initial interval before the first retry (in milliseconds).
     ///
-    /// Default is `1_000`.
+    /// Default value is `1_000`.
     pub const fn initial_interval_ms(mut self, initial_interval_ms: i32) -> Self {
         self.inner.initial_interval_ms = initial_interval_ms;
         self
@@ -360,7 +360,7 @@ impl RetryPolicyBuilder {
 
     /// Sets the maximum interval between retries (in milliseconds).
     ///
-    /// Default is `60_000`.
+    /// Default value is `60_000`.
     pub const fn max_interval_ms(mut self, max_interval_ms: i32) -> Self {
         self.inner.max_interval_ms = max_interval_ms;
         self
@@ -368,7 +368,7 @@ impl RetryPolicyBuilder {
 
     /// Sets the backoff coefficient to apply after each retry.
     ///
-    /// Default is `2.0`.
+    /// Default value is `2.0`.
     pub const fn backoff_coefficient(mut self, backoff_coefficient: f32) -> Self {
         self.inner.backoff_coefficient = backoff_coefficient;
         self
@@ -398,6 +398,37 @@ pub enum State {
 
     /// Execute completed unsucessfully.
     Failed,
+}
+
+/// Dequeued task.
+#[derive(Debug)]
+pub struct DequeuedTask {
+    /// Task ID.
+    pub id: Id,
+
+    /// Input as a `serde_json::Value`.
+    pub input: serde_json::Value,
+
+    /// Timeout.
+    pub timeout: PgInterval,
+
+    /// Total times retried.
+    pub retry_count: i32,
+
+    /// Maximum retry attempts.
+    pub max_attempts: i32,
+
+    /// Initial interval in milliseconds.
+    pub initial_interval_ms: i32,
+
+    /// Maximum interval in milliseconds.
+    pub max_interval_ms: i32,
+
+    /// Backoff coefficient.
+    pub backoff_coefficient: f32,
+
+    /// Concurrency key.
+    pub concurrency_key: Option<String>,
 }
 
 #[cfg(test)]

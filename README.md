@@ -37,7 +37,7 @@ use std::env;
 
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use underway::{queue::QueueBuilder, JobBuilder};
+use underway::{Queue, Job};
 
 const QUEUE_NAME: &str = "email";
 
@@ -58,14 +58,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     underway::MIGRATOR.run(&pool).await?;
 
     // Create the task queue.
-    let queue = QueueBuilder::new()
+    let queue = Queue::builder()
         .name(QUEUE_NAME)
         .pool(pool)
         .build()
         .await?;
 
     // Build the job.
-    let job = JobBuilder::new(queue)
+    let job = Job::builder()
+        .name(queue)
         .execute(
             |WelcomeEmail {
                  user_id,
