@@ -10,10 +10,24 @@ env:
   CARGO_TERM_COLOR: always
   DATABASE_URL: postgres://postgres:postgres@postgres:5432/underway
 
+postgres_service: &postgres_service
+  postgres:
+    image: postgres
+    env:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: underway
+    options: >-
+      --health-cmd pg_isready
+      --health-interval 10s
+      --health-timeout 5s
+      --health-retries 5
+
 jobs:
   check:
     runs-on: ubuntu-latest
-
+    services:
+      <<: *postgres_service
     steps:
       - uses: actions/checkout@v4
       - run: |
@@ -26,21 +40,10 @@ jobs:
         run: |
           cargo +nightly fmt --all -- --check
 
-    services:
-      postgres:
-        image: postgres
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: underway
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
   check-docs:
     runs-on: ubuntu-latest
+    services:
+      <<: *postgres_service
     steps:
       - uses: actions/checkout@v4
       - run: |
@@ -55,6 +58,8 @@ jobs:
   test-docs:
     needs: check
     runs-on: ubuntu-latest
+    services:
+      <<: *postgres_service
     steps:
       - uses: actions/checkout@v4
       - run: |
@@ -67,6 +72,8 @@ jobs:
   test-lib:
     needs: check
     runs-on: ubuntu-latest
+    services:
+      <<: *postgres_service
     steps:
       - uses: actions/checkout@v4
       - run: |
