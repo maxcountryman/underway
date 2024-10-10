@@ -58,6 +58,7 @@ jobs:
   test-lib:
     needs: check
     runs-on: ubuntu-latest
+    container: rust
     services:
       postgres:
         image: postgres
