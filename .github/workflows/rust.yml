@@ -8,7 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  SQLX_OFFLINE: true
+  DATABASE_URL: postgres://postgres:postgres@postgres:5432/underway
 
 jobs:
   check:
@@ -25,6 +25,14 @@ jobs:
       - name: rustfmt
         run: |
           cargo +nightly fmt --all -- --check
+
+    services:
+      postgres:
+        image: postgres
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: underway
 
   check-docs:
     runs-on: ubuntu-latest
