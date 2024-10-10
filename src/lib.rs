@@ -32,9 +32,9 @@
 //!
 //! Let's say we wanted to send welcome emails upon the successful registration
 //! of a new user. If we're building a web application, we want to defer work
-//! like this such that we aren't slowing down the response. We can use Underway
-//! to create a background job for sending emails. For instance, this basic
-//! example illustrates:
+//! like this so we can return a response quickly back to the browser. We can
+//! use Underway to create a background job for sending emails without blocking
+//! the response:
 //!
 //! ```rust,no_run
 //! use std::env;
@@ -100,7 +100,8 @@
 //!
 //! # Concepts
 //!
-//! Underway has been designed around several core concepts:
+//! Underway has been designed around several core concepts, which build on one
+//! another to deliver a robust background-job framework:
 //!
 //! - [Tasks](#tasks) represent a well-structure unit of work.
 //! - [Jobs](#jobs) are a higher-level abstraction over the [`Task`] trait.
@@ -113,7 +114,7 @@
 //! input.
 //!
 //! This is the lowest-level concept in our design, with everything else being
-//! built around this idea.
+//! built on top of or around this idea.
 //!
 //! See [`task`] for more details about tasks.
 //!
@@ -123,7 +124,7 @@
 //! and operating tasks.
 //!
 //! In most cases, applications will use jobs to define tasks instead of using
-//! the task trait directly.
+//! the `Task` trait directly.
 //!
 //! See [`job`] for more details about jobs.
 //!
@@ -136,11 +137,8 @@
 //!
 //! ## Workers
 //!
-//! Workers are derived from tasks and use their queue to find new work to
-//! execute.
-//!
-//! Besides this polling style of work execution, workers are also used to
-//! manage cron-like schedules.
+//! Workers are responsible for executing tasks. They poll the queue for new
+//! tasks, and when found, try to invoke the task's execute routine.
 //!
 //! See [`worker`] for more details about workers.
 
@@ -163,12 +161,12 @@ mod scheduler;
 pub mod task;
 pub mod worker;
 
-/// SQLx [`Migrator`] which provides `underway`'s schema migrations.
+/// A SQLx [`Migrator`] which provides Underway's schema migrations.
 ///
 /// These migrations must be applied before queues, tasks, and workers can be
 /// run.
 ///
-/// **Note: Changes are managed within a dedicated schema, called "underway".**
+/// **Note**: Changes are managed within a dedicated schema, called "underway".
 ///
 /// # Example
 ///
@@ -191,23 +189,3 @@ pub mod worker;
 /// # });
 /// # }
 pub static MIGRATOR: Migrator = sqlx::migrate!();
-
-/// Error enum which provides all `underway` error types.
-#[derive(Debug, thiserror::Error)]
-enum Error {
-    /// Job-related errors.
-    #[error(transparent)]
-    Job(#[from] job::Error),
-
-    /// Queue-relayed errors.
-    #[error(transparent)]
-    Queue(#[from] queue::Error),
-
-    /// Task-relayed errors.
-    #[error(transparent)]
-    Task(#[from] task::Error),
-
-    /// Worker-relayed errors.
-    #[error(transparent)]
-    Worker(#[from] worker::Error),
-}

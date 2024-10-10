@@ -1,6 +1,6 @@
 [package]
 name = "underway"
-description = "⏳ Distributed task queue over Postgres"
+description = "⏳ PostgreSQL-backed job queue for reliable background task processing"
 version = "0.0.0"
 edition = "2021"
 license = "MIT"

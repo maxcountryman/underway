@@ -98,15 +98,20 @@
 //! # }
 //! ```
 //!
+//! ## Transactional enqueue
+//!
 //! Sometimes a job should only be enqueued when other conditions are met.
 //!
-//! For example, perhaps we're implementing user registration. We'd like to send
-//! a welcome email upon completing the flow. However, if something goes wrong
-//! and we need to reset the flow, we don't want to send an email.
+//! For example, perhaps we're implementing user registration and we'd like to
+//! send a welcome email upon completing the flow. However, if something goes
+//! wrong and we need to reset the flow, we'd like to avoid sending such an
+//! email.
 //!
-//! To accomodate use cases like this, we can also make use of
+//! To accomodate use cases like this, we can make use of
 //! [`Job::enqueue_using`], which allows us to specify a transaction. Should the
-//! transaction be rolled back, then our job won't be enqueued.
+//! transaction be rolled back, then our job won't be enqueued. (An ID will
+//! still be returned by this method, so it's up to our application to recognize
+//! when a failure has occurred and ignore any such IDs.)
 //!
 //! ```rust
 //! # use sqlx::PgPool;
