@@ -178,7 +178,7 @@ pub trait Task: Send + 'static {
     /// This may be useful when a task should not be run after it's been
     /// constructed and enqueued. However, delays differ from scheduled tasks
     /// and should not be used for recurring execution. Instead, use
-    /// [`Worker::run_scheduled`](crate::Worker::run_scheduler).
+    /// [`Scheduler::run`](crate::Scheduler::run).
     fn delay(&self) -> Span {
         Span::new()
     }
