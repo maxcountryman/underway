@@ -63,7 +63,6 @@ jobs:
       postgres:
         image: postgres
         env:
-          #POSTGRES_HOST: localhost
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: underway
@@ -85,7 +84,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run lib tests
         run: |
-          cargo sqlx database create
+          cargo sqlx database setup
           cargo test --workspace --all-features --lib
           cargo tarpaulin --workspace --all-features --lib -olcov
       - name: Upload coverage data to Codecov
