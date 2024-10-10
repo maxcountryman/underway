@@ -81,9 +81,11 @@ jobs:
       - run: |
           rustup toolchain install nightly --profile minimal
           cargo install cargo-tarpaulin
+          cargo install sqlx-cli --no-default-features --features native-tls,postgres
       - uses: Swatinem/rust-cache@v2
       - name: Run lib tests
         run: |
+          cargo sqlx database create
           cargo test --workspace --all-features --lib
           cargo tarpaulin --workspace --all-features --lib -olcov
       - name: Upload coverage data to Codecov
