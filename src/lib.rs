@@ -17,7 +17,7 @@
 //! - **Scalable and Flexible** Scales from a single worker to multiple workers
 //!   with minimal configuration, allowing seamless background job processing.
 //!
-//! ## Overview
+//! # Overview
 //!
 //! Underway provides a robust and efficient way to execute asynchronous tasks
 //! using PostgreSQL as the backend for task storage and coordination. It is
@@ -25,6 +25,8 @@
 //! a way that ensures safe concurrency and reliable task execution. Whether
 //! you're processing tasks on a single server or across multiple workers,
 //! Underway makes it easy to manage background jobs with confidence.
+//!
+//! # Example
 //!
 //! Let's say we wanted to send welcome emails upon the successful registration
 //! of a new user. If we're building a web application, we want to defer work
@@ -94,7 +96,7 @@
 //! }
 //! ```
 //!
-//! ## Concepts
+//! # Concepts
 //!
 //! Underway has been designed around several core concepts:
 //!
@@ -103,7 +105,7 @@
 //! - [Queues](#queues) provide an interface for managing task execution.
 //! - [Workers](#workers) interface with queues to execute tasks.
 //!
-//! ### Tasks
+//! ## Tasks
 //!
 //! Tasks are units of work to be executed, with clearly defined behavior and
 //! input.
@@ -113,7 +115,7 @@
 //!
 //! See [`task`] for more details about tasks.
 //!
-//! ### Jobs
+//! ## Jobs
 //!
 //! Jobs are a specialized task which provide a higher-level API for defining
 //! and operating tasks.
@@ -123,14 +125,14 @@
 //!
 //! See [`job`] for more details about jobs.
 //!
-//! ### Queues
+//! ## Queues
 //!
 //! Queues manage tasks, including enqueuing and dequeuing them from the
 //! database.
 //!
 //! See [`queue`] for more details about queues.
 //!
-//! ### Workers
+//! ## Workers
 //!
 //! Workers are derived from tasks and use their queue to find new work to
 //! execute.
@@ -145,10 +147,17 @@
 
 use sqlx::migrate::Migrator;
 
-pub use crate::{job::Job, queue::Queue, task::Task, worker::Worker};
+pub use crate::{
+    job::Job,
+    queue::Queue,
+    scheduler::{Scheduler, ZonedSchedule},
+    task::Task,
+    worker::Worker,
+};
 
 pub mod job;
 pub mod queue;
+mod scheduler;
 pub mod task;
 pub mod worker;
 

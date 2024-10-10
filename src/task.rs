@@ -56,14 +56,12 @@
 //!         Ok(())
 //!     }
 //! }
-//!
 //! # let task = WelcomeEmailTask;
 //! # let input = WelcomeEmail {
 //! #     user_id: 1,
 //! #     email: "user@example.com".to_string(),
 //! #     name: "Alice".to_string(),
 //! # };
-//!
 //! # task.execute(input).await.unwrap();
 //! # });
 //! # }
@@ -88,13 +86,15 @@ pub enum Error {
     #[error(transparent)]
     Database(#[from] sqlx::Error),
 
-    /// Error indicating that the task has encountered an unrecoverable state.
+    /// Error indicating that the task has encountered an unrecoverable error
+    /// state.
     #[error("{0}")]
     Fatal(String),
 
-    /// Error indicating that the task has encountered a retriable state.
+    /// Error indicating that the task has encountered a recoverable error
+    /// state.
     #[error("{0}")]
-    Generic(String),
+    Retryable(String),
 }
 
 /// The task interface.
@@ -255,10 +255,50 @@ pub trait Task: Send + 'static {
     }
 }
 
+/// Dequeued task.
+#[derive(Debug)]
+pub struct DequeuedTask {
+    /// Task ID.
+    pub id: Id,
+
+    /// Input as a `serde_json::Value`.
+    pub input: serde_json::Value,
+
+    /// Timeout.
+    pub timeout: PgInterval,
+
+    /// Total times retried.
+    pub retry_count: i32,
+
+    /// Maximum retry attempts.
+    pub max_attempts: i32,
+
+    /// Initial interval in milliseconds.
+    pub initial_interval_ms: i32,
+
+    /// Maximum interval in milliseconds.
+    pub max_interval_ms: i32,
+
+    /// Backoff coefficient.
+    pub backoff_coefficient: f32,
+
+    /// Concurrency key.
+    pub concurrency_key: Option<String>,
+}
+
 /// Configuration of a policy for retries in case of task failure.
 ///
-/// Use [`RetryPolicyBuilder`] to define a new policy.
-#[derive(Debug, Clone, Copy)]
+/// # Example
+///
+/// ```rust
+/// use underway::task::RetryPolicy;
+///
+/// let retry_policy = RetryPolicy::builder()
+///     .max_attempts(10)
+///     .backoff_coefficient(4.0)
+///     .build();
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RetryPolicy {
     pub(crate) max_attempts: i32,
     pub(crate) initial_interval_ms: i32,
@@ -317,7 +357,7 @@ impl Default for RetryPolicy {
 
 /// A builder for constructing `RetryPolicy`.
 ///
-/// # Example:
+/// # Example
 ///
 /// ```
 /// use underway::task::RetryPolicyBuilder;
@@ -400,37 +440,6 @@ pub enum State {
     Failed,
 }
 
-/// Dequeued task.
-#[derive(Debug)]
-pub struct DequeuedTask {
-    /// Task ID.
-    pub id: Id,
-
-    /// Input as a `serde_json::Value`.
-    pub input: serde_json::Value,
-
-    /// Timeout.
-    pub timeout: PgInterval,
-
-    /// Total times retried.
-    pub retry_count: i32,
-
-    /// Maximum retry attempts.
-    pub max_attempts: i32,
-
-    /// Initial interval in milliseconds.
-    pub initial_interval_ms: i32,
-
-    /// Maximum interval in milliseconds.
-    pub max_interval_ms: i32,
-
-    /// Backoff coefficient.
-    pub backoff_coefficient: f32,
-
-    /// Concurrency key.
-    pub concurrency_key: Option<String>,
-}
-
 #[cfg(test)]
 mod tests {
     use serde::{Deserialize, Serialize};
@@ -450,7 +459,7 @@ mod tests {
         async fn execute(&self, input: Self::Input) -> Result {
             println!("Executing task with message: {}", input.message);
             if input.message == "fail" {
-                return Err(Error::Generic("Task failed".to_string()));
+                return Err(Error::Retryable("Task failed".to_string()));
             }
             Ok(())
         }

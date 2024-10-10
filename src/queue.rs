@@ -4,12 +4,50 @@
 //! later dequeued, using the [`Queue::dequeue`] method, when they're executed.
 //!
 //! The semantics for retrieving a task from the queue are defined by the order
-//! of insertion (first-in, first-out) or the priority of the task
-//! defines. If a priority is defined, then it's considered before the order the
+//! of insertion (first-in, first-out) or the priority of the task defines. If a
+//! priority is defined, then it's considered before the order the
 //! task was inserted.
 //!
-//! Queues may also define an optional "dead-letter" queue, which provides a
-//! secondary queue where failed tasks can be stored for later inspection.
+//! # Dead-letter queues
+//!
+//! When a dead-letter queue name is provided, a secondary queue is created with
+//! this name. This is a queue of "dead letters". In other words, it's a queue
+//! of tasks that have failed on the queue and can't be retried. This can be
+//! useful for identifying patterns of failures or reprocessing failed tasks
+//! when they're likely to succeed again.
+//!
+//! ```rust
+//! # use tokio::runtime::Runtime;
+//! # use underway::Task;
+//! # use underway::task::Result as TaskResult;
+//! # use sqlx::PgPool;
+//! use underway::Queue;
+//!
+//! # struct MyTask;
+//! # impl Task for MyTask {
+//! #    type Input = ();
+//! #    async fn execute(&self, input: Self::Input) -> TaskResult {
+//! #        Ok(())
+//! #    }
+//! # }
+//! # fn main() {
+//! # let rt = Runtime::new().unwrap();
+//! # rt.block_on(async {
+//! # /*
+//! let pool = { /* A `PgPool`. */ };
+//! # */
+//! # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
+//! let queue = Queue::builder()
+//!     .name("example_queue")
+//!     .dead_letter_queue("example_dlq")
+//!     .pool(pool.clone())
+//!     .build()
+//!     .await?;
+//! # queue.enqueue(&pool, &MyTask, ()).await?;
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! # });
+//! # }
+//! ```
 //!
 //! # Processing tasks
 //!
@@ -22,24 +60,166 @@
 //! worker via its [`run`](crate::Job::run) method, that worker uses its queue's
 //! dequeue method.
 //!
+//! With that said, a queue may be interfaced with directly. As an example, we
+//! may enqueue and dequeue like so:
+//! ```rust
+//! # use tokio::runtime::Runtime;
+//! # use underway::Task;
+//! # use underway::task::Result as TaskResult;
+//! # use sqlx::PgPool;
+//! use underway::Queue;
+//!
+//! # struct MyTask;
+//! # impl Task for MyTask {
+//! #    type Input = ();
+//! #    async fn execute(&self, input: Self::Input) -> TaskResult {
+//! #        Ok(())
+//! #    }
+//! # }
+//! # fn main() {
+//! # let rt = Runtime::new().unwrap();
+//! # rt.block_on(async {
+//! # /*
+//! let pool = { /* A `PgPool`. */ };
+//! # */
+//! # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
+//! let queue = Queue::builder()
+//!     .name("example_queue")
+//!     .pool(pool.clone())
+//!     .build()
+//!     .await?;
+//!
+//! # /*
+//! let task = { /* A type that implements `Task`. */ };
+//! # */
+//! # let task = MyTask;
+//!
+//! // Enqueue the task.
+//! queue.enqueue(&pool, &task, ()).await?;
+//!
+//! if let Some(task) = queue.dequeue(&pool).await? {
+//!     // Process the task here
+//! }
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! # });
+//! # }
+//! ```
+//!
 //! # Scheduling tasks
 //!
-//! In order to enable cron-like task scheduling, a schedule must be set on the
-//! queue. This can be done via the [`schedule`](Queue::schedule) method. Once
-//! set, a worker can be used to run the schedule via the
-//! [`run_scheduler`](crate::Job::run_scheduler) method.
+//! It's important to note that a schedule **must** be set on the queue before
+//! the scheduler can be run.
+//!
+//! As with task processing, jobs provide an interface for scheduling. For
+//! example, the [`schedule`](crate::Job::schedule) method along with
+//! [`run_scheduler`](crate::Job::run_scheduler) are often what you want to use.
+//! Use these to set the schedule and run the scheduler, respectively.
+//!
+//! Of course it's also possible to interface directly with the queue to achieve
+//! the same if desired. Schedules can be set with the
+//! [`schedule`](Queue::schedule) method. Once set, a worker can be used to run
+//! the schedule via the [`run_scheduler`](crate::Job::run_scheduler) method:
+//!
+//! ```rust
+//! # use tokio::runtime::Runtime;
+//! # use underway::Task;
+//! # use underway::task::Result as TaskResult;
+//! # use sqlx::PgPool;
+//! use underway::{Queue, Scheduler};
+//!
+//! # struct MyTask;
+//! # impl Task for MyTask {
+//! #    type Input = ();
+//! #    async fn execute(&self, input: Self::Input) -> TaskResult {
+//! #        Ok(())
+//! #    }
+//! # }
+//! # fn main() {
+//! # let rt = Runtime::new().unwrap();
+//! # rt.block_on(async {
+//! # /*
+//! let pool = { /* A `PgPool`. */ };
+//! # */
+//! # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
+//! let queue = Queue::builder()
+//!     .name("example_queue")
+//!     .pool(pool.clone())
+//!     .build()
+//!     .await?;
+//!
+//! // Set a quarter-hour schedule.
+//! let quarter_hour = "0 */15 * * * *[America/Los_Angeles]".parse()?;
+//! queue.schedule(&pool, quarter_hour, ()).await?;
+//!
+//! # /*
+//! let task = { /* A type that implements `Task`. */ };
+//! # */
+//! # let task = MyTask;
+//! let scheduler = Scheduler::new(queue, task);
+//!
+//! // Run a scheduler based on our configured schedule.
+//! scheduler.run().await?;
+//!
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! # });
+//! # }
+//! ```
+//!
+//! # Deleting expired tasks
+//!
+//! Tasks configure a time-to-live (TTL) which specifies how long they'll remain
+//! in the queue. However, tasks are only deleted from the queue if the deletion
+//! routine is explicitly invoked. Either [`Queue::run_deletion`] or
+//! [`Queue::run_deletion_every`] should be called to start the deletion
+//! routine.
+//!
+//! ```rust
+//! # use tokio::runtime::Runtime;
+//! # use underway::Task;
+//! # use underway::task::Result as TaskResult;
+//! # use sqlx::PgPool;
+//! use underway::Queue;
+//!
+//! # struct MyTask;
+//! # impl Task for MyTask {
+//! #    type Input = ();
+//! #    async fn execute(&self, input: Self::Input) -> TaskResult {
+//! #        Ok(())
+//! #    }
+//! # }
+//! # fn main() {
+//! # let rt = Runtime::new().unwrap();
+//! # rt.block_on(async {
+//! # /*
+//! let pool = { /* A `PgPool`. */ };
+//! # */
+//! # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
+//! let queue: Queue<MyTask> = Queue::builder()
+//!     .name("example_queue")
+//!     .pool(pool.clone())
+//!     .build()
+//!     .await?;
+//!
+//! queue.run_deletion().await?;
+//!
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! # });
+//! # }
+//! ```
 
 use std::{marker::PhantomData, time::Duration as StdDuration};
 
 use builder_states::{Initial, NameSet, PoolSet};
-use jiff::{tz::TimeZone, Span, Zoned};
-use jiff_cron::Schedule;
+use jiff::{Span, ToSpan};
 use sqlx::{Acquire, PgExecutor, PgPool, Postgres};
 use tracing::instrument;
 use ulid::Ulid;
 use uuid::Uuid;
 
-use crate::task::{DequeuedTask, Id as TaskId, State as TaskState, Task};
+use crate::{
+    task::{DequeuedTask, Id as TaskId, State as TaskState, Task},
+    ZonedSchedule,
+};
 
 type Result<T = ()> = std::result::Result<T, Error>;
 
@@ -69,6 +249,10 @@ pub enum Error {
     /// the query that prevent a row from being returned.
     #[error("Task with ID {0} not found.")]
     TaskNotFound(Uuid),
+
+    /// Indicates that the schedule associated with the task is malformed.
+    #[error("A malformed schedule was retrieved.")]
+    MalformedSchedule,
 }
 
 /// Task queue.
@@ -76,56 +260,6 @@ pub enum Error {
 /// Queues are responsible for managing tasks that implement the `Task` trait.
 /// They are generic over task types, meaning that each queue contains only a
 /// specific type of task, ensuring type safety and correctness at compile time.
-///
-/// # Dead-letter queues
-///
-/// When a dead-letter queue name is provided, a secondary queue is created with
-/// this name. This is a queue of "dead letters". In other words, it's a queue
-/// of tasks that have failed on the queue and can't be retried. This can be
-/// useful for identifying patterns of failures or reprocessing failed tasks
-/// when they're likely to succeed again.
-///
-/// # Example
-///
-/// ```rust
-/// # use tokio::runtime::Runtime;
-/// # use underway::Task;
-/// # use underway::task::Result as TaskResult;
-/// use sqlx::PgPool;
-/// use underway::Queue;
-///
-/// # struct MyTask;
-/// # impl Task for MyTask {
-/// #    type Input = ();
-/// #    async fn execute(&self, input: Self::Input) -> TaskResult {
-/// #        Ok(())
-/// #    }
-/// # }
-/// # fn main() {
-/// # let rt = Runtime::new().unwrap();
-/// # rt.block_on(async {
-/// let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
-///
-/// let queue = Queue::builder()
-///     .name("example_queue")
-///     .dead_letter_queue("example_dlq")
-///     .pool(pool.clone())
-///     .build()
-///     .await?;
-///
-///  # /*
-/// let my_task = { /* A type that implements `Task`. */ };
-/// # */
-/// # let my_task = MyTask;
-/// let task_id = queue.enqueue(&pool, &my_task, ()).await?;
-///
-/// if let Some(task) = queue.dequeue(&pool).await? {
-///     // Process the task here
-/// }
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// # });
-/// # }
-/// ```
 #[derive(Debug)]
 pub struct Queue<T: Task> {
     name: String,
@@ -162,12 +296,23 @@ impl<T: Task> Queue<T> {
     /// delay, concurrency key, and priority configured as specified by the task
     /// type.
     ///
+    /// An ID, which is a [`ULID`][ULID] converted to `UUIDv4`, is also assigned
+    /// to the task and returned upon successfully enqueue.
+    ///
+    /// **Note:** If you pass a transactional executor and the transaction is
+    /// rolled back, the returned tasl ID will not correspond to any persisted
+    /// task.
+    ///
     /// # Errors
     ///
     /// This function will return an error if:
     ///
     /// - The `input` cannot be serialized to JSON.
     /// - The database operation fails during the insertion.
+    /// - Any of `timeout`, `delay`, or `ttl` cannot be converted to
+    ///   `std::time::Duration`.
+    ///
+    /// [ULID]: https://github.com/ulid/spec?tab=readme-ov-file#specification
     #[instrument(skip(self, executor, task, input), fields(task.id = tracing::field::Empty), err)]
     pub async fn enqueue<'a, E>(&self, executor: E, task: &T, input: T::Input) -> Result<TaskId>
     where
@@ -222,7 +367,33 @@ impl<T: Task> Queue<T> {
         Ok(id)
     }
 
-    /// Returns the next available task.
+    /// Dequeues the next available task.
+    ///
+    /// This method uses the `FOR UPDATE SKIP LOCKED` clause to ensure efficient
+    /// retrievial of pending task rows.
+    ///
+    /// If an available task is found, it's marked as "in progress".
+    ///
+    /// # Transactions, locks, and timeouts
+    ///
+    /// At the beginning of this operation, a new transaction is started
+    /// (otherwise if already in a transaction a savepoint is created). Before
+    /// returning, this transaction is committed. It's important to point out
+    /// that the row locked by this transaction will be locked until the
+    /// transaction is committed, rolled back, or is otherwise reset,
+    /// e.g. via a timeout.
+    ///
+    /// More specifically the implication is that transactions should set a
+    /// reasonable timeout to ensure tasks are returned to the queue on a
+    /// reasonable time horizon. Note that Underway does not currently set any
+    /// database-level timeouts.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if:
+    ///
+    /// - The database operation fails during select.
+    /// - The database operation fails during update.
     #[instrument(skip(self, conn), fields(task.id = tracing::field::Empty), err)]
     pub async fn dequeue<'a, A>(&self, conn: A) -> Result<Option<DequeuedTask>>
     where
@@ -273,6 +444,13 @@ impl<T: Task> Queue<T> {
     ///
     /// Schedules are useful when a task should be run periodically, according
     /// to a crontab definition.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if:
+    ///
+    /// - The input value cannot be serialized.
+    /// - The database operation fails during insert.
     #[instrument(skip(self, executor, zoned_schedule, input), err)]
     pub async fn schedule<'a, E>(
         &self,
@@ -310,16 +488,38 @@ impl<T: Task> Queue<T> {
         Ok(())
     }
 
-    /// Runs an infinite loop that deletes expired tasks on an interval.
+    /// Runs deletion clean up of expired tasks in a loop, sleeping between
+    /// deletions for the specified period.
     ///
-    /// Task time-to-live semantics are only enforced when this method is used.
-    pub async fn continuously_delete_expired(&self, period: Span) -> Result {
+    /// Note that tasks are only deleted when this routine or `run_deletion` is
+    /// running.
+    ///
+    /// # Errors
+    ///
+    /// This function returns an error if:
+    ///
+    /// - The database operation fails during deletion.
+    pub async fn run_deletion_every(&self, period: Span) -> Result {
         let mut interval = tokio::time::interval(period.try_into()?);
         interval.tick().await;
         loop {
             self.delete_expired(&self.pool).await?;
             interval.tick().await;
         }
+    }
+
+    /// Runs deletion clean up of expired tasks every hour.
+    ///
+    /// Note that tasks are only deleted when this routine or
+    /// `run_deletion_every` is running.
+    ///
+    /// # Errors
+    ///
+    /// This function returns an error if:
+    ///
+    /// - The database operation fails during deletion.
+    pub async fn run_deletion(&self) -> Result {
+        self.run_deletion_every(1.hour()).await
     }
 
     #[instrument(skip(self, executor), err)]
@@ -339,7 +539,8 @@ impl<T: Task> Queue<T> {
         .fetch_one(executor)
         .await?;
 
-        let zoned_schedule = ZonedSchedule::new(&schedule_row.schedule, &schedule_row.timezone)?;
+        let zoned_schedule = ZonedSchedule::new(&schedule_row.schedule, &schedule_row.timezone)
+            .map_err(|_| Error::MalformedSchedule)?;
         let input = serde_json::from_value(schedule_row.input)?;
 
         Ok((zoned_schedule, input))
@@ -710,54 +911,9 @@ impl<T: Task> QueueBuilder<T, PoolSet> {
     }
 }
 
-/// Schedule paired with its time zone.
-pub struct ZonedSchedule {
-    schedule: Schedule,
-    timezone: TimeZone,
-}
-
-impl ZonedSchedule {
-    /// Create a new schedule which is associated with a time zone.
-    pub fn new(cron_expr: &str, time_zone_name: &str) -> Result<Self> {
-        let schedule = cron_expr.parse()?;
-        let timezone = TimeZone::get(time_zone_name)?;
-
-        assert!(
-            timezone.iana_name().is_some(),
-            "Time zones must use IANA names for now"
-        );
-
-        Ok(Self { schedule, timezone })
-    }
-
-    fn cron_expr(&self) -> String {
-        self.schedule.to_string()
-    }
-
-    fn iana_name(&self) -> &str {
-        self.timezone
-            .iana_name()
-            .expect("iana_name should always be Some because new ensures valid time zone")
-    }
-
-    pub(crate) fn duration_until_next(&self) -> Option<StdDuration> {
-        // Construct a date-time with the schedule's time zone.
-        let now_with_tz = Zoned::now().with_time_zone(self.timezone.clone());
-        if let Some(next_timestamp) = self.schedule.upcoming(self.timezone.clone()).next() {
-            let until_next = next_timestamp.duration_since(&now_with_tz);
-            // N.B. We're assigning default on failure here.
-            return Some(until_next.try_into().unwrap_or_default());
-        }
-
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-
-    use jiff::Span;
 
     use super::*;
     use crate::task::Result as TaskResult;
@@ -1023,7 +1179,7 @@ mod tests {
 
         // TODO: Converting PgInterval to Span may need to be revisited as minutes and
         // seconds do no properly line up.
-        let delay = Span::new().seconds(60);
+        let delay = 1.minute();
 
         queue
             .reschedule_task_for_retry(&pool, task_id, retry_count, delay)

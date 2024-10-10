@@ -1,47 +1,107 @@
 //! Workers interface with queues to execute tasks.
 //!
-//! A [`Worker`] continuously polls the queue for tasks and executes them.
-//! It works with any type that implements [`Task`].
+//! Until a worker is run, tasks remain on the queue, waiting to be processed.
+//! Workers complement queues by providing the mechanism to process tasks, first
+//! by finding an available task, deserializing its input, and then passing this
+//! input to an invocation of its execute method.
 //!
-//! Until a worker is run, tasks remain on their queue, waiting to be processed.
+//! As a task is being processed, the worker will assign various state
+//! transitions to the task. Eventually the task will either be completed or
+//! failed.
 //!
-//! ```rust,no_run
-//! use serde::{Deserialize, Serialize};
-//! use sqlx::PgPool;
-//! use underway::{task::Result as TaskResult, Queue, Task, Worker};
+//! Also note that workers retry failed tasks in accordance with their
+//! configured retry policies.
 //!
-//! #[derive(Debug, Clone, Deserialize, Serialize)]
-//! struct MyTaskInput {
-//!     data: String,
+//! # Running workers
+//!
+//! Oftentimes you'll define [a job](crate::job) and use its methods to run a
+//! worker. However, workers can be manually constructed and only require a
+//! queue and task:
+//!
+//! ```rust
+//! # use tokio::runtime::Runtime;
+//! # use underway::Task;
+//! # use underway::task::Result as TaskResult;
+//! # use sqlx::PgPool;
+//! use underway::{Queue, Worker};
+//!
+//! # struct MyTask;
+//! # impl Task for MyTask {
+//! #    type Input = ();
+//! #    async fn execute(&self, input: Self::Input) -> TaskResult {
+//! #        Ok(())
+//! #    }
+//! # }
+//! # fn main() {
+//! # let rt = Runtime::new().unwrap();
+//! # rt.block_on(async {
+//! # /*
+//! let pool = { /* A `PgPool`. */ };
+//! # */
+//! # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
+//! let queue = Queue::builder()
+//!     .name("example_queue")
+//!     .pool(pool.clone())
+//!     .build()
+//!     .await?;
+//!
+//! # /*
+//! let task = { /* A type that implements `Task`. */ };
+//! # */
+//! # let task = MyTask;
+//!
+//! // Create a new worker from the queue and task.
+//! let worker = Worker::new(queue, task);
+//!
+//! // Run the worker.
+//! worker.run().await?;
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! # });
+//! # }
+//! ```
+//!
+//! # Scaling task processing
+//!
+//! Workers can also be used to scale task processing. To do so, we can spin up
+//! as many workers as we might like to ensure tasks are processed in a timely
+//! manner. Also note that workers do not need to be run in-process, and can be
+//! run from a separate binary altogether.
+//!
+//! ```rust
+//! # use tokio::runtime::Runtime;
+//! # use underway::Task;
+//! # use underway::task::Result as TaskResult;
+//! # use sqlx::PgPool;
+//! # use underway::{Queue, Worker};
+//! # #[derive(Clone)]
+//! # struct MyTask;
+//! # impl Task for MyTask {
+//! #    type Input = ();
+//! #    async fn execute(&self, input: Self::Input) -> TaskResult {
+//! #        Ok(())
+//! #    }
+//! # }
+//! # fn main() {
+//! # let rt = Runtime::new().unwrap();
+//! # rt.block_on(async {
+//! # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
+//! # let queue = Queue::builder()
+//! #    .name("example_queue")
+//! #    .pool(pool.clone())
+//! #    .build()
+//! #    .await?;
+//! # let task = MyTask;
+//! # let worker = Worker::new(queue, task);
+//! // Spin up a number of workers to process tasks concurrently.
+//! for _ in 0..4 {
+//!     let task_worker = worker.clone();
+//!     tokio::task::spawn(async move { task_worker.run().await });
 //! }
-//!
-//! struct MyTask;
-//!
-//! impl Task for MyTask {
-//!     type Input = MyTaskInput;
-//!
-//!     async fn execute(&self, input: Self::Input) -> TaskResult {
-//!         println!("Executing task with data: {}", input.data);
-//!         Ok(())
-//!     }
-//! }
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
-//!
-//!     let queue = Queue::builder()
-//!         .name("my_task_queue")
-//!         .pool(pool.clone())
-//!         .build()
-//!         .await?;
-//!
-//!     let task = MyTask;
-//!     let worker = Worker::new(queue, task);
-//!     worker.run().await?;
-//!
-//!     Ok(())
-//! }
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! # });
+//! # }
+//! ```
+
 use jiff::{Span, ToSpan};
 use serde::{de::DeserializeOwned, Serialize};
 use sqlx::{postgres::types::PgInterval, PgConnection};
@@ -55,7 +115,7 @@ use crate::{
 pub(crate) type Result = std::result::Result<(), Error>;
 
 /// A worker that's generic over the task it processes.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Worker<T: Task> {
     queue: Queue<T>,
     task: T,
@@ -121,7 +181,7 @@ impl<T: Task> Worker<T> {
     /// Tasks are processed via polling in a loop. A one-second sleep occurs
     /// between polls.
     pub async fn run(&self) -> Result {
-        self.run_every(1.seconds()).await
+        self.run_every(1.second()).await
     }
 
     /// Same as `run` but allows for the configuration of the span between
@@ -131,27 +191,6 @@ impl<T: Task> Worker<T> {
         interval.tick().await;
         loop {
             self.process_next_task().await?;
-            interval.tick().await;
-        }
-    }
-
-    /// Runs the worker as a scheduler.
-    ///
-    /// Note that if the worker's queue is not configured with a task schedule,
-    /// this does nothing.
-    ///
-    /// Schedules are processed via polling in a loop. A one-minute sleep occurs
-    /// between polls.
-    pub async fn run_scheduler(&self) -> Result {
-        self.run_scheduler_every(1.minutes()).await
-    }
-    /// Same as `run_scheduler` but allows for the configuration of the span
-    /// between polls.
-    pub async fn run_scheduler_every(&self, span: Span) -> Result {
-        let mut interval = tokio::time::interval(span.try_into()?);
-        interval.tick().await;
-        loop {
-            self.process_next_schedule().await?;
             interval.tick().await;
         }
     }
@@ -209,26 +248,6 @@ impl<T: Task> Worker<T> {
             }
 
             tx.commit().await?;
-        }
-
-        Ok(())
-    }
-
-    /// Processes the next available schedule.
-    ///
-    /// # Errors
-    ///
-    /// If a task schedule has not already been set for the queue, this will
-    /// result in an error.
-    #[instrument(skip(self), err)]
-    pub async fn process_next_schedule(&self) -> Result {
-        let (zoned_schedule, input) = self.queue.task_schedule(&self.queue.pool).await?;
-
-        if let Some(until_next) = zoned_schedule.duration_until_next() {
-            tokio::time::sleep(until_next).await;
-            self.queue
-                .enqueue(&self.queue.pool, &self.task, input)
-                .await?;
         }
 
         Ok(())
@@ -334,4 +353,112 @@ fn pg_interval_to_span(
         .months(*months)
         .days(*days)
         .microseconds(*microseconds)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use sqlx::PgPool;
+    use tokio::sync::Mutex;
+
+    use super::*;
+    use crate::task::{Result as TaskResult, State as TaskState};
+
+    struct TestTask;
+
+    impl Task for TestTask {
+        type Input = ();
+
+        async fn execute(&self, _: Self::Input) -> TaskResult {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct FailingTask {
+        fail_times: Arc<Mutex<u32>>,
+    }
+
+    impl Task for FailingTask {
+        type Input = ();
+
+        async fn execute(&self, _: Self::Input) -> TaskResult {
+            let mut fail_times = self.fail_times.lock().await;
+            if *fail_times > 0 {
+                *fail_times -= 1;
+                Err(TaskError::Retryable("Simulated failure".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[sqlx::test]
+    async fn process_next_task(pool: PgPool) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("process_next_task")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        // Enqueue a task.
+        let task = TestTask;
+        queue.enqueue(&pool, &task, ()).await?;
+        assert!(queue.dequeue(&pool).await?.is_some());
+
+        // Process the task.
+        let worker = Worker::new(queue.clone(), task);
+        worker.process_next_task().await?;
+
+        // Ensure the task is no longer available on the queue.
+        assert!(queue.dequeue(&pool).await?.is_none());
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn process_retries(pool: PgPool) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("retry_test_queue")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let fail_times = Arc::new(Mutex::new(2));
+        let task = FailingTask {
+            fail_times: fail_times.clone(),
+        };
+        let worker = Worker::new(queue.clone(), task.clone());
+
+        // Enqueue the task
+        let task_id = queue.enqueue(&pool, &worker.task, ()).await?;
+
+        // Process the task multiple times to simulate retries
+        for retries in 0..3 {
+            let delay = task.retry_policy().calculate_delay(retries);
+            tokio::time::sleep(delay.try_into()?).await;
+            worker.process_next_task().await?;
+        }
+
+        // Verify that the fail_times counter has reached zero
+        let remaining_fail_times = *fail_times.lock().await;
+        assert_eq!(remaining_fail_times, 0);
+
+        // Verify the task eventually succeeded
+        let dequeued_task = sqlx::query!(
+            r#"
+            select state as "state: TaskState"
+            from underway.task
+            where id = $1
+            "#,
+            task_id
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(dequeued_task.state, TaskState::Succeeded);
+
+        Ok(())
+    }
 }

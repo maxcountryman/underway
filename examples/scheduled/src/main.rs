@@ -1,7 +1,7 @@
 use std::env;
 
 use sqlx::PgPool;
-use underway::{queue::ZonedSchedule, Job, Queue};
+use underway::{Job, Queue};
 
 const QUEUE_NAME: &str = "hello-world";
 
@@ -27,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build();
 
     // Schedule the job to run every minute in the given time zone.
-    let every_minute = ZonedSchedule::new("0 * * * * *", "America/Los_Angeles")?;
+    let every_minute = "0 * * * * *[America/Los_Angeles]".parse()?;
     job.schedule(every_minute, ()).await?;
 
     // Run the scheduler and worker concurrently.
