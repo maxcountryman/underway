@@ -4,14 +4,16 @@
 //!
 //! Key Features:
 //!
-//! - **PostgreSQL-Backed** Leverages PostgreSQL for reliable task storage and
-//!   coordination, ensuring high consistency and safe concurrency.
-//! - **Transactional Task Enqueueing** Supports enqueuing tasks within a
-//!   provided database transaction, ensuring they are only added if the
-//!   transaction commits successfully—ideal for operations like user
+//! - **PostgreSQL-Backed** Built on PostgreSQL for robust task storage and
+//!   coordination, ensuring consistency and safe concurrency across all
+//!   operations.
+//! - **Transactional Task Management** Supports enqueuing tasks within existing
+//!   database transactions, guaranteeing that tasks are only added if the
+//!   transaction commits successfully—perfect for operations like user
 //!   registration.
 //! - **Automatic Retries** Offers customizable retry strategies for failed
-//!   jobs, ensuring tasks are reliably completed even after transient failures.
+//!   executions, ensuring tasks are reliably completed even after transient
+//!   failures.
 //! - **Cron-Like Scheduling** Supports scheduling recurring tasks with
 //!   cron-like expressions, enabling automated, time-based job execution.
 //! - **Scalable and Flexible** Scales from a single worker to multiple workers
