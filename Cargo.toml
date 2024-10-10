@@ -4,6 +4,16 @@ description = "⏳ PostgreSQL-backed job queue for reliable background task proc
 version = "0.0.1"
 edition = "2021"
 license = "MIT"
+keywords = [
+    "background-jobs",
+    "background-processing",
+    "job-processing",
+    "sqlx",
+    "web",
+]
+categories = ["asynchronous", "database", "web-programming"]
+repository = "https://github.com/maxcountryman/underway"
+documentation = "https://docs.rs/underway"
 
 [dependencies]
 jiff-cron = "0.1.0"
