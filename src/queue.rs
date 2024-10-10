@@ -1,20 +1,23 @@
-//! Queues provide an interface for managing task execution.
+//! Queues provide an interface for managing task lifecycle.
 //!
 //! Tasks are enqueued onto the queue, using the [`Queue::enqueue`] method, and
 //! later dequeued, using the [`Queue::dequeue`] method, when they're executed.
 //!
 //! The semantics for retrieving a task from the queue are defined by the order
-//! of insertion (first-in, first-out) or the priority of the task defines. If a
-//! priority is defined, then it's considered before the order the
-//! task was inserted.
+//! of insertion, first-in, first-out (FIFO), or the priority the task defines.
+//! If a priority is defined, then it's considered before the order the task was
+//! inserted.
 //!
 //! # Dead-letter queues
 //!
 //! When a dead-letter queue name is provided, a secondary queue is created with
 //! this name. This is a queue of "dead letters". In other words, it's a queue
-//! of tasks that have failed on the queue and can't be retried. This can be
-//! useful for identifying patterns of failures or reprocessing failed tasks
-//! when they're likely to succeed again.
+//! of tasks that have failed and can't be retried.
+//!
+//! Dead-letter queues can be useful for identifying patterns of failures or
+//! reprocessing failed tasks at later date.
+//!
+//! To enable dead-letter queues, simply provide its name:
 //!
 //! ```rust
 //! # use tokio::runtime::Runtime;
@@ -39,6 +42,7 @@
 //! # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
 //! let queue = Queue::builder()
 //!     .name("example_queue")
+//!     // Enable the dead-letter queue.
 //!     .dead_letter_queue("example_dlq")
 //!     .pool(pool.clone())
 //!     .build()
@@ -58,10 +62,12 @@
 //! For example, `Job` provides an [`enqueue`](crate::Job::enqueue) method,
 //! which wraps its queue's enqueue method. Likewise, when a job spins up a
 //! worker via its [`run`](crate::Job::run) method, that worker uses its queue's
-//! dequeue method.
+//! dequeue method and in both cases there's no need to use the queue methods
+//! directly.
 //!
-//! With that said, a queue may be interfaced with directly. As an example, we
-//! may enqueue and dequeue like so:
+//! With that said, a queue may be interfaced with directly and operated
+//! manually if desired:
+//!
 //! ```rust
 //! # use tokio::runtime::Runtime;
 //! # use underway::Task;
@@ -117,8 +123,9 @@
 //!
 //! Of course it's also possible to interface directly with the queue to achieve
 //! the same if desired. Schedules can be set with the
-//! [`schedule`](Queue::schedule) method. Once set, a worker can be used to run
-//! the schedule via the [`run_scheduler`](crate::Job::run_scheduler) method:
+//! [`Queue::schedule`](Queue::schedule) method. Once set, a scheduler can be
+//! used to run the schedule via the [`Scheduler::run`](crate::Scheduler::run)
+//! method:
 //!
 //! ```rust
 //! # use tokio::runtime::Runtime;
@@ -147,7 +154,7 @@
 //!     .build()
 //!     .await?;
 //!
-//! // Set a quarter-hour schedule.
+//! // Set a quarter-hour schedule; IANA timezones are mandatory.
 //! let quarter_hour = "0 */15 * * * *[America/Los_Angeles]".parse()?;
 //! queue.schedule(&pool, quarter_hour, ()).await?;
 //!
@@ -160,6 +167,8 @@
 //! // Run a scheduler based on our configured schedule.
 //! scheduler.run().await?;
 //!
+//! // Don't forget that there's no workers running, so even if we schedule work, nothing will
+//! // happen!
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! # });
 //! # }
@@ -172,6 +181,9 @@
 //! routine is explicitly invoked. Either [`Queue::run_deletion`] or
 //! [`Queue::run_deletion_every`] should be called to start the deletion
 //! routine.
+//!
+//! **Note**: Tasks will not be deleted from the queue if this routine is not
+//! running!
 //!
 //! ```rust
 //! # use tokio::runtime::Runtime;
@@ -200,6 +212,7 @@
 //!     .build()
 //!     .await?;
 //!
+//! // Ensure we remove tasks that have an expired TTL.
 //! queue.run_deletion().await?;
 //!
 //! # Ok::<(), Box<dyn std::error::Error>>(())
@@ -235,7 +248,7 @@ pub enum Error {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 
-    /// Error returned by the `cron` crate.
+    /// Error returned by the `jiff_cron` crate.
     #[error(transparent)]
     Cron(#[from] jiff_cron::error::Error),
 
@@ -257,9 +270,7 @@ pub enum Error {
 
 /// Task queue.
 ///
-/// Queues are responsible for managing tasks that implement the `Task` trait.
-/// They are generic over task types, meaning that each queue contains only a
-/// specific type of task, ensuring type safety and correctness at compile time.
+/// Queues are responsible for managing task lifecycle.
 #[derive(Debug)]
 pub struct Queue<T: Task> {
     name: String,
@@ -491,7 +502,7 @@ impl<T: Task> Queue<T> {
     /// Runs deletion clean up of expired tasks in a loop, sleeping between
     /// deletions for the specified period.
     ///
-    /// Note that tasks are only deleted when this routine or `run_deletion` is
+    /// **Note:** Tasks are only deleted when this routine or `run_deletion` is
     /// running.
     ///
     /// # Errors
@@ -510,8 +521,8 @@ impl<T: Task> Queue<T> {
 
     /// Runs deletion clean up of expired tasks every hour.
     ///
-    /// Note that tasks are only deleted when this routine or
-    /// `run_deletion_every` is running.
+    /// **Note:** Tasks are only deleted when this routine or `run_deletion` is
+    /// running.
     ///
     /// # Errors
     ///

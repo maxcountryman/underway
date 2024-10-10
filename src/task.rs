@@ -1,8 +1,8 @@
-//! Tasks represent a well-structure unit of work.
+//! Tasks represent a well-structured unit of work.
 //!
 //! A task is defined by implementing the [`execute`](crate::Task::execute)
 //! method and specifying the associated type [`Input`](crate::Task::Input).
-//! This provides a strongly-typed interface to execute invocations.
+//! This provides a strongly-typed interface to execute task invocations.
 //!
 //! Once a task is implemented, it can be enqueued on a [`Queue`](crate::Queue)
 //! for processing. A [`Worker`](crate::Worker) can then dequeue the task and
@@ -74,6 +74,10 @@ use sqlx::postgres::types::PgInterval;
 use uuid::Uuid;
 
 /// A type alias for task identifiers.
+///
+/// Task IDs are [ULID][ULID]s which are converted to UUIDv4 for storage.
+///
+/// [ULID]: https://github.com/ulid/spec?tab=readme-ov-file#specification
 pub type Id = Uuid;
 
 /// A type alias for task execution results.
@@ -88,6 +92,9 @@ pub enum Error {
 
     /// Error indicating that the task has encountered an unrecoverable error
     /// state.
+    ///
+    /// **Note:** Returning this error from an execute future will override any
+    /// remaining retries and set the task to [`State::Failed`].
     #[error("{0}")]
     Fatal(String),
 
@@ -97,7 +104,9 @@ pub enum Error {
     Retryable(String),
 }
 
-/// The task interface.
+/// Trait for defining tasks.
+///
+/// Queues and workers operate over types that implement this trait.
 pub trait Task: Send + 'static {
     /// The input type that the execute method will take.
     ///
@@ -107,8 +116,11 @@ pub trait Task: Send + 'static {
     /// Executes the task with the provided input.
     ///
     /// The core of a task, this method is called when the task is picked up by
-    /// a worker. The input type is passed to the method, and the task is
-    /// expected to handle it.
+    /// a worker.
+    ///
+    /// Typically this method will do something with the provided input. If no
+    /// input is needed, then the unit type, `()`, can be used instead and the
+    /// input ignored.
     ///
     /// # Example
     ///
@@ -151,14 +163,65 @@ pub trait Task: Send + 'static {
     /// the event of failure, and the interval between retries. This is useful
     /// for handling transient failures like network issues or external API
     /// errors.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use underway::{
+    ///     task::{Result as TaskResult, RetryPolicy},
+    ///     Task,
+    /// };
+    ///
+    /// struct MyCustomRetryTask;
+    ///
+    /// impl Task for MyCustomRetryTask {
+    ///     type Input = ();
+    ///
+    ///     async fn execute(&self, _input: Self::Input) -> TaskResult {
+    ///         Ok(())
+    ///     }
+    ///
+    ///     // Specify our own retry policy for the task.
+    ///     fn retry_policy(&self) -> RetryPolicy {
+    ///         RetryPolicy::builder()
+    ///             .max_attempts(20)
+    ///             .initial_interval_ms(2_500)
+    ///             .backoff_coefficient(1.5)
+    ///             .build()
+    ///     }
+    /// }
+    /// ```
     fn retry_policy(&self) -> RetryPolicy {
         RetryPolicy::default()
     }
 
     /// Provides the task execution timeout.
     ///
-    /// The default expiration is set to 15 minutes. Override this if your tasks
-    /// need to have shorter or longer timeouts.
+    /// Override this if your tasks need to have shorter or longer timeouts.
+    ///
+    /// Defaults to 15 minutes.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use jiff::{Span, ToSpan};
+    /// use underway::{task::Result as TaskResult, Task};
+    ///
+    /// struct MyImpatientTask;
+    ///
+    /// impl Task for MyImpatientTask {
+    ///     type Input = ();
+    ///
+    ///     async fn execute(&self, _input: Self::Input) -> TaskResult {
+    ///         Ok(())
+    ///     }
+    ///
+    ///     // Only give the task a short time to complete execution.
+    ///     fn timeout(&self) -> Span {
+    ///         1.second()
+    ///     }
+    /// }
+    /// ```
     fn timeout(&self) -> Span {
         15.minutes()
     }
@@ -166,19 +229,66 @@ pub trait Task: Send + 'static {
     /// Provides task time-to-live (TTL) duration in queue.
     ///
     /// After the duration has elapsed, a task may be removed from the queue,
-    /// e.g. via [`delete_expired`](Queue.delete_expired).
+    /// e.g. via [`run_deletion`](crate::Queue::run_deletion).
+    ///
+    /// **Note:** Tasks are not removed from the queue unless the `run_deletion`
+    /// routine is active.
+    ///
+    /// Defaults to 14 days.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use jiff::{Span, ToSpan};
+    /// use underway::{task::Result as TaskResult, Task};
+    ///
+    /// struct MyLongLivedTask;
+    ///
+    /// impl Task for MyLongLivedTask {
+    ///     type Input = ();
+    ///
+    ///     async fn execute(&self, _input: Self::Input) -> TaskResult {
+    ///         Ok(())
+    ///     }
+    ///
+    ///     // Keep the task around in the queue for a very long time.
+    ///     fn ttl(&self) -> Span {
+    ///         10.years()
+    ///     }
+    /// }
+    /// ```
     fn ttl(&self) -> Span {
         14.days()
     }
 
     /// Provides a delay before which the task won't be dequeued.
     ///
-    /// Delays are used to prevent a task from being run immediately.
+    /// Delays are used to prevent a task from running immediately after being
+    /// enqueued.
     ///
-    /// This may be useful when a task should not be run after it's been
-    /// constructed and enqueued. However, delays differ from scheduled tasks
-    /// and should not be used for recurring execution. Instead, use
-    /// [`Scheduler::run`](crate::Scheduler::run).
+    /// Defaults to no delay.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use jiff::{Span, ToSpan};
+    /// use underway::{task::Result as TaskResult, Task};
+    ///
+    /// struct MyDelayedTask;
+    ///
+    /// impl Task for MyDelayedTask {
+    ///     type Input = ();
+    ///
+    ///     async fn execute(&self, _input: Self::Input) -> TaskResult {
+    ///         Ok(())
+    ///     }
+    ///
+    ///     // Delay dequeuing the task for one hour.
+    ///     fn delay(&self) -> Span {
+    ///         1.hour()
+    ///     }
+    /// }
+    /// ```
     fn delay(&self) -> Span {
         Span::new()
     }
@@ -187,19 +297,19 @@ pub trait Task: Send + 'static {
     ///
     /// Concurrency keys are used to limit how many tasks of a specific type are
     /// allowed to run concurrently. By providing a unique key, tasks with
-    /// the same key can be processed sequentially rather than in parallel.
+    /// the same key can be processed sequentially rather than concurrently.
     ///
-    /// This can be useful when working with shared resources or preventing race
-    /// conditions. If no concurrency key is provided, tasks will be
+    /// This can be useful when working with shared resources or for preventing
+    /// race conditions. If no concurrency key is provided, tasks will be
     /// executed concurrently.
     ///
-    /// # Example:
+    /// # Example
     ///
     /// If you're processing files, you might want to use the file path as the
     /// concurrency key to prevent two workers from processing the same file
     /// simultaneously.
     ///
-    /// ```
+    /// ```rust
     /// use std::path::PathBuf;
     ///
     /// use underway::{task::Result as TaskResult, Task};
@@ -231,9 +341,9 @@ pub trait Task: Send + 'static {
     /// The default priority is `0`, and higher numbers represent higher
     /// priority.
     ///
-    /// # Example:
+    /// # Example
     ///
-    /// ```
+    /// ```rust
     /// use underway::{task::Result as TaskResult, Task};
     ///
     /// struct HighPriorityTask;
