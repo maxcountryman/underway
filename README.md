@@ -46,11 +46,11 @@ use std::env;
 
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use underway::{Queue, Job};
+use underway::{Job, Queue};
 
 const QUEUE_NAME: &str = "email";
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct WelcomeEmail {
     user_id: i32,
     email: String,
@@ -67,15 +67,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     underway::MIGRATOR.run(&pool).await?;
 
     // Create the task queue.
-    let queue = Queue::builder()
-        .name(QUEUE_NAME)
-        .pool(pool)
-        .build()
-        .await?;
+    let queue = Queue::builder().name(QUEUE_NAME).pool(pool).build().await?;
 
     // Build the job.
     let job = Job::builder()
-        .name(queue)
+        .queue(queue)
         .execute(
             |WelcomeEmail {
                  user_id,
@@ -87,8 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(())
             },
         )
-        .build()
-        .await?;
+        .build();
 
     // Enqueue a job task.
     let task_id = job
