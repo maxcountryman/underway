@@ -329,6 +329,44 @@ impl<T: Task> Queue<T> {
     where
         E: PgExecutor<'a>,
     {
+        self.enqueue_with_delay(executor, task, input, task.delay())
+            .await
+    }
+
+    /// Same as [`enqueue`](Queue::enqueue), but the task doesn't become
+    /// available until after the specified delay.
+    ///
+    /// **Note:** The provided delay is added to the task's configured delay.
+    /// This means that if you provide a five-minute delay and the task is
+    /// already configured with a thirty-second delay the task will not be
+    /// dequeued for at least five and half minutes.
+    pub async fn enqueue_after<'a, E>(
+        &self,
+        executor: E,
+        task: &T,
+        input: T::Input,
+        delay: Span,
+    ) -> Result<TaskId>
+    where
+        E: PgExecutor<'a>,
+    {
+        let calculated_delay = task.delay().checked_add(delay)?;
+        self.enqueue_with_delay(executor, task, input, calculated_delay)
+            .await
+    }
+
+    // Explicitly provide for a delay so that we can also facilitate calculated
+    // retries, i.e. `enqueue_after`.
+    async fn enqueue_with_delay<'a, E>(
+        &self,
+        executor: E,
+        task: &T,
+        input: T::Input,
+        delay: Span,
+    ) -> Result<TaskId>
+    where
+        E: PgExecutor<'a>,
+    {
         let id: TaskId = Ulid::new().into();
 
         let input_value = serde_json::to_value(&input)?;
@@ -336,7 +374,6 @@ impl<T: Task> Queue<T> {
         let retry_policy = task.retry_policy();
         let timeout = task.timeout();
         let ttl = task.ttl();
-        let delay = task.delay();
         let concurrency_key = task.concurrency_key();
         let priority = task.priority();
 
@@ -927,7 +964,7 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
-    use crate::task::Result as TaskResult;
+    use crate::{task::Result as TaskResult, worker::pg_interval_to_span};
 
     struct TestTask;
 
@@ -1017,6 +1054,40 @@ mod tests {
 
         assert_eq!(dequeued_task.concurrency_key, task.concurrency_key());
         assert_eq!(dequeued_task.priority, task.priority());
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn enqueue_after(pool: PgPool) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("test_enqueue_after")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let input = serde_json::json!({ "key": "value" });
+        let task = TestTask;
+
+        let task_id = queue
+            .enqueue_after(&pool, &task, input.clone(), 5.minutes())
+            .await?;
+
+        // Check the delay
+        let dequeued_task = sqlx::query!(
+            r#"
+            select delay from underway.task
+            where id = $1
+            "#,
+            task_id
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(
+            pg_interval_to_span(&dequeued_task.delay).compare(5.minutes())?,
+            std::cmp::Ordering::Equal
+        );
 
         Ok(())
     }

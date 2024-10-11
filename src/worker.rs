@@ -342,7 +342,7 @@ impl<T: Task> Worker<T> {
     }
 }
 
-fn pg_interval_to_span(
+pub(crate) fn pg_interval_to_span(
     PgInterval {
         months,
         days,

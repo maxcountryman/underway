@@ -333,6 +333,49 @@ where
         Ok(id)
     }
 
+    /// Enqueue the job after the given delay using a connection from the
+    /// queue's pool
+    ///
+    /// The given delay is added to the task's configured delay, if one is set.
+    pub async fn enqueue_after<'a, E>(
+        &self,
+        executor: E,
+        input: JobInput<I>,
+        delay: Span,
+    ) -> Result<TaskId>
+    where
+        E: PgExecutor<'a>,
+    {
+        self.enqueue_after_using(executor, input, delay).await
+    }
+
+    /// Enqueue the job using the provided executor after the given delay.
+    ///
+    /// The given delay is added to the task's configured delay, if one is set.
+    ///
+    /// This allows jobs to be enqueued using the same transaction as an
+    /// application may already be using in a given context.
+    ///
+    /// **Note:** If you pass a transactional executor and the transaction is
+    /// rolled back, the returned task ID will not correspond to any persisted
+    /// task.
+    pub async fn enqueue_after_using<'a, E>(
+        &self,
+        executor: E,
+        input: JobInput<I>,
+        delay: Span,
+    ) -> Result<TaskId>
+    where
+        E: PgExecutor<'a>,
+    {
+        let id = self
+            .queue
+            .enqueue_after(executor, self, input, delay)
+            .await?;
+
+        Ok(id)
+    }
+
     /// Schedule the job using a connection from the queue's pool.
     pub async fn schedule(&self, zoned_schedule: ZonedSchedule, input: JobInput<I>) -> Result {
         let mut conn = self.queue.pool.acquire().await?;
