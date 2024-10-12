@@ -101,24 +101,69 @@
 //! # });
 //! # }
 //! ```
+//!
+//! # Stopping workers safely
+//!
+//! In order to ensure that workers are interrupted while handling in-progress
+//! tasks, the [`graceful_shutdown`](crate::queue::graceful_shutdown) function
+//! is provided.
+//!
+//! This function allows you to politely ask all workers to stop processing new
+//! tasks. At the same time, workers are also aware of any in-progress tasks
+//! they're working on and will wait for these to be done or timeout.
+//!
+//! For cases where it's unimportant to wait for tasks to complete, this routine
+//! can be ignored.
+
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use jiff::{Span, ToSpan};
 use serde::{de::DeserializeOwned, Serialize};
-use sqlx::{postgres::types::PgInterval, PgConnection};
+use sqlx::{
+    postgres::{types::PgInterval, PgListener},
+    PgConnection,
+};
+use tokio::sync::{Notify, Semaphore};
 use tracing::instrument;
 
 use crate::{
     job::Job,
-    queue::{Error as QueueError, Queue},
+    queue::{Error as QueueError, Queue, SHUTDOWN_CHANNEL},
     task::{DequeuedTask, Error as TaskError, Id as TaskId, RetryCount, RetryPolicy, Task},
 };
 pub(crate) type Result = std::result::Result<(), Error>;
 
 /// A worker that's generic over the task it processes.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Worker<T: Task> {
     queue: Queue<T>,
-    task: T,
+    task: Arc<T>,
+
+    // Indicates the underlying queue has received a shutdown signal.
+    queue_shutdown: Arc<AtomicBool>,
+
+    // Indicates that this worker is processing a task.
+    processing: Arc<AtomicBool>,
+
+    // Notifies when a task is done processing.
+    processing_done: Arc<Notify>,
+}
+
+impl<T: Task> Clone for Worker<T> {
+    fn clone(&self) -> Self {
+        Self {
+            queue: self.queue.clone(),
+            task: Arc::clone(&self.task),
+            queue_shutdown: self.queue_shutdown.clone(),
+
+            // Clones don't share processing state.
+            processing: Arc::new(false.into()),
+            processing_done: Arc::new(Notify::new()),
+        }
+    }
 }
 
 /// Worker errors.
@@ -153,7 +198,10 @@ where
     fn from(job: Job<I>) -> Self {
         Self {
             queue: job.queue.clone(),
-            task: job,
+            task: Arc::new(job),
+            queue_shutdown: Arc::new(false.into()),
+            processing: Arc::new(false.into()),
+            processing_done: Arc::new(Notify::new()),
         }
     }
 }
@@ -165,15 +213,24 @@ where
     fn from(job: &Job<I>) -> Self {
         Self {
             queue: job.queue.clone(),
-            task: job.clone(),
+            task: Arc::new(job.to_owned()),
+            queue_shutdown: Arc::new(false.into()),
+            processing: Arc::new(false.into()),
+            processing_done: Arc::new(Notify::new()),
         }
     }
 }
 
-impl<T: Task> Worker<T> {
+impl<T: Task + Sync> Worker<T> {
     /// Creates a new worker with the given queue and task.
-    pub const fn new(queue: Queue<T>, task: T) -> Self {
-        Self { queue, task }
+    pub fn new(queue: Queue<T>, task: T) -> Self {
+        Self {
+            queue,
+            task: Arc::new(task),
+            queue_shutdown: Arc::new(false.into()),
+            processing: Arc::new(false.into()),
+            processing_done: Arc::new(Notify::new()),
+        }
     }
 
     /// Runs the worker, processing tasks as they become available.
@@ -188,11 +245,68 @@ impl<T: Task> Worker<T> {
     /// polls.
     pub async fn run_every(&self, span: Span) -> Result {
         let mut interval = tokio::time::interval(span.try_into()?);
-        interval.tick().await;
+
+        // Set up a listener for shutdown notifications
+        let mut shutdown_listener = PgListener::connect_with(&self.queue.pool).await?;
+        shutdown_listener.listen(SHUTDOWN_CHANNEL).await?;
+
+        // TODO: Concurrent limit config.
+        let permits = Arc::new(Semaphore::new(1));
+
         loop {
-            self.process_next_task().await?;
-            interval.tick().await;
+            tokio::select! {
+                shutdown_notif = shutdown_listener.recv() => {
+                    if let Err(err) = shutdown_notif {
+                        tracing::error!(%err, "NOTIFY resulted in an error");
+                        continue;
+                    }
+
+                    self.queue_shutdown.store(true, Ordering::SeqCst);
+
+                    if self.processing.load(Ordering::SeqCst) {
+                        tracing::info!(
+                            task.timeout = ?self.task.timeout(),
+                            "Worker is in-progress with a task, waiting for done notification or task timeout"
+                        );
+
+                        // Wait for either task processing to be done or the task timeout,
+                        // whichever is first.
+                        tokio::select! {
+                            _ = self.processing_done.notified() => {
+                                tracing::debug!("Received done notification");
+                            },
+
+                            _ = tokio::time::sleep(self.task.timeout().try_into().unwrap()) => {
+                                tracing::debug!("Slept until task timeout");
+                            },
+                        }
+                    }
+
+                },
+
+                _ = interval.tick() => {
+                    if self.queue_shutdown.load(Ordering::SeqCst) {
+                        tracing::info!("Queue is shutdown so no new tasks will be processed");
+                        break;
+                    }
+
+                    let permits = Arc::clone(&permits);
+
+                    // Cancellation safety: spawned tasks are managed by Tokio's runtime and will not
+                    // be dropped when the interval.tick future is cancelled.
+                    tokio::spawn({
+                        let worker = self.clone();
+                        async move {
+                            let _permit = permits.acquire().await.expect("Semaphore should be open");
+                            worker.process_next_task().await?;
+                            Ok::<(), Error>(())
+                        }
+                    });
+                }
+            }
         }
+
+        Ok(())
     }
 
     /// Processes the next available task in the queue.
@@ -213,6 +327,8 @@ impl<T: Task> Worker<T> {
         let mut tx = self.queue.pool.begin().await?;
 
         if let Some(task_row) = self.queue.dequeue(&mut tx).await? {
+            self.processing.store(true, Ordering::SeqCst);
+
             let task_id = task_row.id;
             tracing::Span::current().record("task.id", task_id.as_hyphenated().to_string());
 
@@ -234,6 +350,7 @@ impl<T: Task> Worker<T> {
                         Ok(_) => {
                             self.queue.mark_task_succeeded(&mut *tx, task_id).await?;
                         }
+
                         Err(err) => {
                             self.handle_task_error(err, &mut tx, task_id, task_row)
                                 .await?;
@@ -248,6 +365,9 @@ impl<T: Task> Worker<T> {
             }
 
             tx.commit().await?;
+
+            self.processing.store(false, Ordering::SeqCst);
+            self.processing_done.notify_waiters();
         }
 
         Ok(())
@@ -357,13 +477,16 @@ pub(crate) fn pg_interval_to_span(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration as StdDuration};
 
     use sqlx::PgPool;
     use tokio::sync::Mutex;
 
     use super::*;
-    use crate::task::{Result as TaskResult, State as TaskState};
+    use crate::{
+        queue::graceful_shutdown,
+        task::{Result as TaskResult, State as TaskState},
+    };
 
     struct TestTask;
 
@@ -458,6 +581,94 @@ mod tests {
         .await?;
 
         assert_eq!(dequeued_task.state, TaskState::Succeeded);
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn test_graceful_shutdown(pool: PgPool) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("test_queue")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        #[derive(Debug, Clone)]
+        struct LongRunningTask;
+
+        impl Task for LongRunningTask {
+            type Input = ();
+
+            async fn execute(&self, _: Self::Input) -> TaskResult {
+                tokio::time::sleep(StdDuration::from_secs(1)).await;
+                Ok(())
+            }
+        }
+
+        // Enqueue some tasks
+        for _ in 0..5 {
+            queue.enqueue(&pool, &LongRunningTask, ()).await?;
+        }
+
+        // Start workers
+        let worker = Worker::new(queue.clone(), LongRunningTask);
+        for _ in 0..2 {
+            let worker = worker.clone();
+            tokio::spawn(async move { worker.run().await });
+        }
+
+        let pending = sqlx::query_scalar!(
+            r#"
+            select count(*)
+            from underway.task
+            where state = $1
+            "#,
+            TaskState::Pending as _
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(pending, Some(5));
+
+        // Wait briefly to ensure workers are listening
+        tokio::time::sleep(StdDuration::from_secs(2)).await;
+
+        // Initiate graceful shutdown
+        graceful_shutdown(&pool).await?;
+
+        // Wait for tasks to be done
+        tokio::time::sleep(StdDuration::from_secs(5)).await;
+
+        let succeeded = sqlx::query_scalar!(
+            r#"
+            select count(*)
+            from underway.task
+            where state = $1
+            "#,
+            TaskState::Succeeded as _
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(succeeded, Some(5));
+
+        // New tasks shouldn't be processed
+        queue.enqueue(&pool, &LongRunningTask, ()).await?;
+
+        // Wait to ensure a worker would have seen the new task if one were processing
+        tokio::time::sleep(StdDuration::from_secs(5)).await;
+
+        let succeeded = sqlx::query_scalar!(
+            r#"
+            select count(*)
+            from underway.task
+            where state = $1
+            "#,
+            TaskState::Succeeded as _
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        // Succeeded count remains the same since workers have been shutdown
+        assert_eq!(succeeded, Some(5));
 
         Ok(())
     }

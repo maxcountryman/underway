@@ -959,6 +959,28 @@ impl<T: Task> QueueBuilder<T, PoolSet> {
     }
 }
 
+pub(crate) const SHUTDOWN_CHANNEL: &str = "underway_shutdown";
+
+/// Initiates a graceful shutdown by sending a `NOTIFY` to the
+/// `underway_shutdown` channel via the `pg_notify` function.
+///
+/// Workers listen on this channel and when a message is received will stop
+/// processing further tasks and wait for in-progress tasks to finish or
+/// timeout.
+///
+/// This can be useful when combined with [`tokio::signal`] to ensure queues are
+/// stopped cleanly when stopping your application.
+pub async fn graceful_shutdown<'a, E>(executor: E) -> Result
+where
+    E: PgExecutor<'a>,
+{
+    sqlx::query!("select pg_notify($1, $2)", SHUTDOWN_CHANNEL, "")
+        .execute(executor)
+        .await?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
