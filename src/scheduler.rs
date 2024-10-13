@@ -116,15 +116,20 @@ impl ZonedSchedule {
             .expect("iana_name should always be Some because new ensures valid time zone")
     }
 
-    pub(crate) fn duration_until_next(&self) -> Option<StdDuration> {
-        // Construct a date-time with the schedule's time zone.
-        let now_with_tz = Zoned::now().with_time_zone(self.timezone.clone());
-        if let Some(next_timestamp) = self.schedule.upcoming(self.timezone.clone()).next() {
-            let until_next = now_with_tz.duration_until(&next_timestamp).unsigned_abs();
-            return Some(until_next);
-        }
+    fn tz(&self) -> TimeZone {
+        self.timezone.to_owned()
+    }
 
-        None
+    fn now_with_tz(&self) -> Zoned {
+        Zoned::now().with_time_zone(self.tz())
+    }
+
+    pub(crate) fn duration_until_next(&self) -> Option<StdDuration> {
+        self.schedule.upcoming(self.tz()).next().map(|next_zoned| {
+            self.now_with_tz()
+                .duration_until(&next_zoned)
+                .unsigned_abs()
+        })
     }
 }
 
