@@ -120,9 +120,8 @@ impl ZonedSchedule {
         // Construct a date-time with the schedule's time zone.
         let now_with_tz = Zoned::now().with_time_zone(self.timezone.clone());
         if let Some(next_timestamp) = self.schedule.upcoming(self.timezone.clone()).next() {
-            let until_next = next_timestamp.duration_since(&now_with_tz);
-            // N.B. We're assigning default on failure here.
-            return Some(until_next.try_into().unwrap_or_default());
+            let until_next = now_with_tz.duration_until(&next_timestamp).unsigned_abs();
+            return Some(until_next);
         }
 
         None
