@@ -770,6 +770,34 @@ where
     }
 
     /// Set state.
+    ///
+    /// State allows you to inject dependencies into your execute closures.
+    /// When given, state is passed to the execute closure as its second
+    /// argument.
+    ///
+    /// # Mutable state
+    ///
+    /// Note that if your state needs to mutable, some form of interior
+    /// mutability is required. The most straightforward approach is to use
+    /// `Arc<Mutex<T>>`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use underway::Job;
+    /// // The type we'll use for our state.
+    /// #[derive(Clone)]
+    /// struct State {
+    ///     data: String,
+    /// }
+    ///
+    /// // Our state value.
+    /// let state = State {
+    ///     data: "foo".to_string(),
+    /// };
+    ///
+    /// Job::<(), _>::builder().state(state);
+    /// ```
     pub fn state(self, state: S) -> JobBuilder<I, S, StateSet<S>> {
         JobBuilder {
             builder_state: StateSet { state },
@@ -783,7 +811,26 @@ where
         }
     }
 
-    /// Set execute method.
+    /// Set execute closure.
+    ///
+    /// The provided closure must take input and return a future that outputs
+    /// [`task::Result`](crate::task::Result).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use serde::{Deserialize, Serialize};
+    /// # use underway::Job;
+    /// #[derive(Clone, Deserialize, Serialize)]
+    /// struct Message {
+    ///     content: String,
+    /// }
+    ///
+    /// Job::<_, ()>::builder().execute(|Message { content }| async move {
+    ///     println!("{content}");
+    ///     Ok(())
+    /// });
+    /// ```
     pub fn execute<F, Fut>(self, f: F) -> JobBuilder<I, S, ExecutorSet<I, ()>>
     where
         F: Fn(I) -> Fut + Send + Sync + 'static,
@@ -823,7 +870,40 @@ where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
     S: Clone + Send + Sync + 'static,
 {
-    /// Set execute method.
+    /// Set execute closure with state.
+    ///
+    /// The provided closure must take input and then state and return
+    /// a future which outputs [`task::Result`](crate::task::Result).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use serde::{Deserialize, Serialize};
+    /// # use underway::Job;
+    /// #[derive(Clone, Deserialize, Serialize)]
+    /// // The type we'll use for our input.
+    /// struct Message {
+    ///     content: String,
+    /// }
+    ///
+    /// // The type we'll use for our state.
+    /// #[derive(Clone)]
+    /// struct State {
+    ///     data: String,
+    /// }
+    ///
+    /// // Our state value.
+    /// let state = State {
+    ///     data: "foo".to_string(),
+    /// };
+    ///
+    /// Job::builder()
+    ///     .state(state)
+    ///     .execute(|Message { content }, State { data }| async move {
+    ///         println!("{content} {data}");
+    ///         Ok(())
+    ///     });
+    /// ```
     pub fn execute<F, Fut>(self, f: F) -> JobBuilder<I, S, ExecutorSet<I, S>>
     where
         F: Fn(I, S) -> Fut + Send + Sync + 'static,
@@ -854,6 +934,36 @@ where
     S: Clone + Send + Sync + 'static,
 {
     /// Set queue.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use serde::{Deserialize, Serialize};
+    /// # use underway::{Job, Queue};
+    /// # use sqlx::PgPool;
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
+    /// # let queue = Queue::builder()
+    /// #    .name("example_queue")
+    /// #    .pool(pool)
+    /// #    .build()
+    /// #    .await?;
+    /// # /*
+    /// let queue = { /* The queue we've defined for our job */ };
+    /// # */
+    /// #
+    ///
+    /// Job::builder()
+    /// #    .execute(|_: ()| async { Ok(()) })
+    ///     //.execute(...)
+    ///     .queue(queue);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     pub fn queue(self, queue: Queue<Job<I, S>>) -> JobBuilder<I, S, QueueSet<I, S>> {
         JobBuilder {
             builder_state: QueueSet {
@@ -878,6 +988,33 @@ where
     S: Clone + Send + Sync + 'static,
 {
     /// Returns a new [`Job`].
+    ///
+    ///# Example
+    ///
+    /// ```rust
+    /// # use serde::{Deserialize, Serialize};
+    /// # use underway::{Job, Queue};
+    /// # use sqlx::PgPool;
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
+    /// # let queue = Queue::builder()
+    /// #    .name("example_queue")
+    /// #    .pool(pool)
+    /// #    .build()
+    /// #    .await?;
+    /// let job = Job::builder()
+    /// #    .execute(|_: ()| async { Ok(()) })
+    ///     //.execute(...)
+    /// #    .queue(queue)
+    ///     //.queue(queue)
+    ///     .build();
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     pub fn build(self) -> Job<I, S> {
         let QueueSet {
             queue,
