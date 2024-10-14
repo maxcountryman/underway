@@ -618,30 +618,90 @@ where
     /// Set retry policy.
     ///
     /// See [`Task::retry_policy`].
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use underway::Job;
+    /// use underway::task::RetryPolicy;
+    ///
+    /// // Make a custom retry policy.
+    /// let retry_policy = RetryPolicy::builder().max_interval_ms(20_000).build();
+    ///
+    /// Job::builder()
+    /// #   .execute(|_: ()| async { Ok(()) })
+    ///     //.execute(...)
+    ///     .retry_policy(retry_policy);
+    /// ```
     pub fn retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
         self.retry_policy = retry_policy;
         self
     }
 
-    /// Set timeout.
+    /// Set execution timeout.
     ///
     /// See [`Task::timeout`].
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use underway::Job;
+    /// use jiff::ToSpan;
+    ///
+    /// // Set a one-hour timeout on task execution.
+    /// let timeout = 1.hour();
+    ///
+    /// Job::builder()
+    /// #   .execute(|_: ()| async { Ok(()) })
+    ///     //.execute(...)
+    ///     .timeout(timeout);
+    /// ```
     pub fn timeout(mut self, timeout: Span) -> Self {
         self.timeout = timeout;
         self
     }
 
-    /// Set time-to-live.
+    /// Set task time-to-live.
     ///
     /// See [`Task::ttl`].
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use underway::Job;
+    /// use jiff::ToSpan;
+    ///
+    /// // Set a one-year time-to-live for tasks.
+    /// let ttl = 1.year();
+    ///
+    /// Job::builder()
+    /// #   .execute(|_: ()| async { Ok(()) })
+    ///     //.execute(...)
+    ///     .ttl(ttl);
+    /// ```
     pub fn ttl(mut self, ttl: Span) -> Self {
         self.ttl = ttl;
         self
     }
 
-    /// Set delay.
+    /// Set dequeue delay.
     ///
     /// See [`Task::delay`].
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use underway::Job;
+    /// use jiff::ToSpan;
+    ///
+    /// // Set a five-minute delay before the task will be dequeued.
+    /// let delay = 5.minutes();
+    ///
+    /// Job::builder()
+    /// #   .execute(|_: ()| async { Ok(()) })
+    ///     //.execute(...)
+    ///     .delay(delay);
+    /// ```
     pub fn delay(mut self, delay: Span) -> Self {
         self.delay = delay;
         self
@@ -650,6 +710,19 @@ where
     /// Set concurrency key.
     ///
     /// See [`Task::concurrency_key`].
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use underway::Job;
+    /// // Use a unique string to ensure only one instance of the task can be run at a time.
+    /// let concurrency_key = "unique".to_string();
+    ///
+    /// Job::builder()
+    /// #   .execute(|_: ()| async { Ok(()) })
+    ///     //.execute(...)
+    ///     .concurrency_key(concurrency_key);
+    /// ```
     pub fn concurrency_key(mut self, concurrency_key: impl Into<String>) -> Self {
         self.concurrency_key = Some(concurrency_key.into());
         self
@@ -658,6 +731,19 @@ where
     /// Set priority.
     ///
     /// See [`Task::priority`].
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use underway::Job;
+    /// // Use a higher priority to ensure task is prioritized.
+    /// let priority = 10;
+    ///
+    /// Job::builder()
+    /// #   .execute(|_: ()| async { Ok(()) })
+    ///     //.execute(...)
+    ///     .priority(priority);
+    /// ```
     pub fn priority(mut self, priority: i32) -> Self {
         self.priority = priority;
         self
