@@ -611,7 +611,7 @@ where
     _state: PhantomData<S>,
 }
 
-impl<I, S, B> JobBuilder<I, S, B>
+impl<I, S> JobBuilder<I, S, ExecutorSet<I, S>>
 where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
     S: Clone + Send + Sync + 'static,
