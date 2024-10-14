@@ -19,11 +19,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build the job.
     let job = Job::builder()
-        .queue(queue)
         .execute(|_| async move {
             println!("Hello, World!");
             Ok(())
         })
+        .queue(queue)
         .build();
 
     // Schedule the job to run every minute in the given time zone.
