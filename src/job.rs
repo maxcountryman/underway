@@ -607,8 +607,7 @@ where
     delay: Span,
     concurrency_key: Option<String>,
     priority: i32,
-    _marker: PhantomData<I>,
-    _state: PhantomData<S>,
+    _marker: PhantomData<(I, S)>,
 }
 
 impl<I, S> JobBuilder<I, S, ExecutorSet<I, S>>
@@ -676,7 +675,6 @@ where
             concurrency_key: None,
             priority: 0,
             _marker: PhantomData,
-            _state: PhantomData,
         }
     }
 
@@ -691,7 +689,6 @@ where
             concurrency_key: self.concurrency_key,
             priority: self.priority,
             _marker: PhantomData,
-            _state: PhantomData,
         }
     }
 
@@ -716,7 +713,6 @@ where
             concurrency_key: self.concurrency_key,
             priority: self.priority,
             _marker: PhantomData,
-            _state: PhantomData,
         }
     }
 }
@@ -757,7 +753,6 @@ where
             concurrency_key: self.concurrency_key,
             priority: self.priority,
             _marker: PhantomData,
-            _state: PhantomData,
         }
     }
 }
@@ -782,7 +777,6 @@ where
             concurrency_key: self.concurrency_key,
             priority: self.priority,
             _marker: PhantomData,
-            _state: PhantomData,
         }
     }
 }
