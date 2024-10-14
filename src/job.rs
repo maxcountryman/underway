@@ -854,6 +854,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use jiff::ToSpan;
     use serde::{Deserialize, Serialize};
     use sqlx::PgPool;
@@ -1009,6 +1011,48 @@ mod tests {
                 .parse()
                 .expect("A valid zoned scheduled should be provided")
         );
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn shared_mutable_state(pool: PgPool) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("shared_mutable_state")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        #[derive(Clone)]
+        struct State {
+            data: Arc<Mutex<String>>,
+        }
+
+        let state = State {
+            data: Arc::new(Mutex::new("foo".to_string())),
+        };
+
+        let job = Job::builder()
+            .state(state.clone())
+            .execute(|_: (), State { data }| async move {
+                let mut data = data.lock().unwrap();
+                *data = "bar".to_string();
+                Ok(())
+            })
+            .queue(queue.clone())
+            .build();
+
+        job.enqueue(()).await?;
+
+        let job_handle = tokio::spawn(async move { job.run().await });
+
+        // Wait for job to complete
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert_eq!(*state.data.lock().unwrap(), "bar".to_string());
+
+        // Ensure the test will exit
+        job_handle.abort();
 
         Ok(())
     }
