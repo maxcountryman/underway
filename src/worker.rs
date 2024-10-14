@@ -185,11 +185,12 @@ pub enum Error {
     Jiff(#[from] jiff::Error),
 }
 
-impl<I> From<Job<I>> for Worker<Job<I>>
+impl<I, S> From<Job<I, S>> for Worker<Job<I, S>>
 where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
+    S: Clone + Send + Sync + 'static,
 {
-    fn from(job: Job<I>) -> Self {
+    fn from(job: Job<I, S>) -> Self {
         Self {
             queue: job.queue.clone(),
             task: Arc::new(job),
@@ -199,11 +200,12 @@ where
     }
 }
 
-impl<I> From<&Job<I>> for Worker<Job<I>>
+impl<I, S> From<&Job<I, S>> for Worker<Job<I, S>>
 where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
+    S: Clone + Send + Sync + 'static,
 {
-    fn from(job: &Job<I>) -> Self {
+    fn from(job: &Job<I, S>) -> Self {
         Self {
             queue: job.queue.clone(),
             task: Arc::new(job.to_owned()),
