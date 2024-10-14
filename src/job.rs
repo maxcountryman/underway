@@ -593,7 +593,7 @@ mod builder_states {
     }
 }
 
-/// A builder of [`Job`].
+/// Builder for [`Job`].
 #[derive(Debug)]
 pub struct JobBuilder<I, S, B = Initial>
 where
@@ -615,44 +615,49 @@ where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
     S: Clone + Send + Sync + 'static,
 {
-    /// Sets the job's retry policy.
+    /// Set retry policy.
+    ///
+    /// See [`Task::retry_policy`].
     pub fn retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
         self.retry_policy = retry_policy;
         self
     }
 
-    /// Sets the job's timeout.
+    /// Set timeout.
+    ///
+    /// See [`Task::timeout`].
     pub fn timeout(mut self, timeout: Span) -> Self {
         self.timeout = timeout;
         self
     }
 
-    /// Sets the job's time-to-live (TTL).
+    /// Set time-to-live.
+    ///
+    /// See [`Task::ttl`].
     pub fn ttl(mut self, ttl: Span) -> Self {
         self.ttl = ttl;
         self
     }
 
-    /// Sets the job's delay.
+    /// Set delay.
     ///
-    /// The job will not be processed before this delay has elapsed.
+    /// See [`Task::delay`].
     pub fn delay(mut self, delay: Span) -> Self {
         self.delay = delay;
         self
     }
 
-    /// Sets the job's concurrency key.
+    /// Set concurrency key.
     ///
-    /// Concurrency keys ensure that only one job of the given key may be
-    /// processed at a time.
+    /// See [`Task::concurrency_key`].
     pub fn concurrency_key(mut self, concurrency_key: impl Into<String>) -> Self {
         self.concurrency_key = Some(concurrency_key.into());
         self
     }
 
-    /// Sets the job's priority.
+    /// Set priority.
     ///
-    /// Higher priorities are processed first.
+    /// See [`Task::priority`].
     pub fn priority(mut self, priority: i32) -> Self {
         self.priority = priority;
         self
@@ -678,7 +683,7 @@ where
         }
     }
 
-    /// Sets the job's state.,
+    /// Set state.
     pub fn state(self, state: S) -> JobBuilder<I, S, StateSet<S>> {
         JobBuilder {
             builder_state: StateSet { state },
@@ -692,7 +697,7 @@ where
         }
     }
 
-    /// Sets the job's execute method.
+    /// Set execute method.
     pub fn execute<F, Fut>(self, f: F) -> JobBuilder<I, S, ExecutorSet<I, ()>>
     where
         F: Fn(I) -> Fut + Send + Sync + 'static,
@@ -732,7 +737,7 @@ where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
     S: Clone + Send + Sync + 'static,
 {
-    /// Sets the job's execute method.
+    /// Set execute method.
     pub fn execute<F, Fut>(self, f: F) -> JobBuilder<I, S, ExecutorSet<I, S>>
     where
         F: Fn(I, S) -> Fut + Send + Sync + 'static,
@@ -762,7 +767,7 @@ where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
     S: Clone + Send + Sync + 'static,
 {
-    /// Set the queue name.
+    /// Set queue.
     pub fn queue(self, queue: Queue<Job<I, S>>) -> JobBuilder<I, S, QueueSet<I, S>> {
         JobBuilder {
             builder_state: QueueSet {
@@ -786,7 +791,7 @@ where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
     S: Clone + Send + Sync + 'static,
 {
-    /// Returns a configured [`Job`].
+    /// Returns a new [`Job`].
     pub fn build(self) -> Job<I, S> {
         let QueueSet {
             queue,
