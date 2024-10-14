@@ -61,11 +61,12 @@ impl<T: Task> Scheduler<T> {
     }
 }
 
-impl<I> From<Job<I>> for Scheduler<Job<I>>
+impl<I, S> From<Job<I, S>> for Scheduler<Job<I, S>>
 where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
+    S: Clone + Send + Sync + 'static,
 {
-    fn from(job: Job<I>) -> Self {
+    fn from(job: Job<I, S>) -> Self {
         Self {
             queue: job.queue.clone(),
             task: job,
@@ -73,11 +74,12 @@ where
     }
 }
 
-impl<I> From<&Job<I>> for Scheduler<Job<I>>
+impl<I, S> From<&Job<I, S>> for Scheduler<Job<I, S>>
 where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
+    S: Clone + Send + Sync + 'static,
 {
-    fn from(job: &Job<I>) -> Self {
+    fn from(job: &Job<I, S>) -> Self {
         Self {
             queue: job.queue.clone(),
             task: job.clone(),

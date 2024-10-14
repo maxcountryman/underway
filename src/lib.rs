@@ -66,7 +66,6 @@
 //!
 //!     // Build the job.
 //!     let job = Job::builder()
-//!         .queue(queue)
 //!         .execute(
 //!             |WelcomeEmail {
 //!                  user_id,
@@ -78,6 +77,7 @@
 //!                 Ok(())
 //!             },
 //!         )
+//!         .queue(queue)
 //!         .build();
 //!
 //!     // Enqueue a task.

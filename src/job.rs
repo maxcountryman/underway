@@ -40,11 +40,11 @@
 //!
 //! // Define the job.
 //! let job = Job::builder()
-//!     .queue(queue)
 //!     .execute(|Message { content }| async move {
 //!         println!("Received: {content}");
 //!         Ok(())
 //!     })
+//!     .queue(queue)
 //!     .build();
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! # });
@@ -84,11 +84,11 @@
 //! }
 //!
 //! let job = Job::builder()
-//!     .queue(queue)
 //!     .execute(|Order { id }| async move {
 //!         println!("Order ID: {id}");
 //!         Ok(())
 //!     })
+//!     .queue(queue)
 //!     .build();
 //!
 //! // Enqueue a new message.
@@ -134,11 +134,11 @@
 //! #     id: usize,
 //! # }
 //! # let job = Job::builder()
-//! #     .queue(queue)
 //! #     .execute(|Order { id }| async move {
 //! #         println!("Order ID: {id}");
 //! #         Ok(())
 //! #     })
+//! #     .queue(queue)
 //! #     .build();
 //! let mut tx = pool.begin().await?;
 //!
@@ -181,8 +181,8 @@
 //! #    .build()
 //! #    .await?;
 //! # let job = Job::builder()
-//! #    .queue(queue)
 //! #    .execute(|_: ()| async move { Ok(()) })
+//! #    .queue(queue)
 //! #    .build();
 //! // Run the worker directly from the job.
 //! job.run().await?;
@@ -224,8 +224,8 @@
 //!     report_title: String,
 //! }
 //! # let job = Job::builder()
-//! #     .queue(queue)
 //! #     .execute(|_: JobConfig| async move { Ok(()) })
+//! #     .queue(queue)
 //! #     .build();
 //! #
 //!
@@ -245,10 +245,129 @@
 //! # });
 //! # }
 //! ```
+//!
+//! # Jobs with state
+//!
+//! Sometimes it's helpful to provide jobs with access to a shared context or
+//! state.
+//!
+//! For example, your jobs might need access to a database connection pool.
+//! Defining a state can make it easier to access these kinds of resources
+//! in the scope of your execute function.
+//!
+//! Note that when a state is provided, the execute function must take first the
+//! input and then the state.
+//!
+//! ```rust
+//! # use sqlx::PgPool;
+//! # use underway::Queue;
+//! use serde::{Deserialize, Serialize};
+//! use underway::Job;
+//!
+//! # use tokio::runtime::Runtime;
+//! # fn main() {
+//! # let rt = Runtime::new().unwrap();
+//! # rt.block_on(async {
+//! # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
+//! # let queue = Queue::builder()
+//! #    .name("example_queue")
+//! #    .pool(pool.clone())
+//! #    .build()
+//! #    .await?;
+//! # /*
+//! let queue = { /* The queue we've defined for our job */ };
+//! # */
+//! #
+//!
+//! // The execute input type.
+//! #[derive(Clone, Serialize, Deserialize)]
+//! struct Message {
+//!     content: String,
+//! }
+//!
+//! // The execute state type.
+//! #[derive(Clone)]
+//! struct State {
+//!     db_pool: PgPool,
+//! }
+//!
+//! // Define the job with state.
+//! let job = Job::builder()
+//!     .state(State { db_pool: pool })
+//!     .execute(|_: Message, State { db_pool }| async move {
+//!         // Do something with our connection pool...
+//!         Ok(())
+//!     })
+//!     .queue(queue)
+//!     .build();
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! # });
+//! # }
+//! ```
+//!
+//! ## Shared mutable state
+//!
+//! In order to mutate state from within an execution, some form of interior
+//! mutability should be used. The most straightfoward is `Arc<Mutex<T>>`.
+//!
+//! If the mutex is held across await points then an async-aware lock (such as
+//! [`tokio::sync::Mutex`]) is needed. That said, generally a synchronous lock
+//! is what you want and should be preferred.
+//! ```rust
+//! # use sqlx::PgPool;
+//! # use underway::Queue;
+//! use std::sync::{Arc, Mutex};
+//!
+//! use serde::{Deserialize, Serialize};
+//! use underway::Job;
+//!
+//! # use tokio::runtime::Runtime;
+//! # fn main() {
+//! # let rt = Runtime::new().unwrap();
+//! # rt.block_on(async {
+//! # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
+//! # let queue = Queue::builder()
+//! #    .name("example_queue")
+//! #    .pool(pool)
+//! #    .build()
+//! #    .await?;
+//! # /*
+//! let queue = { /* The queue we've defined for our job */ };
+//! # */
+//! #
+//!
+//! // The execute input type.
+//! #[derive(Clone, Serialize, Deserialize)]
+//! struct Message {
+//!     content: String,
+//! }
+//!
+//! // The execute state type.
+//! #[derive(Clone)]
+//! struct State {
+//!     data: Arc<Mutex<String>>,
+//! }
+//!
+//! // Define the job with state.
+//! let job = Job::builder()
+//!     .state(State {
+//!         data: Arc::new(Mutex::new("foo".to_string())),
+//!     })
+//!     .execute(|_: Message, State { data }| async move {
+//!         let mut data = data.lock().expect("Mutex should not be poisoned");
+//!         *data = "bar".to_string();
+//!         Ok(())
+//!     })
+//!     .queue(queue)
+//!     .build();
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! # });
+//! # }
+//! ```
 
 use std::{future::Future, marker::PhantomData, pin::Pin, sync::Arc};
 
-use builder_states::{ExecutorSet, Initial, QueueSet};
+use builder_states::{ExecutorSet, Initial, QueueSet, StateSet};
 use jiff::Span;
 use serde::{de::DeserializeOwned, Serialize};
 use sqlx::PgExecutor;
@@ -260,10 +379,19 @@ use crate::{
     worker::{Result as WorkerResult, Worker},
 };
 
-type JobInput<I> = <Job<I> as Task>::Input;
+type JobInput<I, S> = <Job<I, S> as Task>::Input;
 
-type ExecuteFn<I> =
+type SimpleExecuteFn<I> =
     Arc<dyn Fn(I) -> Pin<Box<dyn Future<Output = TaskResult> + Send>> + Send + Sync>;
+
+type StatefulExecuteFn<I, S> =
+    Arc<dyn Fn(I, S) -> Pin<Box<dyn Future<Output = TaskResult> + Send>> + Send + Sync>;
+
+#[derive(Clone)]
+pub(crate) enum ExecuteFn<I, S> {
+    Simple(SimpleExecuteFn<I>),
+    Stateful(StatefulExecuteFn<I, S>),
+}
 
 type Result<T = ()> = std::result::Result<T, Error>;
 
@@ -285,13 +413,15 @@ pub enum Error {
 
 /// An ergnomic implementation of the `Task` trait.
 #[derive(Clone)]
-pub struct Job<I>
+pub struct Job<I, S = ()>
 where
     Self: Task,
     I: Clone,
+    S: Clone + Send + Sync + 'static,
 {
     pub(crate) queue: Queue<Self>,
-    execute_fn: ExecuteFn<I>,
+    execute_fn: ExecuteFn<I, S>,
+    state: S,
     retry_policy: RetryPolicy,
     timeout: Span,
     ttl: Span,
@@ -300,18 +430,19 @@ where
     priority: i32,
 }
 
-impl<I> Job<I>
+impl<I, S> Job<I, S>
 where
-    I: Clone + DeserializeOwned + Serialize + Send + 'static,
     Self: Task,
+    I: Clone + DeserializeOwned + Serialize + Send + 'static,
+    S: Clone + Send + Sync + 'static,
 {
     /// Create a new job builder.
-    pub fn builder() -> JobBuilder<I, Initial> {
+    pub fn builder() -> JobBuilder<I, S, Initial> {
         JobBuilder::default()
     }
 
     /// Enqueue the job using a connection from the queue's pool.
-    pub async fn enqueue(&self, input: JobInput<I>) -> Result<TaskId> {
+    pub async fn enqueue(&self, input: JobInput<I, S>) -> Result<TaskId> {
         let mut conn = self.queue.pool.acquire().await?;
         self.enqueue_using(&mut *conn, input).await
     }
@@ -324,7 +455,7 @@ where
     /// **Note:** If you pass a transactional executor and the transaction is
     /// rolled back, the returned task ID will not correspond to any persisted
     /// task.
-    pub async fn enqueue_using<'a, E>(&self, executor: E, input: JobInput<I>) -> Result<TaskId>
+    pub async fn enqueue_using<'a, E>(&self, executor: E, input: JobInput<I, S>) -> Result<TaskId>
     where
         E: PgExecutor<'a>,
     {
@@ -340,7 +471,7 @@ where
     pub async fn enqueue_after<'a, E>(
         &self,
         executor: E,
-        input: JobInput<I>,
+        input: JobInput<I, S>,
         delay: Span,
     ) -> Result<TaskId>
     where
@@ -362,7 +493,7 @@ where
     pub async fn enqueue_after_using<'a, E>(
         &self,
         executor: E,
-        input: JobInput<I>,
+        input: JobInput<I, S>,
         delay: Span,
     ) -> Result<TaskId>
     where
@@ -377,7 +508,7 @@ where
     }
 
     /// Schedule the job using a connection from the queue's pool.
-    pub async fn schedule(&self, zoned_schedule: ZonedSchedule, input: JobInput<I>) -> Result {
+    pub async fn schedule(&self, zoned_schedule: ZonedSchedule, input: JobInput<I, S>) -> Result {
         let mut conn = self.queue.pool.acquire().await?;
         self.schedule_using(&mut *conn, zoned_schedule, input).await
     }
@@ -390,7 +521,7 @@ where
         &self,
         executor: E,
         zoned_schedule: ZonedSchedule,
-        input: JobInput<I>,
+        input: JobInput<I, S>,
     ) -> Result
     where
         E: PgExecutor<'a>,
@@ -435,94 +566,113 @@ mod builder_states {
 
     pub struct Initial;
 
-    pub struct QueueSet<I>
+    pub struct StateSet<S>
     where
-        I: Clone + DeserializeOwned + Serialize + Send + 'static,
+        S: Clone + Send + Sync + 'static,
     {
-        pub queue: Queue<Job<I>>,
+        pub state: S,
     }
 
-    pub struct ExecutorSet<I>
+    pub struct ExecutorSet<I, S>
     where
         I: Clone + DeserializeOwned + Serialize + Send + 'static,
+        S: Clone + Send + Sync + 'static,
     {
-        pub queue: Queue<Job<I>>,
-        pub execute_fn: ExecuteFn<I>,
+        pub state: S,
+        pub(crate) execute_fn: ExecuteFn<I, S>,
+    }
+
+    pub struct QueueSet<I, S>
+    where
+        I: Clone + DeserializeOwned + Serialize + Send + 'static,
+        S: Clone + Send + Sync + 'static,
+    {
+        pub state: S,
+        pub(crate) execute_fn: ExecuteFn<I, S>,
+        pub queue: Queue<Job<I, S>>,
     }
 }
 
-/// A builder of [`Job`].
+/// Builder for [`Job`].
 #[derive(Debug)]
-pub struct JobBuilder<I, S = Initial>
+pub struct JobBuilder<I, S, B = Initial>
 where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
+    S: Clone + Send + Sync + 'static,
 {
-    state: S,
+    builder_state: B,
     retry_policy: RetryPolicy,
     timeout: Span,
     ttl: Span,
     delay: Span,
     concurrency_key: Option<String>,
     priority: i32,
-    _marker: PhantomData<I>,
+    _marker: PhantomData<(I, S)>,
 }
 
-impl<I, S> JobBuilder<I, S>
+impl<I, S> JobBuilder<I, S, ExecutorSet<I, S>>
 where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
+    S: Clone + Send + Sync + 'static,
 {
-    /// Sets the job's retry policy.
+    /// Set retry policy.
+    ///
+    /// See [`Task::retry_policy`].
     pub fn retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
         self.retry_policy = retry_policy;
         self
     }
 
-    /// Sets the job's timeout.
+    /// Set timeout.
+    ///
+    /// See [`Task::timeout`].
     pub fn timeout(mut self, timeout: Span) -> Self {
         self.timeout = timeout;
         self
     }
 
-    /// Sets the job's time-to-live (TTL).
+    /// Set time-to-live.
+    ///
+    /// See [`Task::ttl`].
     pub fn ttl(mut self, ttl: Span) -> Self {
         self.ttl = ttl;
         self
     }
 
-    /// Sets the job's delay.
+    /// Set delay.
     ///
-    /// The job will not be processed before this delay has elapsed.
+    /// See [`Task::delay`].
     pub fn delay(mut self, delay: Span) -> Self {
         self.delay = delay;
         self
     }
 
-    /// Sets the job's concurrency key.
+    /// Set concurrency key.
     ///
-    /// Concurrency keys ensure that only one job of the given key may be
-    /// processed at a time.
+    /// See [`Task::concurrency_key`].
     pub fn concurrency_key(mut self, concurrency_key: impl Into<String>) -> Self {
         self.concurrency_key = Some(concurrency_key.into());
         self
     }
 
-    /// Sets the job's priority.
+    /// Set priority.
     ///
-    /// Higher priorities are processed first.
+    /// See [`Task::priority`].
     pub fn priority(mut self, priority: i32) -> Self {
         self.priority = priority;
         self
     }
 }
 
-impl<I> JobBuilder<I, Initial>
+impl<I, S> JobBuilder<I, S, Initial>
 where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
+    S: Clone + Send + Sync + 'static,
 {
     /// Create a job builder.
-    pub fn new() -> JobBuilder<I, Initial> {
-        JobBuilder::<I, _> {
-            state: Initial,
+    pub fn new() -> JobBuilder<I, S, Initial> {
+        JobBuilder::<I, S, _> {
+            builder_state: Initial,
             retry_policy: RetryPolicy::default(),
             timeout: Span::new().minutes(15),
             ttl: Span::new().days(14),
@@ -533,10 +683,10 @@ where
         }
     }
 
-    /// Set the queue name.
-    pub fn queue(self, queue: Queue<Job<I>>) -> JobBuilder<I, QueueSet<I>> {
+    /// Set state.
+    pub fn state(self, state: S) -> JobBuilder<I, S, StateSet<S>> {
         JobBuilder {
-            state: QueueSet { queue },
+            builder_state: StateSet { state },
             retry_policy: self.retry_policy,
             timeout: self.timeout,
             ttl: self.ttl,
@@ -546,34 +696,20 @@ where
             _marker: PhantomData,
         }
     }
-}
 
-impl<I> Default for JobBuilder<I, Initial>
-where
-    I: Clone + DeserializeOwned + Serialize + Send + 'static,
-{
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<I> JobBuilder<I, QueueSet<I>>
-where
-    I: Clone + DeserializeOwned + Serialize + Send + 'static,
-{
-    /// Set's the job's execute method.
-    pub fn execute<F, Fut>(self, f: F) -> JobBuilder<I, ExecutorSet<I>>
+    /// Set execute method.
+    pub fn execute<F, Fut>(self, f: F) -> JobBuilder<I, S, ExecutorSet<I, ()>>
     where
         F: Fn(I) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = TaskResult> + Send + 'static,
     {
         JobBuilder {
-            state: ExecutorSet {
-                queue: self.state.queue,
-                execute_fn: Arc::new(move |input: I| {
+            builder_state: ExecutorSet {
+                execute_fn: ExecuteFn::Simple(Arc::new(move |input: I| {
                     let fut = f(input);
                     Box::pin(fut)
-                }),
+                })),
+                state: (),
             },
             retry_policy: self.retry_policy,
             timeout: self.timeout,
@@ -586,16 +722,86 @@ where
     }
 }
 
-impl<I> JobBuilder<I, ExecutorSet<I>>
+impl<I, S> Default for JobBuilder<I, S, Initial>
 where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
+    S: Clone + Send + Sync + 'static,
 {
-    /// Returns a configured [`Job`].
-    pub fn build(self) -> Job<I> {
-        let ExecutorSet { queue, execute_fn } = self.state;
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<I, S> JobBuilder<I, S, StateSet<S>>
+where
+    I: Clone + DeserializeOwned + Serialize + Send + 'static,
+    S: Clone + Send + Sync + 'static,
+{
+    /// Set execute method.
+    pub fn execute<F, Fut>(self, f: F) -> JobBuilder<I, S, ExecutorSet<I, S>>
+    where
+        F: Fn(I, S) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = TaskResult> + Send + 'static,
+    {
+        JobBuilder {
+            builder_state: ExecutorSet {
+                execute_fn: ExecuteFn::Stateful(Arc::new(move |input: I, state: S| {
+                    let fut = f(input, state);
+                    Box::pin(fut)
+                })),
+                state: self.builder_state.state,
+            },
+            retry_policy: self.retry_policy,
+            timeout: self.timeout,
+            ttl: self.ttl,
+            delay: self.delay,
+            concurrency_key: self.concurrency_key,
+            priority: self.priority,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<I, S> JobBuilder<I, S, ExecutorSet<I, S>>
+where
+    I: Clone + DeserializeOwned + Serialize + Send + 'static,
+    S: Clone + Send + Sync + 'static,
+{
+    /// Set queue.
+    pub fn queue(self, queue: Queue<Job<I, S>>) -> JobBuilder<I, S, QueueSet<I, S>> {
+        JobBuilder {
+            builder_state: QueueSet {
+                state: self.builder_state.state,
+                execute_fn: self.builder_state.execute_fn,
+                queue,
+            },
+            retry_policy: self.retry_policy,
+            timeout: self.timeout,
+            ttl: self.ttl,
+            delay: self.delay,
+            concurrency_key: self.concurrency_key,
+            priority: self.priority,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<I, S> JobBuilder<I, S, QueueSet<I, S>>
+where
+    I: Clone + DeserializeOwned + Serialize + Send + 'static,
+    S: Clone + Send + Sync + 'static,
+{
+    /// Returns a new [`Job`].
+    pub fn build(self) -> Job<I, S> {
+        let QueueSet {
+            queue,
+            execute_fn,
+            state,
+        } = self.builder_state;
         Job {
             queue,
             execute_fn,
+            state,
             retry_policy: self.retry_policy,
             timeout: self.timeout,
             ttl: self.ttl,
@@ -606,14 +812,18 @@ where
     }
 }
 
-impl<I> Task for Job<I>
+impl<I, S> Task for Job<I, S>
 where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
+    S: Clone + Send + Sync + 'static,
 {
     type Input = I;
 
     async fn execute(&self, input: Self::Input) -> TaskResult {
-        (self.execute_fn)(input).await
+        match self.execute_fn.to_owned() {
+            ExecuteFn::Simple(f) => f(input).await,
+            ExecuteFn::Stateful(f) => f(input, self.state.to_owned()).await,
+        }
     }
 
     fn retry_policy(&self) -> RetryPolicy {
@@ -643,6 +853,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use jiff::ToSpan;
     use serde::{Deserialize, Serialize};
     use sqlx::PgPool;
@@ -663,7 +875,6 @@ mod tests {
         }
 
         let job = Job::builder()
-            .queue(queue.clone())
             .execute(|input: Input| async move {
                 println!("Executing job with message: {}", input.message);
                 Ok(())
@@ -674,6 +885,56 @@ mod tests {
             .delay(10.seconds())
             .concurrency_key("test_key")
             .priority(10)
+            .queue(queue.clone())
+            .build();
+
+        // Assert that job properties are correctly set.
+        assert_eq!(job.retry_policy(), RetryPolicy::default());
+        assert_eq!(job.timeout(), 5.minutes());
+        assert_eq!(job.ttl(), 1.day());
+        assert_eq!(job.delay(), 10.seconds());
+        assert_eq!(job.concurrency_key(), Some("test_key".to_string()));
+        assert_eq!(job.priority(), 10);
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn create_job_with_state(pool: PgPool) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("create_job")
+            .pool(pool)
+            .build()
+            .await?;
+
+        #[derive(Clone)]
+        struct State {
+            env: String,
+        }
+
+        #[derive(Clone, Serialize, Deserialize)]
+        struct Input {
+            message: String,
+        }
+
+        let job = Job::builder()
+            .state(State {
+                env: "test".to_string(),
+            })
+            .execute(|input: Input, state: State| async move {
+                println!(
+                    "Executing job with message: {} in environment {}",
+                    input.message, state.env
+                );
+                Ok(())
+            })
+            .retry_policy(RetryPolicy::default())
+            .timeout(5.minutes())
+            .ttl(1.day())
+            .delay(10.seconds())
+            .concurrency_key("test_key")
+            .priority(10)
+            .queue(queue.clone())
             .build();
 
         // Assert that job properties are correctly set.
@@ -701,8 +962,8 @@ mod tests {
         }
 
         let job = Job::builder()
-            .queue(queue.clone())
             .execute(|_: Input| async { Ok(()) })
+            .queue(queue.clone())
             .build();
 
         let input = Input {
@@ -732,8 +993,8 @@ mod tests {
             .await?;
 
         let job = Job::builder()
-            .queue(queue.clone())
             .execute(|_: ()| async { Ok(()) })
+            .queue(queue.clone())
             .build();
 
         let monthly = "@monthly[America/Los_Angeles]"
@@ -749,6 +1010,48 @@ mod tests {
                 .parse()
                 .expect("A valid zoned scheduled should be provided")
         );
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn shared_mutable_state(pool: PgPool) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("shared_mutable_state")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        #[derive(Clone)]
+        struct State {
+            data: Arc<Mutex<String>>,
+        }
+
+        let state = State {
+            data: Arc::new(Mutex::new("foo".to_string())),
+        };
+
+        let job = Job::builder()
+            .state(state.clone())
+            .execute(|_: (), State { data }| async move {
+                let mut data = data.lock().unwrap();
+                *data = "bar".to_string();
+                Ok(())
+            })
+            .queue(queue.clone())
+            .build();
+
+        job.enqueue(()).await?;
+
+        let job_handle = tokio::spawn(async move { job.run().await });
+
+        // Wait for job to complete
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert_eq!(*state.data.lock().unwrap(), "bar".to_string());
+
+        // Ensure the test will exit
+        job_handle.abort();
 
         Ok(())
     }
