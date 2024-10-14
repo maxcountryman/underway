@@ -1,16 +1,10 @@
 [package]
 name = "underway"
 description = "⏳ PostgreSQL-backed job queue for reliable background task processing"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 license = "MIT"
-keywords = [
-    "background-jobs",
-    "background-processing",
-    "job-processing",
-    "sqlx",
-    "web",
-]
+keywords = ["background-jobs", "job-queue", "work-queue", "sqlx", "web"]
 categories = ["asynchronous", "database", "web-programming"]
 repository = "https://github.com/maxcountryman/underway"
 documentation = "https://docs.rs/underway"
