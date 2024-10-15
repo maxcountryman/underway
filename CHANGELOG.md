@@ -1,5 +1,9 @@
 # Unreleased
 
+# 0.0.3
+
+- Added `ToTaskResult` trait for better task result ergonomics #10
+
 # 0.0.2
 
 - Jobs may provide state #9
