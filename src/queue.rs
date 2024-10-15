@@ -324,7 +324,6 @@ impl<T: Task> Queue<T> {
     ///   `std::time::Duration`.
     ///
     /// [ULID]: https://github.com/ulid/spec?tab=readme-ov-file#specification
-    #[instrument(skip(self, executor, task, input), fields(task.id = tracing::field::Empty), err)]
     pub async fn enqueue<'a, E>(&self, executor: E, task: &T, input: T::Input) -> Result<TaskId>
     where
         E: PgExecutor<'a>,
@@ -357,6 +356,7 @@ impl<T: Task> Queue<T> {
 
     // Explicitly provide for a delay so that we can also facilitate calculated
     // retries, i.e. `enqueue_after`.
+    #[instrument(name = "enqueue", skip(self, executor, task, input), fields(task.id = tracing::field::Empty), err)]
     async fn enqueue_with_delay<'a, E>(
         &self,
         executor: E,
@@ -611,7 +611,6 @@ impl<T: Task> Queue<T> {
         Ok(())
     }
 
-    #[instrument(skip(self, executor, task_id), fields(task.id = %task_id.as_hyphenated()), err)]
     async fn mark_task_in_progress<'a, E>(&self, executor: E, task_id: TaskId) -> Result
     where
         E: PgExecutor<'a>,
@@ -637,7 +636,6 @@ impl<T: Task> Queue<T> {
         Ok(())
     }
 
-    #[instrument(skip(self, executor, task_id), fields(task.id = %task_id.as_hyphenated()), err)]
     pub(crate) async fn mark_task_cancelled<'a, E>(&self, executor: E, task_id: TaskId) -> Result
     where
         E: PgExecutor<'a>,
@@ -663,7 +661,6 @@ impl<T: Task> Queue<T> {
         Ok(())
     }
 
-    #[instrument(skip(self, executor, task_id), fields(task.id = %task_id.as_hyphenated()), err)]
     pub(crate) async fn mark_task_succeeded<'a, E>(&self, executor: E, task_id: TaskId) -> Result
     where
         E: PgExecutor<'a>,
@@ -689,7 +686,6 @@ impl<T: Task> Queue<T> {
         Ok(())
     }
 
-    #[instrument(skip(self, executor, task_id), fields(task.id = %task_id.as_hyphenated()), err)]
     pub(crate) async fn reschedule_task_for_retry<'a, E>(
         &self,
         executor: E,
@@ -724,7 +720,6 @@ impl<T: Task> Queue<T> {
         Ok(())
     }
 
-    #[instrument(skip(self, executor, task_id), fields(task.id = %task_id.as_hyphenated()), err)]
     pub(crate) async fn mark_task_failed<'a, E>(&self, executor: E, task_id: TaskId) -> Result
     where
         E: PgExecutor<'a>,
@@ -749,7 +744,6 @@ impl<T: Task> Queue<T> {
         Ok(())
     }
 
-    #[instrument(skip(self, executor, task_id), fields(task.id = %task_id.as_hyphenated()), err)]
     pub(crate) async fn update_task_failure<'a, E>(
         &self,
         executor: E,
@@ -783,7 +777,6 @@ impl<T: Task> Queue<T> {
         Ok(())
     }
 
-    #[instrument(skip(self, executor, task_id), fields(task.id = %task_id.as_hyphenated()), err)]
     pub(crate) async fn move_task_to_dlq<'a, E>(
         &self,
         executor: E,
