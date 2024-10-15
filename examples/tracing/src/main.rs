@@ -5,9 +5,9 @@ use sqlx::PgPool;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use underway::{Job, Queue};
 
-const QUEUE_NAME: &str = "email";
+const QUEUE_NAME: &str = "example-tracing";
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct WelcomeEmail {
     user_id: i32,
     email: String,

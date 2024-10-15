@@ -5,6 +5,8 @@ use tokio::signal;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use underway::{Job, Queue};
 
+const QUEUE_NAME: &str = "graceful-shutdown";
+
 async fn shutdown_signal(pool: &PgPool) {
     let ctrl_c = async {
         signal::ctrl_c().await.unwrap();
@@ -50,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create the task queue.
     let queue = Queue::builder()
-        .name("graceful_shutdown")
+        .name(QUEUE_NAME)
         .pool(pool.clone())
         .build()
         .await?;

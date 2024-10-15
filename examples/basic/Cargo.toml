@@ -5,11 +5,8 @@ edition = "2021"
 publish = false
 
 [dependencies]
-chrono-tz = "0.10.0"
-cron = "0.12.1"
 serde = { version = "1.0.210", features = ["derive"] }
 sqlx = { version = "0.8.2", features = ["postgres", "runtime-tokio-rustls"] }
-time = "0.3"
 tokio = { version = "1.34.0", features = ["full"] }
 underway = { path = "../../" }
 uuid = { version = "1.10.0", features = ["serde", "v4"] }

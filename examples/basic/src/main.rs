@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use underway::{Job, Queue};
 
-const QUEUE_NAME: &str = "email";
+const QUEUE_NAME: &str = "example-basic";
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct WelcomeEmail {
     user_id: i32,
     email: String,

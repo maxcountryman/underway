@@ -3,7 +3,7 @@ use std::env;
 use sqlx::PgPool;
 use underway::{Job, Queue};
 
-const QUEUE_NAME: &str = "hello-world";
+const QUEUE_NAME: &str = "example-scheduled";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

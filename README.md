@@ -50,7 +50,7 @@ use underway::{Job, Queue};
 
 const QUEUE_NAME: &str = "email";
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct WelcomeEmail {
     user_id: i32,
     email: String,
