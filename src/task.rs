@@ -66,7 +66,7 @@
 //! # });
 //! # }
 //! ```
-use std::future::Future;
+use std::{future::Future, result::Result as StdResult};
 
 use jiff::{Span, ToSpan};
 use serde::{de::DeserializeOwned, Serialize};
@@ -81,7 +81,7 @@ use uuid::Uuid;
 pub type Id = Uuid;
 
 /// A type alias for task execution results.
-pub type Result = std::result::Result<(), Error>;
+pub type Result = StdResult<(), Error>;
 
 /// Task errors.
 #[derive(Debug, thiserror::Error)]
@@ -102,6 +102,60 @@ pub enum Error {
     /// state.
     #[error("{0}")]
     Retryable(String),
+}
+
+/// Convenience trait for converting results into task results.
+///
+/// This makes it easier to convert execution errors to either
+/// [`Retryable`](Error::Retryable) or [`Fatal`](Error::Fatal). These are
+/// recoverable and unrecoverable, respectively.
+///
+/// # Examples
+///
+/// Sometimes errors are retryable:
+///
+///```rust
+/// use tokio::net;
+/// use underway::{Job, ToTaskResult};
+///
+/// Job::<(), ()>::builder().execute(|_| async {
+///     // If we can't resolve DNS the issue may be transient and recoverable.
+///     net::lookup_host("example.com:80").await.retryable()?;
+///
+///     Ok(())
+/// });
+/// ```
+///
+/// And other times they're fatal:
+///
+/// ```rust
+/// use std::env;
+///
+/// use underway::{Job, ToTaskResult};
+///
+/// Job::<(), ()>::builder().execute(|_| async {
+///     // If the API_KEY environment variable isn't set we can't recover.
+///     let api_key = env::var("API_KEY").fatal()?;
+///
+///     Ok(())
+/// });
+/// ```
+pub trait ToTaskResult<T> {
+    /// Converts the error into a [`Retryable`](Error::Retryable) task error.
+    fn retryable(self) -> StdResult<T, Error>;
+
+    /// Converts the error into a [`Fatal`](Error::Fatal) task error.
+    fn fatal(self) -> StdResult<T, Error>;
+}
+
+impl<T, E: std::fmt::Display> ToTaskResult<T> for StdResult<T, E> {
+    fn retryable(self) -> StdResult<T, Error> {
+        self.map_err(|err| Error::Retryable(err.to_string()))
+    }
+
+    fn fatal(self) -> StdResult<T, Error> {
+        self.map_err(|err| Error::Fatal(err.to_string()))
+    }
 }
 
 /// Trait for defining tasks.

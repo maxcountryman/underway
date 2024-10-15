@@ -151,7 +151,7 @@ pub use crate::{
     job::Job,
     queue::Queue,
     scheduler::{Scheduler, ZonedSchedule},
-    task::Task,
+    task::{Task, ToTaskResult},
     worker::Worker,
 };
 
