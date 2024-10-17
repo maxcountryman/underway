@@ -374,9 +374,9 @@ use sqlx::PgExecutor;
 
 use crate::{
     queue::{Error as QueueError, Queue},
-    scheduler::{Result as SchedulerResult, Scheduler, ZonedSchedule},
+    scheduler::{Error as SchedulerError, Result as SchedulerResult, Scheduler, ZonedSchedule},
     task::{Error as TaskError, Id as TaskId, Result as TaskResult, RetryPolicy, Task},
-    worker::{Result as WorkerResult, Worker},
+    worker::{Error as WorkerError, Result as WorkerResult, Worker},
 };
 
 type JobInput<I, S> = <Job<I, S> as Task>::Input;
@@ -406,17 +406,29 @@ pub enum Error {
     #[error(transparent)]
     Task(#[from] TaskError),
 
+    /// Error returned from worker operation.
+    #[error(transparent)]
+    Worker(#[from] WorkerError),
+
+    /// Error returned from scheduler operation.
+    #[error(transparent)]
+    Scheduler(#[from] SchedulerError),
+
+    /// Error returned from Tokio task joins.
+    #[error(transparent)]
+    Join(#[from] tokio::task::JoinError),
+
     /// Error returned from database operations.
     #[error(transparent)]
     Database(#[from] sqlx::Error),
 }
 
-/// An ergnomic implementation of the `Task` trait.
+/// Ergnomic implementation of the `Task` trait.
 #[derive(Clone)]
 pub struct Job<I, S = ()>
 where
     Self: Task,
-    I: Clone,
+    I: Clone + DeserializeOwned + Serialize + Send + 'static,
     S: Clone + Send + Sync + 'static,
 {
     pub(crate) queue: Queue<Self>,
@@ -549,7 +561,7 @@ where
     }
 
     /// Constructs a worker which then immediately runs task processing.
-    pub async fn run(&self) -> WorkerResult {
+    pub async fn run_worker(&self) -> WorkerResult {
         let worker = Worker::from(self);
         worker.run().await
     }
@@ -558,6 +570,33 @@ where
     pub async fn run_scheduler(&self) -> SchedulerResult {
         let scheduler = Scheduler::from(self);
         scheduler.run().await
+    }
+
+    /// Runs both a worker and scheduler for the job.
+    pub async fn run(&self) -> Result {
+        let worker = Worker::from(self);
+        let scheduler = Scheduler::from(self);
+
+        let worker_task = tokio::spawn(async move { worker.run().await });
+        let scheduler_task = tokio::spawn(async move { scheduler.run().await });
+
+        tokio::select! {
+            res =  worker_task => {
+                match res {
+                    Ok(inner_res) => inner_res?,
+                    Err(join_err) => return Err(Error::from(join_err)),
+                }
+            },
+
+            res = scheduler_task => {
+                match res {
+                    Ok(inner_res) => inner_res?,
+                    Err(join_err) => return Err(Error::from(join_err)),
+                }
+            },
+        }
+
+        Ok(())
     }
 }
 
@@ -1083,6 +1122,7 @@ mod tests {
     use sqlx::PgPool;
 
     use super::*;
+    use crate::queue::graceful_shutdown;
 
     #[sqlx::test]
     async fn create_job(pool: PgPool) -> sqlx::Result<(), Error> {
@@ -1261,20 +1301,21 @@ mod tests {
                 *data = "bar".to_string();
                 Ok(())
             })
-            .queue(queue.clone())
+            .queue(queue)
             .build();
 
         job.enqueue(()).await?;
 
-        let job_handle = tokio::spawn(async move { job.run().await });
+        tokio::spawn(async move { job.run().await });
 
         // Wait for job to complete
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         assert_eq!(*state.data.lock().unwrap(), "bar".to_string());
 
-        // Ensure the test will exit
-        job_handle.abort();
+        // Shutdown and wait for a bit to ensure the test can exit.
+        tokio::spawn(async move { graceful_shutdown(&pool).await });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         Ok(())
     }
