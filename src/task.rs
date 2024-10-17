@@ -283,7 +283,7 @@ pub trait Task: Send + 'static {
     /// Provides task time-to-live (TTL) duration in queue.
     ///
     /// After the duration has elapsed, a task may be removed from the queue,
-    /// e.g. via [`run_deletion`](crate::Queue::run_deletion).
+    /// e.g. via [`run_deletion`](crate::queue::run_deletion).
     ///
     /// **Note:** Tasks are not removed from the queue unless the `run_deletion`
     /// routine is active.

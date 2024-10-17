@@ -178,9 +178,8 @@
 //!
 //! Tasks configure a time-to-live (TTL) which specifies how long they'll remain
 //! in the queue. However, tasks are only deleted from the queue if the deletion
-//! routine is explicitly invoked. Either [`Queue::run_deletion`] or
-//! [`Queue::run_deletion_every`] should be called to start the deletion
-//! routine.
+//! routine is explicitly invoked. Either [`run_deletion`] or
+//! [`run_deletion_every`] should be called to start the deletion routine.
 //!
 //! **Note**: Tasks will not be deleted from the queue if this routine is not
 //! running!
@@ -190,7 +189,7 @@
 //! # use underway::Task;
 //! # use underway::task::Result as TaskResult;
 //! # use sqlx::PgPool;
-//! use underway::Queue;
+//! use underway::queue;
 //!
 //! # struct MyTask;
 //! # impl Task for MyTask {
@@ -206,14 +205,9 @@
 //! let pool = { /* A `PgPool`. */ };
 //! # */
 //! # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
-//! let queue: Queue<MyTask> = Queue::builder()
-//!     .name("example_queue")
-//!     .pool(pool.clone())
-//!     .build()
-//!     .await?;
 //!
 //! // Ensure we remove tasks that have an expired TTL.
-//! queue.run_deletion().await?;
+//! queue::run_deletion(&pool).await?;
 //!
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! # });
@@ -540,40 +534,6 @@ impl<T: Task> Queue<T> {
         Ok(())
     }
 
-    /// Runs deletion clean up of expired tasks in a loop, sleeping between
-    /// deletions for the specified period.
-    ///
-    /// **Note:** Tasks are only deleted when this routine or `run_deletion` is
-    /// running.
-    ///
-    /// # Errors
-    ///
-    /// This function returns an error if:
-    ///
-    /// - The database operation fails during deletion.
-    pub async fn run_deletion_every(&self, period: Span) -> Result {
-        let mut interval = tokio::time::interval(period.try_into()?);
-        interval.tick().await;
-        loop {
-            self.delete_expired(&self.pool).await?;
-            interval.tick().await;
-        }
-    }
-
-    /// Runs deletion clean up of expired tasks every hour.
-    ///
-    /// **Note:** Tasks are only deleted when this routine or `run_deletion` is
-    /// running.
-    ///
-    /// # Errors
-    ///
-    /// This function returns an error if:
-    ///
-    /// - The database operation fails during deletion.
-    pub async fn run_deletion(&self) -> Result {
-        self.run_deletion_every(1.hour()).await
-    }
-
     #[instrument(skip(self, executor), err)]
     pub(crate) async fn task_schedule<'a, E>(
         &self,
@@ -810,43 +770,6 @@ impl<T: Task> Queue<T> {
     }
 
     #[instrument(skip(self, executor), err)]
-    pub(crate) async fn delete_expired<'a, E>(&self, executor: E) -> Result
-    where
-        E: PgExecutor<'a>,
-    {
-        if let Some(dlq_name) = &self.dlq_name {
-            sqlx::query!(
-                r#"
-                delete from underway.task
-                where (task_queue_name = $1 or task_queue_name = $2) and
-                       state != $3 and
-                       created_at + ttl < now()
-                "#,
-                self.name,
-                dlq_name,
-                TaskState::InProgress as _
-            )
-            .execute(executor)
-            .await?;
-        } else {
-            sqlx::query!(
-                r#"
-                delete from underway.task
-                where task_queue_name = $1 and
-                      state != $2 and
-                      created_at + ttl < now()
-                "#,
-                self.name,
-                TaskState::InProgress as _
-            )
-            .execute(executor)
-            .await?;
-        }
-
-        Ok(())
-    }
-
-    #[instrument(skip(self, executor), err)]
     pub(crate) async fn lock_task<'a, E>(&self, executor: E, key: &str) -> Result
     where
         E: PgExecutor<'a>,
@@ -871,6 +794,58 @@ impl<T: Task> Queue<T> {
 
         Ok(guard)
     }
+}
+
+/// Runs deletion clean up of expired tasks in a loop, sleeping between
+/// deletions for the specified period.
+///
+/// **Note:** Tasks are only deleted when this routine or `run_deletion` is
+/// running.
+///
+/// # Errors
+///
+/// This function returns an error if:
+///
+/// - The database operation fails during deletion.
+pub async fn run_deletion_every(pool: &PgPool, period: Span) -> Result {
+    let mut interval = tokio::time::interval(period.try_into()?);
+    interval.tick().await;
+    loop {
+        delete_expired(pool).await?;
+        interval.tick().await;
+    }
+}
+
+/// Runs deletion clean up of expired tasks every hour.
+///
+/// **Note:** Tasks are only deleted when this routine or `run_deletion` is
+/// running.
+///
+/// # Errors
+///
+/// This function returns an error if:
+///
+/// - The database operation fails during deletion.
+pub async fn run_deletion(pool: &PgPool) -> Result {
+    run_deletion_every(pool, 1.hour()).await
+}
+
+#[instrument(skip(executor), err)]
+async fn delete_expired<'a, E>(executor: E) -> Result
+where
+    E: PgExecutor<'a>,
+{
+    sqlx::query!(
+        r#"
+        delete from underway.task
+        where state != $1 and created_at + ttl < now()
+        "#,
+        TaskState::InProgress as _,
+    )
+    .execute(executor)
+    .await?;
+
+    Ok(())
 }
 
 mod builder_states {
