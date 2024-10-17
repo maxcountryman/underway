@@ -3,6 +3,7 @@ use std::{result::Result as StdResult, str::FromStr, time::Duration as StdDurati
 use jiff::{tz::TimeZone, Span, ToSpan, Zoned};
 use jiff_cron::Schedule;
 use serde::{de::DeserializeOwned, Serialize};
+use sqlx::postgres::PgAdvisoryLock;
 
 use crate::{queue::Error as QueueError, Job, Queue, Task};
 
@@ -21,15 +22,34 @@ pub enum Error {
 }
 
 /// Scheduler for running task schedules.
+///
+/// # Singleton behavior
+///
+/// In order to ensure schedules are dispatched at most once, only a single
+/// instance of a scheduler is allowed to run per queue. Internally this is
+/// managed via an [advisory lock][advisory-lock]. The lock is keyed to the name
+/// of the queue the scheduler belongs to.
+///
+/// When a scheduler is run it will attempt to acquire its lock. When it can,
+/// the run method loops indefinitely. However, when the lock cannot be
+/// acquired, e.g. because another scheduler is already running, it will return.
+///
+/// [advisory-lock]: https://www.postgresql.org/docs/current/explicit-locking.html#ADVISORY-LOCKS
 pub struct Scheduler<T: Task> {
     queue: Queue<T>,
+    queue_lock: PgAdvisoryLock,
     task: T,
 }
 
 impl<T: Task> Scheduler<T> {
     /// Creates a new scheduler.
     pub fn new(queue: Queue<T>, task: T) -> Self {
-        Self { queue, task }
+        let queue_lock = queue_scheduler_lock(&queue.name);
+        Self {
+            queue,
+            queue_lock,
+            task,
+        }
     }
 
     /// Runs the scheduler in a loop, sleeping one-second per iteration.
@@ -39,6 +59,15 @@ impl<T: Task> Scheduler<T> {
 
     /// Runs the scheduler in a loop, sleeping for the given span per iteration.
     pub async fn run_every(&self, span: Span) -> Result {
+        let Some(_guard) = self
+            .queue
+            .try_acquire_advisory_lock(&self.queue_lock)
+            .await?
+        else {
+            tracing::warn!("Scheduler lock could not be acquired, scheduler exiting");
+            return Ok(());
+        };
+
         let mut interval = tokio::time::interval(span.try_into()?);
         interval.tick().await;
         loop {
@@ -69,6 +98,7 @@ where
     fn from(job: Job<I, S>) -> Self {
         Self {
             queue: job.queue.clone(),
+            queue_lock: queue_scheduler_lock(&job.queue.name),
             task: job,
         }
     }
@@ -82,9 +112,14 @@ where
     fn from(job: &Job<I, S>) -> Self {
         Self {
             queue: job.queue.clone(),
+            queue_lock: queue_scheduler_lock(&job.queue.name),
             task: job.clone(),
         }
     }
+}
+
+fn queue_scheduler_lock(queue_name: &str) -> PgAdvisoryLock {
+    PgAdvisoryLock::new(format!("{queue_name}-scheduler"))
 }
 
 /// Schedule paired with its time zone.

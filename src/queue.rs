@@ -224,7 +224,11 @@ use std::{marker::PhantomData, time::Duration as StdDuration};
 
 use builder_states::{Initial, NameSet, PoolSet};
 use jiff::{Span, ToSpan};
-use sqlx::{Acquire, PgExecutor, PgPool, Postgres};
+use sqlx::{
+    pool::PoolConnection,
+    postgres::{PgAdvisoryLock, PgAdvisoryLockGuard},
+    Acquire, PgExecutor, PgPool, Postgres,
+};
 use tracing::instrument;
 use ulid::Ulid;
 use uuid::Uuid;
@@ -273,7 +277,7 @@ pub enum Error {
 /// Queues are responsible for managing task lifecycle.
 #[derive(Debug)]
 pub struct Queue<T: Task> {
-    name: String,
+    pub(crate) name: String,
     pub(crate) dlq_name: Option<String>,
     pub(crate) pool: PgPool,
     _marker: PhantomData<T>,
@@ -847,11 +851,25 @@ impl<T: Task> Queue<T> {
     where
         E: PgExecutor<'a>,
     {
-        sqlx::query!("select pg_advisory_xact_lock(hashtext($1))", key,)
+        sqlx::query!("select pg_advisory_xact_lock(hashtext($1))", key)
             .execute(executor)
             .await?;
 
         Ok(())
+    }
+
+    #[instrument(skip(self), err)]
+    pub(crate) async fn try_acquire_advisory_lock<'a>(
+        &self,
+        lock: &'a PgAdvisoryLock,
+    ) -> Result<Option<PgAdvisoryLockGuard<'a, PoolConnection<Postgres>>>> {
+        let conn = self.pool.acquire().await?;
+        let guard = match lock.try_acquire(conn).await? {
+            sqlx::Either::Left(guard) => Some(guard),
+            sqlx::Either::Right(_) => None,
+        };
+
+        Ok(guard)
     }
 }
 
