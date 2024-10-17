@@ -1,12 +1,10 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n                delete from underway.task\n                where (task_queue_name = $1 or task_queue_name = $2) and\n                       state != $3 and\n                       created_at + ttl < now()\n                ",
+  "query": "\n        delete from underway.task\n        where state != $1 and created_at + ttl < now()\n        ",
   "describe": {
     "columns": [],
     "parameters": {
       "Left": [
-        "Text",
-        "Text",
         {
           "Custom": {
             "name": "underway.task_state",
@@ -25,5 +23,5 @@
     },
     "nullable": []
   },
-  "hash": "cbebe0e2b1253795f14417fd2708e8de46f36aa24d48b5be40d3669c3150e25d"
+  "hash": "63da920fcf11b0f6fc6cdb39e0dbcc61c3d70196c12097f6609e405ab8a4e38a"
 }
