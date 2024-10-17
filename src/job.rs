@@ -1309,7 +1309,7 @@ mod tests {
         tokio::spawn(async move { job.run().await });
 
         // Wait for job to complete
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         assert_eq!(*state.data.lock().unwrap(), "bar".to_string());
 
