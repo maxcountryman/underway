@@ -30,8 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let every_minute = "0 * * * * *[America/Los_Angeles]".parse()?;
     job.schedule(every_minute, ()).await?;
 
-    // Run the scheduler and worker concurrently.
-    let _ = tokio::join!(job.run_scheduler(), job.run());
+    job.run().await?;
 
     Ok(())
 }

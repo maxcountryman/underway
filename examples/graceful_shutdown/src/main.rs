@@ -75,13 +75,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let every_second = "* * * * * *[America/Los_Angeles]".parse()?;
     job.schedule(every_second, ()).await?;
 
-    // Run the scheduler and shutdown signal listener in a separate Tokio task.
-    tokio::spawn({
-        let job = job.clone();
-        async move { tokio::join!(job.run_scheduler(), shutdown_signal(&pool)) }
-    });
+    // Await the shutdown signal handler in its own task.
+    tokio::spawn(async move { shutdown_signal(&pool).await });
 
-    // The worker will run until the queue signals a shutdown.
+    // The job will run until the queue signals a shutdown.
     job.run().await?;
 
     Ok(())
