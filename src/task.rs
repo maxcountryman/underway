@@ -377,6 +377,7 @@ pub trait Task: Send + 'static {
     ///         Ok(())
     ///     }
     ///
+    ///     // Use the path buf as our concurrency key.
     ///     fn concurrency_key(&self) -> Option<String> {
     ///         Some(self.0.display().to_string())
     ///     }
@@ -409,8 +410,9 @@ pub trait Task: Send + 'static {
     ///         Ok(())
     ///     }
     ///
+    ///     // Set the priority to 10.
     ///     fn priority(&self) -> i32 {
-    ///         10 // High-priority task
+    ///         10
     ///     }
     /// }
     /// ```

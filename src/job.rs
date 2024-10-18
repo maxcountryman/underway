@@ -1105,7 +1105,7 @@ where
     }
 
     fn concurrency_key(&self) -> Option<String> {
-        self.concurrency_key.clone()
+        self.concurrency_key.to_owned()
     }
 
     fn priority(&self) -> i32 {
