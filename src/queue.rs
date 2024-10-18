@@ -290,8 +290,8 @@ impl<T: Task> Clone for Queue<T> {
 
 impl<T: Task> Queue<T> {
     /// Creates a builder for a new queue.
-    pub fn builder() -> QueueBuilder<T, Initial> {
-        QueueBuilder::default()
+    pub fn builder() -> Builder<T, Initial> {
+        Builder::default()
     }
 
     /// Enqueues a new task into the task queue, returning the task's unique ID.
@@ -867,18 +867,18 @@ mod builder_states {
 
 /// A builder for [`Queue`].
 #[derive(Debug)]
-pub struct QueueBuilder<T: Task, S> {
+pub struct Builder<T: Task, S> {
     state: S,
     _marker: PhantomData<T>,
 }
 
-impl<T: Task> Default for QueueBuilder<T, Initial> {
+impl<T: Task> Default for Builder<T, Initial> {
     fn default() -> Self {
-        QueueBuilder::new()
+        Builder::new()
     }
 }
 
-impl<T: Task> QueueBuilder<T, Initial> {
+impl<T: Task> Builder<T, Initial> {
     /// Create a new queue builder.
     pub fn new() -> Self {
         Self {
@@ -888,8 +888,8 @@ impl<T: Task> QueueBuilder<T, Initial> {
     }
 
     /// Set the queue name.
-    pub fn name(self, name: impl Into<String>) -> QueueBuilder<T, NameSet> {
-        QueueBuilder {
+    pub fn name(self, name: impl Into<String>) -> Builder<T, NameSet> {
+        Builder {
             state: NameSet {
                 name: name.into(),
                 dlq_name: None,
@@ -899,7 +899,7 @@ impl<T: Task> QueueBuilder<T, Initial> {
     }
 }
 
-impl<T: Task> QueueBuilder<T, NameSet> {
+impl<T: Task> Builder<T, NameSet> {
     /// Set the dead-letter queue name.
     pub fn dead_letter_queue(mut self, dlq_name: impl Into<String>) -> Self {
         self.state.dlq_name = Some(dlq_name.into());
@@ -907,8 +907,8 @@ impl<T: Task> QueueBuilder<T, NameSet> {
     }
 
     /// Set the database connection pool.
-    pub fn pool(self, pool: PgPool) -> QueueBuilder<T, PoolSet> {
-        QueueBuilder {
+    pub fn pool(self, pool: PgPool) -> Builder<T, PoolSet> {
+        Builder {
             state: PoolSet {
                 name: self.state.name,
                 dlq_name: self.state.dlq_name,
@@ -919,7 +919,7 @@ impl<T: Task> QueueBuilder<T, NameSet> {
     }
 }
 
-impl<T: Task> QueueBuilder<T, PoolSet> {
+impl<T: Task> Builder<T, PoolSet> {
     /// Builds the queue.
     pub async fn build(self) -> Result<Queue<T>> {
         let state = self.state;
