@@ -449,8 +449,8 @@ where
     S: Clone + Send + Sync + 'static,
 {
     /// Create a new job builder.
-    pub fn builder() -> JobBuilder<I, S, Initial> {
-        JobBuilder::default()
+    pub fn builder() -> Builder<I, S, Initial> {
+        Builder::default()
     }
 
     /// Enqueue the job using a connection from the queue's pool.
@@ -634,7 +634,7 @@ mod builder_states {
 
 /// Builder for [`Job`].
 #[derive(Debug)]
-pub struct JobBuilder<I, S, B = Initial>
+pub struct Builder<I, S, B = Initial>
 where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
     S: Clone + Send + Sync + 'static,
@@ -649,7 +649,7 @@ where
     _marker: PhantomData<(I, S)>,
 }
 
-impl<I, S> JobBuilder<I, S, ExecutorSet<I, S>>
+impl<I, S> Builder<I, S, ExecutorSet<I, S>>
 where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
     S: Clone + Send + Sync + 'static,
@@ -789,14 +789,14 @@ where
     }
 }
 
-impl<I, S> JobBuilder<I, S, Initial>
+impl<I, S> Builder<I, S, Initial>
 where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
     S: Clone + Send + Sync + 'static,
 {
     /// Create a job builder.
-    pub fn new() -> JobBuilder<I, S, Initial> {
-        JobBuilder::<I, S, _> {
+    pub fn new() -> Builder<I, S, Initial> {
+        Builder::<I, S, _> {
             builder_state: Initial,
             retry_policy: RetryPolicy::default(),
             timeout: Span::new().minutes(15),
@@ -837,8 +837,8 @@ where
     ///
     /// Job::<(), _>::builder().state(state);
     /// ```
-    pub fn state(self, state: S) -> JobBuilder<I, S, StateSet<S>> {
-        JobBuilder {
+    pub fn state(self, state: S) -> Builder<I, S, StateSet<S>> {
+        Builder {
             builder_state: StateSet { state },
             retry_policy: self.retry_policy,
             timeout: self.timeout,
@@ -870,12 +870,12 @@ where
     ///     Ok(())
     /// });
     /// ```
-    pub fn execute<F, Fut>(self, f: F) -> JobBuilder<I, S, ExecutorSet<I, ()>>
+    pub fn execute<F, Fut>(self, f: F) -> Builder<I, S, ExecutorSet<I, ()>>
     where
         F: Fn(I) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = TaskResult> + Send + 'static,
     {
-        JobBuilder {
+        Builder {
             builder_state: ExecutorSet {
                 execute_fn: ExecuteFn::Simple(Arc::new(move |input: I| {
                     let fut = f(input);
@@ -894,7 +894,7 @@ where
     }
 }
 
-impl<I, S> Default for JobBuilder<I, S, Initial>
+impl<I, S> Default for Builder<I, S, Initial>
 where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
     S: Clone + Send + Sync + 'static,
@@ -904,7 +904,7 @@ where
     }
 }
 
-impl<I, S> JobBuilder<I, S, StateSet<S>>
+impl<I, S> Builder<I, S, StateSet<S>>
 where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
     S: Clone + Send + Sync + 'static,
@@ -943,12 +943,12 @@ where
     ///         Ok(())
     ///     });
     /// ```
-    pub fn execute<F, Fut>(self, f: F) -> JobBuilder<I, S, ExecutorSet<I, S>>
+    pub fn execute<F, Fut>(self, f: F) -> Builder<I, S, ExecutorSet<I, S>>
     where
         F: Fn(I, S) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = TaskResult> + Send + 'static,
     {
-        JobBuilder {
+        Builder {
             builder_state: ExecutorSet {
                 execute_fn: ExecuteFn::Stateful(Arc::new(move |input: I, state: S| {
                     let fut = f(input, state);
@@ -967,7 +967,7 @@ where
     }
 }
 
-impl<I, S> JobBuilder<I, S, ExecutorSet<I, S>>
+impl<I, S> Builder<I, S, ExecutorSet<I, S>>
 where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
     S: Clone + Send + Sync + 'static,
@@ -1003,8 +1003,8 @@ where
     /// # });
     /// # }
     /// ```
-    pub fn queue(self, queue: Queue<Job<I, S>>) -> JobBuilder<I, S, QueueSet<I, S>> {
-        JobBuilder {
+    pub fn queue(self, queue: Queue<Job<I, S>>) -> Builder<I, S, QueueSet<I, S>> {
+        Builder {
             builder_state: QueueSet {
                 state: self.builder_state.state,
                 execute_fn: self.builder_state.execute_fn,
@@ -1021,7 +1021,7 @@ where
     }
 }
 
-impl<I, S> JobBuilder<I, S, QueueSet<I, S>>
+impl<I, S> Builder<I, S, QueueSet<I, S>>
 where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
     S: Clone + Send + Sync + 'static,
