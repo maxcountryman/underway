@@ -1,7 +1,7 @@
 [package]
 name = "underway"
 description = "⏳ PostgreSQL-backed job queue for reliable background task processing"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2021"
 license = "MIT"
 keywords = ["background-jobs", "job-queue", "work-queue", "sqlx", "web"]

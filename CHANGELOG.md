@@ -1,5 +1,12 @@
 # Unreleased
 
+# 0.0.4
+
+- Breaking: Renamed builders to `Builder` #15
+- Breaking: Made task deletion routine a free function #13
+- Breaking: `Job::run` now runs both the worker and scheduler #12
+- Ensure scheduler singleton behavior
+
 # 0.0.3
 
 - Added `ToTaskResult` trait for better task result ergonomics #10
