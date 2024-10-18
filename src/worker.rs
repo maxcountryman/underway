@@ -28,7 +28,8 @@
 //! # struct MyTask;
 //! # impl Task for MyTask {
 //! #    type Input = ();
-//! #    async fn execute(&self, input: Self::Input) -> TaskResult {
+//! #    type Output = ();
+//! #    async fn execute(&self, input: Self::Input) -> TaskResult<Self::Output> {
 //! #        Ok(())
 //! #    }
 //! # }
@@ -77,7 +78,8 @@
 //! # struct MyTask;
 //! # impl Task for MyTask {
 //! #    type Input = ();
-//! #    async fn execute(&self, input: Self::Input) -> TaskResult {
+//! #    type Output = ();
+//! #    async fn execute(&self, input: Self::Input) -> TaskResult<Self::Output> {
 //! #        Ok(())
 //! #    }
 //! # }
@@ -185,12 +187,13 @@ pub enum Error {
     Jiff(#[from] jiff::Error),
 }
 
-impl<I, S> From<Job<I, S>> for Worker<Job<I, S>>
+impl<I, O, S> From<Job<I, O, S>> for Worker<Job<I, O, S>>
 where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
+    O: Clone + Serialize + Send + 'static,
     S: Clone + Send + Sync + 'static,
 {
-    fn from(job: Job<I, S>) -> Self {
+    fn from(job: Job<I, O, S>) -> Self {
         Self {
             queue: job.queue.clone(),
             task: Arc::new(job),
@@ -200,12 +203,13 @@ where
     }
 }
 
-impl<I, S> From<&Job<I, S>> for Worker<Job<I, S>>
+impl<I, O, S> From<&Job<I, O, S>> for Worker<Job<I, O, S>>
 where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
+    O: Clone + Serialize + Send + 'static,
     S: Clone + Send + Sync + 'static,
 {
-    fn from(job: &Job<I, S>) -> Self {
+    fn from(job: &Job<I, O, S>) -> Self {
         Self {
             queue: job.queue.clone(),
             task: Arc::new(job.to_owned()),
@@ -498,8 +502,9 @@ mod tests {
 
     impl Task for TestTask {
         type Input = ();
+        type Output = ();
 
-        async fn execute(&self, _: Self::Input) -> TaskResult {
+        async fn execute(&self, _: Self::Input) -> TaskResult<Self::Output> {
             Ok(())
         }
     }
@@ -511,8 +516,9 @@ mod tests {
 
     impl Task for FailingTask {
         type Input = ();
+        type Output = ();
 
-        async fn execute(&self, _: Self::Input) -> TaskResult {
+        async fn execute(&self, _: Self::Input) -> TaskResult<Self::Output> {
             let mut fail_times = self.fail_times.lock().await;
             if *fail_times > 0 {
                 *fail_times -= 1;
@@ -604,8 +610,9 @@ mod tests {
 
         impl Task for LongRunningTask {
             type Input = ();
+            type Output = ();
 
-            async fn execute(&self, _: Self::Input) -> TaskResult {
+            async fn execute(&self, _: Self::Input) -> TaskResult<Self::Output> {
                 tokio::time::sleep(StdDuration::from_secs(1)).await;
                 Ok(())
             }

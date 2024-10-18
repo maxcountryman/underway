@@ -379,18 +379,18 @@ use crate::{
     worker::{Error as WorkerError, Result as WorkerResult, Worker},
 };
 
-type JobInput<I, S> = <Job<I, S> as Task>::Input;
+type JobInput<I, O, S> = <Job<I, O, S> as Task>::Input;
 
-type SimpleExecuteFn<I> =
-    Arc<dyn Fn(I) -> Pin<Box<dyn Future<Output = TaskResult> + Send>> + Send + Sync>;
+type SimpleExecuteFn<I, O> =
+    Arc<dyn Fn(I) -> Pin<Box<dyn Future<Output = TaskResult<O>> + Send>> + Send + Sync>;
 
-type StatefulExecuteFn<I, S> =
-    Arc<dyn Fn(I, S) -> Pin<Box<dyn Future<Output = TaskResult> + Send>> + Send + Sync>;
+type StatefulExecuteFn<I, O, S> =
+    Arc<dyn Fn(I, S) -> Pin<Box<dyn Future<Output = TaskResult<O>> + Send>> + Send + Sync>;
 
 #[derive(Clone)]
-pub(crate) enum ExecuteFn<I, S> {
-    Simple(SimpleExecuteFn<I>),
-    Stateful(StatefulExecuteFn<I, S>),
+pub(crate) enum ExecuteFn<I, O, S> {
+    Simple(SimpleExecuteFn<I, O>),
+    Stateful(StatefulExecuteFn<I, O, S>),
 }
 
 type Result<T = ()> = std::result::Result<T, Error>;
@@ -425,14 +425,15 @@ pub enum Error {
 
 /// Ergnomic implementation of the `Task` trait.
 #[derive(Clone)]
-pub struct Job<I, S = ()>
+pub struct Job<I, O, S = ()>
 where
     Self: Task,
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
     S: Clone + Send + Sync + 'static,
+    O: Serialize + Send + 'static,
 {
     pub(crate) queue: Queue<Self>,
-    execute_fn: ExecuteFn<I, S>,
+    execute_fn: ExecuteFn<I, O, S>,
     state: S,
     retry_policy: RetryPolicy,
     timeout: Span,
@@ -442,19 +443,20 @@ where
     priority: i32,
 }
 
-impl<I, S> Job<I, S>
+impl<I, O, S> Job<I, O, S>
 where
     Self: Task,
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
+    O: Clone + Serialize + Send + 'static,
     S: Clone + Send + Sync + 'static,
 {
     /// Create a new job builder.
-    pub fn builder() -> Builder<I, S, Initial> {
+    pub fn builder() -> Builder<I, O, S, Initial> {
         Builder::default()
     }
 
     /// Enqueue the job using a connection from the queue's pool.
-    pub async fn enqueue(&self, input: JobInput<I, S>) -> Result<TaskId> {
+    pub async fn enqueue(&self, input: JobInput<I, O, S>) -> Result<TaskId> {
         let mut conn = self.queue.pool.acquire().await?;
         self.enqueue_using(&mut *conn, input).await
     }
@@ -467,7 +469,11 @@ where
     /// **Note:** If you pass a transactional executor and the transaction is
     /// rolled back, the returned task ID will not correspond to any persisted
     /// task.
-    pub async fn enqueue_using<'a, E>(&self, executor: E, input: JobInput<I, S>) -> Result<TaskId>
+    pub async fn enqueue_using<'a, E>(
+        &self,
+        executor: E,
+        input: JobInput<I, O, S>,
+    ) -> Result<TaskId>
     where
         E: PgExecutor<'a>,
     {
@@ -483,7 +489,7 @@ where
     pub async fn enqueue_after<'a, E>(
         &self,
         executor: E,
-        input: JobInput<I, S>,
+        input: JobInput<I, O, S>,
         delay: Span,
     ) -> Result<TaskId>
     where
@@ -505,7 +511,7 @@ where
     pub async fn enqueue_after_using<'a, E>(
         &self,
         executor: E,
-        input: JobInput<I, S>,
+        input: JobInput<I, O, S>,
         delay: Span,
     ) -> Result<TaskId>
     where
@@ -520,7 +526,11 @@ where
     }
 
     /// Schedule the job using a connection from the queue's pool.
-    pub async fn schedule(&self, zoned_schedule: ZonedSchedule, input: JobInput<I, S>) -> Result {
+    pub async fn schedule(
+        &self,
+        zoned_schedule: ZonedSchedule,
+        input: JobInput<I, O, S>,
+    ) -> Result {
         let mut conn = self.queue.pool.acquire().await?;
         self.schedule_using(&mut *conn, zoned_schedule, input).await
     }
@@ -533,7 +543,7 @@ where
         &self,
         executor: E,
         zoned_schedule: ZonedSchedule,
-        input: JobInput<I, S>,
+        input: JobInput<I, O, S>,
     ) -> Result
     where
         E: PgExecutor<'a>,
@@ -612,31 +622,34 @@ mod builder_states {
         pub state: S,
     }
 
-    pub struct ExecutorSet<I, S>
+    pub struct ExecutorSet<I, O, S>
     where
         I: Clone + DeserializeOwned + Serialize + Send + 'static,
+        O: Clone + Serialize + Send + 'static,
         S: Clone + Send + Sync + 'static,
     {
         pub state: S,
-        pub(crate) execute_fn: ExecuteFn<I, S>,
+        pub(crate) execute_fn: ExecuteFn<I, O, S>,
     }
 
-    pub struct QueueSet<I, S>
+    pub struct QueueSet<I, O, S>
     where
         I: Clone + DeserializeOwned + Serialize + Send + 'static,
+        O: Clone + Serialize + Send + 'static,
         S: Clone + Send + Sync + 'static,
     {
         pub state: S,
-        pub(crate) execute_fn: ExecuteFn<I, S>,
-        pub queue: Queue<Job<I, S>>,
+        pub(crate) execute_fn: ExecuteFn<I, O, S>,
+        pub queue: Queue<Job<I, O, S>>,
     }
 }
 
 /// Builder for [`Job`].
 #[derive(Debug)]
-pub struct Builder<I, S, B = Initial>
+pub struct Builder<I, O, S, B = Initial>
 where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
+    O: Clone + Serialize + Send + 'static,
     S: Clone + Send + Sync + 'static,
 {
     builder_state: B,
@@ -646,12 +659,13 @@ where
     delay: Span,
     concurrency_key: Option<String>,
     priority: i32,
-    _marker: PhantomData<(I, S)>,
+    _marker: PhantomData<(I, O, S)>,
 }
 
-impl<I, S> Builder<I, S, ExecutorSet<I, S>>
+impl<I, O, S> Builder<I, O, S, ExecutorSet<I, O, S>>
 where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
+    O: Clone + Serialize + Send + 'static,
     S: Clone + Send + Sync + 'static,
 {
     /// Set retry policy.
@@ -789,14 +803,15 @@ where
     }
 }
 
-impl<I, S> Builder<I, S, Initial>
+impl<I, O, S> Builder<I, O, S, Initial>
 where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
+    O: Clone + Serialize + Send + 'static,
     S: Clone + Send + Sync + 'static,
 {
     /// Create a job builder.
-    pub fn new() -> Builder<I, S, Initial> {
-        Builder::<I, S, _> {
+    pub fn new() -> Builder<I, O, S, Initial> {
+        Builder::<I, O, S, _> {
             builder_state: Initial,
             retry_policy: RetryPolicy::default(),
             timeout: Span::new().minutes(15),
@@ -835,9 +850,9 @@ where
     ///     data: "foo".to_string(),
     /// };
     ///
-    /// Job::<(), _>::builder().state(state);
+    /// Job::<(), (), _>::builder().state(state);
     /// ```
-    pub fn state(self, state: S) -> Builder<I, S, StateSet<S>> {
+    pub fn state(self, state: S) -> Builder<I, O, S, StateSet<S>> {
         Builder {
             builder_state: StateSet { state },
             retry_policy: self.retry_policy,
@@ -870,10 +885,10 @@ where
     ///     Ok(())
     /// });
     /// ```
-    pub fn execute<F, Fut>(self, f: F) -> Builder<I, S, ExecutorSet<I, ()>>
+    pub fn execute<F, Fut>(self, f: F) -> Builder<I, O, S, ExecutorSet<I, O, ()>>
     where
         F: Fn(I) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = TaskResult> + Send + 'static,
+        Fut: Future<Output = TaskResult<O>> + Send + 'static,
     {
         Builder {
             builder_state: ExecutorSet {
@@ -894,9 +909,10 @@ where
     }
 }
 
-impl<I, S> Default for Builder<I, S, Initial>
+impl<I, O, S> Default for Builder<I, O, S, Initial>
 where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
+    O: Clone + Serialize + Send + 'static,
     S: Clone + Send + Sync + 'static,
 {
     fn default() -> Self {
@@ -904,9 +920,10 @@ where
     }
 }
 
-impl<I, S> Builder<I, S, StateSet<S>>
+impl<I, O, S> Builder<I, O, S, StateSet<S>>
 where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
+    O: Clone + Serialize + Send + 'static,
     S: Clone + Send + Sync + 'static,
 {
     /// Set execute closure with state.
@@ -943,10 +960,10 @@ where
     ///         Ok(())
     ///     });
     /// ```
-    pub fn execute<F, Fut>(self, f: F) -> Builder<I, S, ExecutorSet<I, S>>
+    pub fn execute<F, Fut>(self, f: F) -> Builder<I, O, S, ExecutorSet<I, O, S>>
     where
         F: Fn(I, S) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = TaskResult> + Send + 'static,
+        Fut: Future<Output = TaskResult<O>> + Send + 'static,
     {
         Builder {
             builder_state: ExecutorSet {
@@ -967,9 +984,10 @@ where
     }
 }
 
-impl<I, S> Builder<I, S, ExecutorSet<I, S>>
+impl<I, O, S> Builder<I, O, S, ExecutorSet<I, O, S>>
 where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
+    O: Clone + Serialize + Send + 'static,
     S: Clone + Send + Sync + 'static,
 {
     /// Set queue.
@@ -1003,7 +1021,7 @@ where
     /// # });
     /// # }
     /// ```
-    pub fn queue(self, queue: Queue<Job<I, S>>) -> Builder<I, S, QueueSet<I, S>> {
+    pub fn queue(self, queue: Queue<Job<I, O, S>>) -> Builder<I, O, S, QueueSet<I, O, S>> {
         Builder {
             builder_state: QueueSet {
                 state: self.builder_state.state,
@@ -1021,9 +1039,10 @@ where
     }
 }
 
-impl<I, S> Builder<I, S, QueueSet<I, S>>
+impl<I, O, S> Builder<I, O, S, QueueSet<I, O, S>>
 where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
+    O: Clone + Serialize + Send + 'static,
     S: Clone + Send + Sync + 'static,
 {
     /// Returns a new [`Job`].
@@ -1054,7 +1073,7 @@ where
     /// # });
     /// # }
     /// ```
-    pub fn build(self) -> Job<I, S> {
+    pub fn build(self) -> Job<I, O, S> {
         let QueueSet {
             queue,
             execute_fn,
@@ -1074,14 +1093,16 @@ where
     }
 }
 
-impl<I, S> Task for Job<I, S>
+impl<I, O, S> Task for Job<I, O, S>
 where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
+    O: Clone + Serialize + Send + 'static,
     S: Clone + Send + Sync + 'static,
 {
     type Input = I;
+    type Output = O;
 
-    async fn execute(&self, input: Self::Input) -> TaskResult {
+    async fn execute(&self, input: Self::Input) -> TaskResult<Self::Output> {
         match self.execute_fn.to_owned() {
             ExecuteFn::Simple(f) => f(input).await,
             ExecuteFn::Stateful(f) => f(input, self.state.to_owned()).await,

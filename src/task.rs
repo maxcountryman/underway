@@ -43,9 +43,10 @@
 //!
 //! impl Task for WelcomeEmailTask {
 //!     type Input = WelcomeEmail;
+//!     type Output = ();
 //!
 //!     /// Simulate sending a welcome email by printing a message to the console.
-//!     async fn execute(&self, input: Self::Input) -> TaskResult {
+//!     async fn execute(&self, input: Self::Input) -> TaskResult<Self::Output> {
 //!         println!(
 //!             "Sending welcome email to {} <{}> (user_id: {})",
 //!             input.name, input.email, input.user_id
@@ -86,7 +87,7 @@ mod retry_policy;
 pub type Id = Uuid;
 
 /// A type alias for task execution results.
-pub type Result = StdResult<(), Error>;
+pub type Result<O> = StdResult<O, Error>;
 
 /// Task errors.
 #[derive(Debug, thiserror::Error)]
@@ -172,6 +173,9 @@ pub trait Task: Send + 'static {
     /// This type must be serialized to and deserialized from the database.
     type Input: DeserializeOwned + Serialize + Send + 'static;
 
+    /// The output type that the execute method will return upon success.
+    type Output: Serialize + Send + 'static;
+
     /// Executes the task with the provided input.
     ///
     /// The core of a task, this method is called when the task is picked up by
@@ -185,7 +189,7 @@ pub trait Task: Send + 'static {
     ///
     /// ```
     /// use serde::{Deserialize, Serialize};
-    /// use underway::{task::Error as TaskError, Task};
+    /// use underway::{task::Result as TaskResult, Task};
     ///
     /// // Task input representing the data needed to send a welcome email.
     /// #[derive(Debug, Deserialize, Serialize)]
@@ -200,9 +204,10 @@ pub trait Task: Send + 'static {
     ///
     /// impl Task for WelcomeEmailTask {
     ///     type Input = WelcomeEmail;
+    ///     type Output = ();
     ///
     ///     /// Simulate sending a welcome email by printing a message to the console.
-    ///     async fn execute(&self, input: Self::Input) -> Result<(), TaskError> {
+    ///     async fn execute(&self, input: Self::Input) -> TaskResult<Self::Output> {
     ///         println!(
     ///             "Sending welcome email to {} <{}> (user_id: {})",
     ///             input.name, input.email, input.user_id
@@ -214,7 +219,7 @@ pub trait Task: Send + 'static {
     ///     }
     /// }
     /// ```
-    fn execute(&self, input: Self::Input) -> impl Future<Output = Result> + Send;
+    fn execute(&self, input: Self::Input) -> impl Future<Output = Result<Self::Output>> + Send;
 
     /// Defines the retry policy of the task.
     ///
@@ -235,8 +240,9 @@ pub trait Task: Send + 'static {
     ///
     /// impl Task for MyCustomRetryTask {
     ///     type Input = ();
+    ///     type Output = ();
     ///
-    ///     async fn execute(&self, _input: Self::Input) -> TaskResult {
+    ///     async fn execute(&self, _input: Self::Input) -> TaskResult<Self::Output> {
     ///         Ok(())
     ///     }
     ///
@@ -270,8 +276,9 @@ pub trait Task: Send + 'static {
     ///
     /// impl Task for MyImpatientTask {
     ///     type Input = ();
+    ///     type Output = ();
     ///
-    ///     async fn execute(&self, _input: Self::Input) -> TaskResult {
+    ///     async fn execute(&self, _input: Self::Input) -> TaskResult<Self::Output> {
     ///         Ok(())
     ///     }
     ///
@@ -305,8 +312,9 @@ pub trait Task: Send + 'static {
     ///
     /// impl Task for MyLongLivedTask {
     ///     type Input = ();
+    ///     type Output = ();
     ///
-    ///     async fn execute(&self, _input: Self::Input) -> TaskResult {
+    ///     async fn execute(&self, _input: Self::Input) -> TaskResult<Self::Output> {
     ///         Ok(())
     ///     }
     ///
@@ -337,8 +345,9 @@ pub trait Task: Send + 'static {
     ///
     /// impl Task for MyDelayedTask {
     ///     type Input = ();
+    ///     type Output = ();
     ///
-    ///     async fn execute(&self, _input: Self::Input) -> TaskResult {
+    ///     async fn execute(&self, _input: Self::Input) -> TaskResult<Self::Output> {
     ///         Ok(())
     ///     }
     ///
@@ -377,8 +386,9 @@ pub trait Task: Send + 'static {
     ///
     /// impl Task for MyUniqueTask {
     ///     type Input = ();
+    ///     type Output = ();
     ///
-    ///     async fn execute(&self, _input: Self::Input) -> TaskResult {
+    ///     async fn execute(&self, _input: Self::Input) -> TaskResult<Self::Output> {
     ///         Ok(())
     ///     }
     ///
@@ -410,8 +420,9 @@ pub trait Task: Send + 'static {
     ///
     /// impl Task for HighPriorityTask {
     ///     type Input = ();
+    ///     type Output = ();
     ///
-    ///     async fn execute(&self, _input: Self::Input) -> TaskResult {
+    ///     async fn execute(&self, _input: Self::Input) -> TaskResult<Self::Output> {
     ///         Ok(())
     ///     }
     ///
@@ -492,8 +503,9 @@ mod tests {
 
     impl Task for TestTask {
         type Input = TestTaskInput;
+        type Output = ();
 
-        async fn execute(&self, input: Self::Input) -> Result {
+        async fn execute(&self, input: Self::Input) -> Result<Self::Output> {
             println!("Executing task with message: {}", input.message);
             if input.message == "fail" {
                 return Err(Error::Retryable("Task failed".to_string()));

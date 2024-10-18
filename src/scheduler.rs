@@ -90,12 +90,13 @@ impl<T: Task> Scheduler<T> {
     }
 }
 
-impl<I, S> From<Job<I, S>> for Scheduler<Job<I, S>>
+impl<I, O, S> From<Job<I, O, S>> for Scheduler<Job<I, O, S>>
 where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
+    O: Clone + Serialize + Send + 'static,
     S: Clone + Send + Sync + 'static,
 {
-    fn from(job: Job<I, S>) -> Self {
+    fn from(job: Job<I, O, S>) -> Self {
         Self {
             queue: job.queue.clone(),
             queue_lock: queue_scheduler_lock(&job.queue.name),
@@ -104,12 +105,13 @@ where
     }
 }
 
-impl<I, S> From<&Job<I, S>> for Scheduler<Job<I, S>>
+impl<I, O, S> From<&Job<I, O, S>> for Scheduler<Job<I, O, S>>
 where
     I: Clone + DeserializeOwned + Serialize + Send + 'static,
+    O: Clone + Serialize + Send + 'static,
     S: Clone + Send + Sync + 'static,
 {
-    fn from(job: &Job<I, S>) -> Self {
+    fn from(job: &Job<I, O, S>) -> Self {
         Self {
             queue: job.queue.clone(),
             queue_lock: queue_scheduler_lock(&job.queue.name),

@@ -29,7 +29,8 @@
 //! # struct MyTask;
 //! # impl Task for MyTask {
 //! #    type Input = ();
-//! #    async fn execute(&self, input: Self::Input) -> TaskResult {
+//! #    type Output = ();
+//! #    async fn execute(&self, input: Self::Input) -> TaskResult<Self::Output> {
 //! #        Ok(())
 //! #    }
 //! # }
@@ -78,7 +79,8 @@
 //! # struct MyTask;
 //! # impl Task for MyTask {
 //! #    type Input = ();
-//! #    async fn execute(&self, input: Self::Input) -> TaskResult {
+//! #    type Output = ();
+//! #    async fn execute(&self, input: Self::Input) -> TaskResult<Self::Output> {
 //! #        Ok(())
 //! #    }
 //! # }
@@ -137,7 +139,8 @@
 //! # struct MyTask;
 //! # impl Task for MyTask {
 //! #    type Input = ();
-//! #    async fn execute(&self, input: Self::Input) -> TaskResult {
+//! #    type Output = ();
+//! #    async fn execute(&self, input: Self::Input) -> TaskResult<Self::Output> {
 //! #        Ok(())
 //! #    }
 //! # }
@@ -194,7 +197,8 @@
 //! # struct MyTask;
 //! # impl Task for MyTask {
 //! #    type Input = ();
-//! #    async fn execute(&self, input: Self::Input) -> TaskResult {
+//! #    type Output = ();
+//! #    async fn execute(&self, input: Self::Input) -> TaskResult<Self::Output> {
 //! #        Ok(())
 //! #    }
 //! # }
@@ -978,8 +982,9 @@ mod tests {
 
     impl Task for TestTask {
         type Input = serde_json::Value;
+        type Output = ();
 
-        async fn execute(&self, _: Self::Input) -> TaskResult {
+        async fn execute(&self, _: Self::Input) -> TaskResult<Self::Output> {
             Ok(())
         }
     }
