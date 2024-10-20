@@ -71,7 +71,7 @@ use std::{future::Future, result::Result as StdResult};
 
 use jiff::{Span, ToSpan};
 use serde::{de::DeserializeOwned, Serialize};
-use sqlx::postgres::types::PgInterval;
+use sqlx::{postgres::types::PgInterval, PgConnection};
 use uuid::Uuid;
 
 pub(crate) use self::retry_policy::RetryCount;
@@ -189,6 +189,7 @@ pub trait Task: Send + 'static {
     ///
     /// ```
     /// use serde::{Deserialize, Serialize};
+    /// use sqlx::PgConnection;
     /// use underway::{task::Result as TaskResult, Task};
     ///
     /// // Task input representing the data needed to send a welcome email.
@@ -207,7 +208,11 @@ pub trait Task: Send + 'static {
     ///     type Output = ();
     ///
     ///     /// Simulate sending a welcome email by printing a message to the console.
-    ///     async fn execute(&self, input: Self::Input) -> TaskResult<Self::Output> {
+    ///     async fn execute(
+    ///         &self,
+    ///         _conn: &mut PgConnection,
+    ///         input: Self::Input,
+    ///     ) -> TaskResult<Self::Output> {
     ///         println!(
     ///             "Sending welcome email to {} <{}> (user_id: {})",
     ///             input.name, input.email, input.user_id
@@ -219,7 +224,11 @@ pub trait Task: Send + 'static {
     ///     }
     /// }
     /// ```
-    fn execute(&self, input: Self::Input) -> impl Future<Output = Result<Self::Output>> + Send;
+    fn execute(
+        &self,
+        conn: &mut PgConnection,
+        input: Self::Input,
+    ) -> impl Future<Output = Result<Self::Output>> + Send;
 
     /// Defines the retry policy of the task.
     ///
@@ -505,7 +514,11 @@ mod tests {
         type Input = TestTaskInput;
         type Output = ();
 
-        async fn execute(&self, input: Self::Input) -> Result<Self::Output> {
+        async fn execute(
+            &self,
+            _conn: &mut PgConnection,
+            input: Self::Input,
+        ) -> Result<Self::Output> {
             println!("Executing task with message: {}", input.message);
             if input.message == "fail" {
                 return Err(Error::Retryable("Task failed".to_string()));

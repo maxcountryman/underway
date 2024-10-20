@@ -187,37 +187,37 @@ pub enum Error {
     Jiff(#[from] jiff::Error),
 }
 
-impl<I, O, S> From<Job<I, O, S>> for Worker<Job<I, O, S>>
-where
-    I: Clone + DeserializeOwned + Serialize + Send + 'static,
-    O: Clone + Serialize + Send + 'static,
-    S: Clone + Send + Sync + 'static,
-{
-    fn from(job: Job<I, O, S>) -> Self {
-        Self {
-            queue: job.queue.clone(),
-            task: Arc::new(job),
-            concurrency_limit: num_cpus::get(),
-            queue_shutdown: Arc::new(false.into()),
-        }
-    }
-}
-
-impl<I, O, S> From<&Job<I, O, S>> for Worker<Job<I, O, S>>
-where
-    I: Clone + DeserializeOwned + Serialize + Send + 'static,
-    O: Clone + Serialize + Send + 'static,
-    S: Clone + Send + Sync + 'static,
-{
-    fn from(job: &Job<I, O, S>) -> Self {
-        Self {
-            queue: job.queue.clone(),
-            task: Arc::new(job.to_owned()),
-            concurrency_limit: num_cpus::get(),
-            queue_shutdown: Arc::new(false.into()),
-        }
-    }
-}
+//impl<I, O, S> From<Job<I, O, S>> for Worker<Job<I, O, S>>
+//where
+//    I: Clone + DeserializeOwned + Serialize + Send + 'static,
+//    O: Clone + Serialize + Send + 'static,
+//    S: Clone + Send + Sync + 'static,
+//{
+//    fn from(job: Job<I, O, S>) -> Self {
+//        Self {
+//            queue: job.queue.clone(),
+//            task: Arc::new(job),
+//            concurrency_limit: num_cpus::get(),
+//            queue_shutdown: Arc::new(false.into()),
+//        }
+//    }
+//}
+//
+//impl<I, O, S> From<&Job<I, O, S>> for Worker<Job<I, O, S>>
+//where
+//    I: Clone + DeserializeOwned + Serialize + Send + 'static,
+//    O: Clone + Serialize + Send + 'static,
+//    S: Clone + Send + Sync + 'static,
+//{
+//    fn from(job: &Job<I, O, S>) -> Self {
+//        Self {
+//            queue: job.queue.clone(),
+//            task: Arc::new(job.to_owned()),
+//            concurrency_limit: num_cpus::get(),
+//            queue_shutdown: Arc::new(false.into()),
+//        }
+//    }
+//}
 
 impl<T: Task + Sync> Worker<T> {
     /// Creates a new worker with the given queue and task.
@@ -358,7 +358,7 @@ impl<T: Task + Sync> Worker<T> {
                 .expect("Task timeout should be compatible with std::time");
 
             tokio::select! {
-                result = self.task.execute(input) => {
+                result = self.task.execute(&mut tx, input) => {
                     match result {
                         Ok(_) => {
                             self.queue.mark_task_succeeded(&mut *tx, task_id).await?;

@@ -90,35 +90,35 @@ impl<T: Task> Scheduler<T> {
     }
 }
 
-impl<I, O, S> From<Job<I, O, S>> for Scheduler<Job<I, O, S>>
-where
-    I: Clone + DeserializeOwned + Serialize + Send + 'static,
-    O: Clone + Serialize + Send + 'static,
-    S: Clone + Send + Sync + 'static,
-{
-    fn from(job: Job<I, O, S>) -> Self {
-        Self {
-            queue: job.queue.clone(),
-            queue_lock: queue_scheduler_lock(&job.queue.name),
-            task: job,
-        }
-    }
-}
-
-impl<I, O, S> From<&Job<I, O, S>> for Scheduler<Job<I, O, S>>
-where
-    I: Clone + DeserializeOwned + Serialize + Send + 'static,
-    O: Clone + Serialize + Send + 'static,
-    S: Clone + Send + Sync + 'static,
-{
-    fn from(job: &Job<I, O, S>) -> Self {
-        Self {
-            queue: job.queue.clone(),
-            queue_lock: queue_scheduler_lock(&job.queue.name),
-            task: job.clone(),
-        }
-    }
-}
+//impl<I, O, S> From<Job<I, O, S>> for Scheduler<Job<I, O, S>>
+//where
+//    I: Clone + DeserializeOwned + Serialize + Send + 'static,
+//    O: Clone + Serialize + Send + 'static,
+//    S: Clone + Send + Sync + 'static,
+//{
+//    fn from(job: Job<I, O, S>) -> Self {
+//        Self {
+//            queue: job.queue.clone(),
+//            queue_lock: queue_scheduler_lock(&job.queue.name),
+//            task: job,
+//        }
+//    }
+//}
+//
+//impl<I, O, S> From<&Job<I, O, S>> for Scheduler<Job<I, O, S>>
+//where
+//    I: Clone + DeserializeOwned + Serialize + Send + 'static,
+//    O: Clone + Serialize + Send + 'static,
+//    S: Clone + Send + Sync + 'static,
+//{
+//    fn from(job: &Job<I, O, S>) -> Self {
+//        Self {
+//            queue: job.queue.clone(),
+//            queue_lock: queue_scheduler_lock(&job.queue.name),
+//            task: job.clone(),
+//        }
+//    }
+//}
 
 fn queue_scheduler_lock(queue_name: &str) -> PgAdvisoryLock {
     PgAdvisoryLock::new(format!("{queue_name}-scheduler"))
