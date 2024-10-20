@@ -123,7 +123,6 @@ use std::sync::{
 };
 
 use jiff::{Span, ToSpan};
-use serde::{de::DeserializeOwned, Serialize};
 use sqlx::{
     postgres::{types::PgInterval, PgListener},
     PgConnection,
@@ -132,7 +131,6 @@ use tokio::{sync::Semaphore, task::JoinSet};
 use tracing::instrument;
 
 use crate::{
-    job::Job,
     queue::{Error as QueueError, Queue, SHUTDOWN_CHANNEL},
     task::{DequeuedTask, Error as TaskError, Id as TaskId, RetryCount, RetryPolicy, Task},
 };
@@ -155,7 +153,7 @@ impl<T: Task> Clone for Worker<T> {
     fn clone(&self) -> Self {
         Self {
             queue: self.queue.clone(),
-            task: Arc::clone(&self.task),
+            task: self.task.clone(),
             concurrency_limit: self.concurrency_limit,
             queue_shutdown: self.queue_shutdown.clone(),
         }
@@ -187,50 +185,20 @@ pub enum Error {
     Jiff(#[from] jiff::Error),
 }
 
-//impl<I, O, S> From<Job<I, O, S>> for Worker<Job<I, O, S>>
-//where
-//    I: Clone + DeserializeOwned + Serialize + Send + 'static,
-//    O: Clone + Serialize + Send + 'static,
-//    S: Clone + Send + Sync + 'static,
-//{
-//    fn from(job: Job<I, O, S>) -> Self {
-//        Self {
-//            queue: job.queue.clone(),
-//            task: Arc::new(job),
-//            concurrency_limit: num_cpus::get(),
-//            queue_shutdown: Arc::new(false.into()),
-//        }
-//    }
-//}
-//
-//impl<I, O, S> From<&Job<I, O, S>> for Worker<Job<I, O, S>>
-//where
-//    I: Clone + DeserializeOwned + Serialize + Send + 'static,
-//    O: Clone + Serialize + Send + 'static,
-//    S: Clone + Send + Sync + 'static,
-//{
-//    fn from(job: &Job<I, O, S>) -> Self {
-//        Self {
-//            queue: job.queue.clone(),
-//            task: Arc::new(job.to_owned()),
-//            concurrency_limit: num_cpus::get(),
-//            queue_shutdown: Arc::new(false.into()),
-//        }
-//    }
-//}
-
 impl<T: Task + Sync> Worker<T> {
     /// Creates a new worker with the given queue and task.
-    pub fn new(queue: Queue<T>, task: T) -> Self {
+    pub fn new(queue: Queue<T>, task: Arc<T>) -> Self {
         Self {
             queue,
-            task: Arc::new(task),
+            task,
             concurrency_limit: num_cpus::get(),
             queue_shutdown: Arc::new(false.into()),
         }
     }
 
     /// Sets the concurrency limit for this worker.
+    ///
+    /// Defaults to CPU count as per [`num_cpus::get`].
     pub fn concurrency_limit(mut self, concurrency_limit: usize) -> Self {
         self.concurrency_limit = concurrency_limit;
         self
@@ -258,9 +226,9 @@ impl<T: Task + Sync> Worker<T> {
 
         loop {
             tokio::select! {
-                shutdown_notif = shutdown_listener.recv() => {
-                    if let Err(err) = shutdown_notif {
-                        tracing::error!(%err, "NOTIFY resulted in an error");
+                notify_shutdown = shutdown_listener.recv() => {
+                    if let Err(err) = notify_shutdown {
+                        tracing::error!(%err, "Postgres notification error");
                         continue;
                     }
 

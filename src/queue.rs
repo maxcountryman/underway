@@ -542,24 +542,28 @@ impl<T: Task> Queue<T> {
     pub(crate) async fn task_schedule<'a, E>(
         &self,
         executor: E,
-    ) -> Result<(ZonedSchedule, T::Input)>
+    ) -> Result<Option<(ZonedSchedule, T::Input)>>
     where
         E: PgExecutor<'a>,
     {
-        let schedule_row = sqlx::query!(
+        let Some(schedule_row) = sqlx::query!(
             r#"
             select schedule, timezone, input from underway.task_schedule where name = $1
+            limit 1
             "#,
             self.name,
         )
-        .fetch_one(executor)
-        .await?;
+        .fetch_optional(executor)
+        .await?
+        else {
+            return Ok(None);
+        };
 
         let zoned_schedule = ZonedSchedule::new(&schedule_row.schedule, &schedule_row.timezone)
             .map_err(|_| Error::MalformedSchedule)?;
         let input = serde_json::from_value(schedule_row.input)?;
 
-        Ok((zoned_schedule, input))
+        Ok(Some((zoned_schedule, input)))
     }
 
     pub(crate) async fn create<'a, E>(executor: E, name: impl Into<String>) -> Result

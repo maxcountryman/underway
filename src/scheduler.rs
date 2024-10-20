@@ -1,11 +1,10 @@
-use std::{result::Result as StdResult, str::FromStr, time::Duration as StdDuration};
+use std::{result::Result as StdResult, str::FromStr, sync::Arc, time::Duration as StdDuration};
 
 use jiff::{tz::TimeZone, Span, ToSpan, Zoned};
 use jiff_cron::Schedule;
-use serde::{de::DeserializeOwned, Serialize};
 use sqlx::postgres::PgAdvisoryLock;
 
-use crate::{queue::Error as QueueError, Job, Queue, Task};
+use crate::{queue::Error as QueueError, Queue, Task};
 
 pub(crate) type Result<T = ()> = std::result::Result<T, Error>;
 
@@ -38,12 +37,12 @@ pub enum Error {
 pub struct Scheduler<T: Task> {
     queue: Queue<T>,
     queue_lock: PgAdvisoryLock,
-    task: T,
+    task: Arc<T>,
 }
 
 impl<T: Task> Scheduler<T> {
     /// Creates a new scheduler.
-    pub fn new(queue: Queue<T>, task: T) -> Self {
+    pub fn new(queue: Queue<T>, task: Arc<T>) -> Self {
         let queue_lock = queue_scheduler_lock(&queue.name);
         Self {
             queue,
@@ -77,48 +76,20 @@ impl<T: Task> Scheduler<T> {
     }
 
     async fn process_next_schedule(&self) -> Result {
-        let (zoned_schedule, input) = self.queue.task_schedule(&self.queue.pool).await?;
+        if let Some((zoned_schedule, input)) = self.queue.task_schedule(&self.queue.pool).await? {
+            if let Some(until_next) = zoned_schedule.duration_until_next() {
+                // Wait until the next schedule would fire.
+                tokio::time::sleep(until_next).await;
 
-        if let Some(until_next) = zoned_schedule.duration_until_next() {
-            tokio::time::sleep(until_next).await;
-            self.queue
-                .enqueue(&self.queue.pool, &self.task, input)
-                .await?;
+                self.queue
+                    .enqueue(&self.queue.pool, &self.task, input)
+                    .await?;
+            }
         }
 
         Ok(())
     }
 }
-
-//impl<I, O, S> From<Job<I, O, S>> for Scheduler<Job<I, O, S>>
-//where
-//    I: Clone + DeserializeOwned + Serialize + Send + 'static,
-//    O: Clone + Serialize + Send + 'static,
-//    S: Clone + Send + Sync + 'static,
-//{
-//    fn from(job: Job<I, O, S>) -> Self {
-//        Self {
-//            queue: job.queue.clone(),
-//            queue_lock: queue_scheduler_lock(&job.queue.name),
-//            task: job,
-//        }
-//    }
-//}
-//
-//impl<I, O, S> From<&Job<I, O, S>> for Scheduler<Job<I, O, S>>
-//where
-//    I: Clone + DeserializeOwned + Serialize + Send + 'static,
-//    O: Clone + Serialize + Send + 'static,
-//    S: Clone + Send + Sync + 'static,
-//{
-//    fn from(job: &Job<I, O, S>) -> Self {
-//        Self {
-//            queue: job.queue.clone(),
-//            queue_lock: queue_scheduler_lock(&job.queue.name),
-//            task: job.clone(),
-//        }
-//    }
-//}
 
 fn queue_scheduler_lock(queue_name: &str) -> PgAdvisoryLock {
     PgAdvisoryLock::new(format!("{queue_name}-scheduler"))

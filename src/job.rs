@@ -367,11 +367,11 @@
 
 use std::{future::Future, marker::PhantomData, pin::Pin, sync::Arc};
 
-use builder_states::{Initial, QueueSet, StepSet};
+use builder_states::{Initial, PoolSet, QueueNameSet, QueueSet, StepSet};
 use futures::FutureExt;
 use jiff::Span;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use sqlx::{PgConnection, PgExecutor};
+use sqlx::{PgConnection, PgExecutor, PgPool};
 
 use crate::{
     queue::{Error as QueueError, Queue},
@@ -506,7 +506,7 @@ where
 
 impl<I> Job<I>
 where
-    I: Sync + Send + 'static,
+    I: Serialize + Sync + Send + 'static,
 {
     /// Create a new job builder.
     pub fn builder() -> Builder<I, I, Initial> {
@@ -514,10 +514,7 @@ where
     }
 
     /// Enqueue the job using a connection from the queue's pool.
-    pub async fn enqueue(&self, input: I) -> Result<TaskId>
-    where
-        I: Serialize,
-    {
+    pub async fn enqueue(&self, input: I) -> Result<TaskId> {
         let mut conn = self.queue.pool.acquire().await?;
         self.enqueue_using(&mut *conn, input).await
     }
@@ -542,48 +539,46 @@ where
         Ok(id)
     }
 
-    ///// Enqueue the job after the given delay using a connection from the
-    ///// queue's pool
-    /////
-    ///// The given delay is added to the task's configured delay, if one is set.
-    //pub async fn enqueue_after<'a, E>(
-    //    &self,
-    //    executor: E,
-    //    input: JobInput<I, O>,
-    //    delay: Span,
-    //) -> Result<TaskId>
-    //where
-    //    E: PgExecutor<'a>,
-    //{
-    //    self.enqueue_after_using(executor, input, delay).await
-    //}
+    /// Enqueue the job after the given delay using a connection from the
+    /// queue's pool
+    ///
+    /// The given delay is added to the task's configured delay, if one is set.
+    pub async fn enqueue_after<'a, E>(&self, executor: E, input: I, delay: Span) -> Result<TaskId>
+    where
+        E: PgExecutor<'a>,
+    {
+        self.enqueue_after_using(executor, input, delay).await
+    }
 
-    ///// Enqueue the job using the provided executor after the given delay.
-    /////
-    ///// The given delay is added to the task's configured delay, if one is set.
-    /////
-    ///// This allows jobs to be enqueued using the same transaction as an
-    ///// application may already be using in a given context.
-    /////
-    ///// **Note:** If you pass a transactional executor and the transaction is
-    ///// rolled back, the returned task ID will not correspond to any persisted
-    ///// task.
-    //pub async fn enqueue_after_using<'a, E>(
-    //    &self,
-    //    executor: E,
-    //    input: JobInput<I, O>,
-    //    delay: Span,
-    //) -> Result<TaskId>
-    //where
-    //    E: PgExecutor<'a>,
-    //{
-    //    let id = self
-    //        .queue
-    //        .enqueue_after(executor, self, input, delay)
-    //        .await?;
+    /// Enqueue the job using the provided executor after the given delay.
+    ///
+    /// The given delay is added to the task's configured delay, if one is set.
+    ///
+    /// This allows jobs to be enqueued using the same transaction as an
+    /// application may already be using in a given context.
+    ///
+    /// **Note:** If you pass a transactional executor and the transaction is
+    /// rolled back, the returned task ID will not correspond to any persisted
+    /// task.
+    pub async fn enqueue_after_using<'a, E>(
+        &self,
+        executor: E,
+        input: I,
+        delay: Span,
+    ) -> Result<TaskId>
+    where
+        E: PgExecutor<'a>,
+    {
+        let step_input = serde_json::to_value(input).unwrap(); // TODO: Queue error
+        let input = JobState::new(step_input);
 
-    //    Ok(id)
-    //}
+        let id = self
+            .queue
+            .enqueue_after(executor, self, input, delay)
+            .await?;
+
+        Ok(id)
+    }
 
     ///// Schedule the job using a connection from the queue's pool.
     //pub async fn schedule(&self, zoned_schedule: ZonedSchedule, input:
@@ -610,23 +605,6 @@ where
     //    Ok(())
     //}
 
-    ///// Marks the given task as cancelled using a connection from the queue's
-    ///// pool.
-    //pub async fn cancel(self, task_id: TaskId) -> Result {
-    //    let mut conn = self.queue.pool.acquire().await?;
-    //    self.cancel_using(&mut *conn, task_id).await
-    //}
-
-    ///// Marks the given task a cancelled using the provided executor.
-    //pub async fn cancel_using<'a, E>(self, executor: E, task_id: TaskId) ->
-    // Result where
-    //    E: PgExecutor<'a>,
-    //{
-    //    self.queue.mark_task_cancelled(executor, task_id).await?;
-
-    //    Ok(())
-    //}
-
     ///// Constructs a worker which then immediately runs task processing.
     //pub async fn run_worker(&self) -> WorkerResult {
     //    let worker = Worker::from(self);
@@ -639,32 +617,35 @@ where
     //    scheduler.run().await
     //}
 
-    ///// Runs both a worker and scheduler for the job.
-    //pub async fn run(&self) -> Result {
-    //    let worker = Worker::from(self);
-    //    let scheduler = Scheduler::from(self);
+    /// Runs both a worker and scheduler for the job.
+    pub async fn run(self) -> Result {
+        let queue = self.queue.clone();
+        let job = Arc::new(self);
 
-    //    let worker_task = tokio::spawn(async move { worker.run().await });
-    //    let scheduler_task = tokio::spawn(async move { scheduler.run().await });
+        let worker = Worker::new(queue.clone(), job.clone());
+        let scheduler = Scheduler::new(queue, job.clone());
 
-    //    tokio::select! {
-    //        res =  worker_task => {
-    //            match res {
-    //                Ok(inner_res) => inner_res?,
-    //                Err(join_err) => return Err(Error::from(join_err)),
-    //            }
-    //        },
+        let worker_task = tokio::spawn(async move { worker.run().await });
+        let scheduler_task = tokio::spawn(async move { scheduler.run().await });
 
-    //        res = scheduler_task => {
-    //            match res {
-    //                Ok(inner_res) => inner_res?,
-    //                Err(join_err) => return Err(Error::from(join_err)),
-    //            }
-    //        },
-    //    }
+        tokio::select! {
+            res =  worker_task => {
+                match res {
+                    Ok(inner_res) => inner_res?,
+                    Err(join_err) => return Err(Error::from(join_err)),
+                }
+            },
 
-    //    Ok(())
-    //}
+            res = scheduler_task => {
+                match res {
+                    Ok(inner_res) => inner_res?,
+                    Err(join_err) => return Err(Error::from(join_err)),
+                }
+            },
+        }
+
+        Ok(())
+    }
 }
 
 // TODO: Versioning?
@@ -761,12 +742,15 @@ where
                         .map_err(|e| TaskError::Fatal(e.to_string()))?;
                     Ok(Some((serialized_output, Span::new())))
                 }
+
                 Ok(StepState::Delay((output, span))) => {
                     let serialized_output = serde_json::to_value(output)
                         .map_err(|e| TaskError::Fatal(e.to_string()))?;
                     Ok(Some((serialized_output, span)))
                 }
+
                 Ok(StepState::Done) => Ok(None),
+
                 Err(e) => Err(e),
             }
         })
@@ -776,6 +760,8 @@ where
 mod builder_states {
     use std::marker::PhantomData;
 
+    use sqlx::PgPool;
+
     use super::JobQueue;
 
     pub struct Initial;
@@ -784,11 +770,20 @@ mod builder_states {
         pub _marker: PhantomData<Current>,
     }
 
-    pub struct QueueSet<S>
+    pub struct QueueSet<I>
     where
-        S: Send + Sync + 'static,
+        I: Send + Sync + 'static,
     {
-        pub queue: JobQueue<S>,
+        pub queue: JobQueue<I>,
+    }
+
+    pub struct QueueNameSet {
+        pub queue_name: String,
+    }
+
+    pub struct PoolSet {
+        pub queue_name: String,
+        pub pool: PgPool,
     }
 }
 
@@ -864,11 +859,60 @@ impl<I, Current> Builder<I, Current, StepSet<Current>> {
     }
 }
 
+// Encapsulate queue creation.
 impl<I> Builder<I, (), StepSet<()>>
 where
     I: Send + Sync + 'static,
 {
-    /// Set the job queue.
+    /// Set the name of the job's queue.
+    pub fn name(self, name: impl Into<String>) -> Builder<I, (), QueueNameSet> {
+        Builder {
+            builder_state: QueueNameSet {
+                queue_name: name.into(),
+            },
+            steps: self.steps,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<I> Builder<I, (), QueueNameSet>
+where
+    I: Send + Sync + 'static,
+{
+    /// Set the name of the job's queue.
+    pub fn pool(self, pool: PgPool) -> Builder<I, (), PoolSet> {
+        let QueueNameSet { queue_name } = self.builder_state;
+        Builder {
+            builder_state: PoolSet { queue_name, pool },
+            steps: self.steps,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<I> Builder<I, (), PoolSet>
+where
+    I: Send + Sync + 'static,
+{
+    /// Finalize the builder into a `Job`.
+    pub async fn build(self) -> Result<Job<I>> {
+        let PoolSet { queue_name, pool } = self.builder_state;
+        let queue = Queue::builder().name(queue_name).pool(pool).build().await?;
+        Ok(Job {
+            queue,
+            steps: Arc::new(self.steps),
+            _marker: PhantomData,
+        })
+    }
+}
+
+// Directly provide queue.
+impl<I> Builder<I, (), StepSet<()>>
+where
+    I: Send + Sync + 'static,
+{
+    /// Set the queue.
     pub fn queue(self, queue: JobQueue<I>) -> Builder<I, (), QueueSet<I>> {
         Builder {
             builder_state: QueueSet { queue },
