@@ -4,7 +4,7 @@ use jiff::ToSpan;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use underway::{job::StepState, task::RetryPolicy, Job};
+use underway::{job::StepState, Job};
 
 #[derive(Serialize, Deserialize)]
 struct Start {
@@ -38,34 +38,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Run migrations.
     underway::MIGRATOR.run(&pool).await?;
 
-    #[derive(Debug, Default, Clone)]
-    struct MyState {
-        content: String,
-    }
-
     // Create our job.
     let job = Job::builder()
-        .state(MyState {
-            content: "hello, world".to_string(),
-        })
         .step(|_ctx, Start { n }| async move {
             tracing::info!("Starting with: {n}");
             StepState::to_next(Power { n })
         })
-        .retry_policy(RetryPolicy::builder().max_attempts(2).build())
-        .step(|ctx, Power { n }| async move {
-            tracing::info!(?ctx.state, "Squared: {n}");
+        .step(|_ctx, Power { n }| async move {
+            tracing::info!("Squared: {n}");
             let n = n % 10;
 
             tracing::info!("The next step is delayed for five seconds");
             StepState::delay_for(Modulo { n }, 5.seconds())
         })
-        .retry_policy(RetryPolicy::builder().max_attempts(3).build())
         .step(|_ctx, Modulo { n }| async move {
             tracing::info!("Modulo 10 result: {n}");
             StepState::done()
         })
-        .retry_policy(RetryPolicy::builder().max_attempts(1).build())
         .name("example-step")
         .pool(pool)
         .build()

@@ -294,7 +294,7 @@
 //! // Define the job with state.
 //! let job = Job::builder()
 //!     .state(State { db_pool: pool })
-//!     .execute(|_: Message, State { db_pool }| async move {
+//!     .execute(|ctx, _: Message| async move {
 //!         // Do something with our connection pool...
 //!         Ok(())
 //!     })
@@ -353,8 +353,8 @@
 //!     .state(State {
 //!         data: Arc::new(Mutex::new("foo".to_string())),
 //!     })
-//!     .execute(|_: Message, State { data }| async move {
-//!         let mut data = data.lock().expect("Mutex should not be poisoned");
+//!     .step(ctx, |_: Message| async move {
+//!         let mut data = ctx.state.data.lock().expect("Mutex should not be poisoned");
 //!         *data = "bar".to_string();
 //!         Ok(())
 //!     })
@@ -375,7 +375,7 @@ use std::{
     },
 };
 
-use builder_states::{Initial, PoolSet, QueueNameSet, QueueSet, StepSet};
+use builder_states::{Initial, PoolSet, QueueNameSet, QueueSet, StateSet, StepSet};
 use jiff::Span;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sqlx::{PgExecutor, PgPool, Postgres, Transaction};
@@ -412,6 +412,10 @@ pub enum Error {
     #[error(transparent)]
     Join(#[from] tokio::task::JoinError),
 
+    /// Error return from serde_json.
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+
     /// Error returned from database operations.
     #[error(transparent)]
     Database(#[from] sqlx::Error),
@@ -441,6 +445,9 @@ impl JobState {
 /// Context passed in to each step.
 pub struct JobContext<S> {
     /// Shared step state.
+    ///
+    /// **Note:** State is not persisted and therefore should not be
+    /// relied on when durability is needed.
     pub state: S,
 }
 
@@ -448,11 +455,11 @@ pub struct JobContext<S> {
 pub struct Job<I, S>
 where
     I: Sync + Send + 'static,
-    S: Default + Clone + Sync + Send + 'static,
+    S: Clone + Sync + Send + 'static,
 {
     pub(crate) queue: JobQueue<I, S>,
     steps: Arc<Vec<(Box<dyn StepExecutor<S>>, RetryPolicy)>>,
-    state: Option<S>,
+    state: S,
     current_index: Arc<AtomicUsize>,
     _marker: PhantomData<I>,
 }
@@ -460,7 +467,7 @@ where
 impl<I, S> Job<I, S>
 where
     I: Serialize + Sync + Send + 'static,
-    S: Default + Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
 {
     /// Create a new job builder.
     pub fn builder() -> Builder<I, I, S, Initial> {
@@ -486,22 +493,19 @@ where
         E: PgExecutor<'a>,
         I: Serialize,
     {
-        let id = self
-            .enqueue_after_using(executor, input, Span::new())
-            .await?;
-
-        Ok(id)
+        self.enqueue_after_using(executor, input, Span::new()).await
     }
 
     /// Enqueue the job after the given delay using a connection from the
     /// queue's pool
     ///
     /// The given delay is added to the task's configured delay, if one is set.
-    pub async fn enqueue_after<'a, E>(&self, executor: E, input: I, delay: Span) -> Result<TaskId>
+    pub async fn enqueue_after<'a, E>(&self, input: I, delay: Span) -> Result<TaskId>
     where
         E: PgExecutor<'a>,
     {
-        self.enqueue_after_using(executor, input, delay).await
+        let mut conn = self.queue.pool.acquire().await?;
+        self.enqueue_after_using(&mut *conn, input, delay).await
     }
 
     /// Enqueue the job using the provided executor after the given delay.
@@ -523,7 +527,7 @@ where
     where
         E: PgExecutor<'a>,
     {
-        let step_input = serde_json::to_value(input).unwrap(); // TODO: Queue error
+        let step_input = serde_json::to_value(input)?;
         let input = JobState::new(step_input);
 
         let id = self
@@ -553,7 +557,7 @@ where
     where
         E: PgExecutor<'a>,
     {
-        let step_input = serde_json::to_value(input).unwrap(); // TODO: Queue error
+        let step_input = serde_json::to_value(input)?;
         let input = JobState::new(step_input);
         self.queue.schedule(executor, zoned_schedule, input).await?;
 
@@ -564,7 +568,7 @@ where
     pub async fn run_worker(self) -> WorkerResult {
         let queue = self.queue.clone();
         let job = Arc::new(self);
-        let worker = Worker::new(queue, job.clone());
+        let worker = Worker::new(queue, job);
         worker.run().await
     }
 
@@ -572,7 +576,7 @@ where
     pub async fn run_scheduler(self) -> SchedulerResult {
         let queue = self.queue.clone();
         let job = Arc::new(self);
-        let scheduler = Scheduler::new(queue, job.clone());
+        let scheduler = Scheduler::new(queue, job);
         scheduler.run().await
     }
 
@@ -582,7 +586,7 @@ where
         let job = Arc::new(self);
 
         let worker = Worker::new(queue.clone(), job.clone());
-        let scheduler = Scheduler::new(queue, job.clone());
+        let scheduler = Scheduler::new(queue, job);
 
         let worker_task = tokio::spawn(async move { worker.run().await });
         let scheduler_task = tokio::spawn(async move { scheduler.run().await });
@@ -610,7 +614,7 @@ where
 impl<I, S> Task for Job<I, S>
 where
     I: Send + Sync + 'static,
-    S: Default + Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
 {
     type Input = JobState;
     type Output = ();
@@ -632,7 +636,7 @@ where
         let (step, _) = &self.steps[step_index];
 
         let ctx = JobContext {
-            state: self.state.clone().unwrap_or_default(),
+            state: self.state.clone(),
         };
 
         // Enqueue the next step if one is given.
@@ -673,22 +677,34 @@ where
 /// Represents the state after executing a step.
 #[derive(Deserialize, Serialize)]
 pub enum StepState<N> {
+    /// The next step to transition to.
     Next(N),
+
+    /// The next step to transition to, after the delay.
     Delay((N, Span)),
+
+    /// The terminal state.
     Done,
 }
 
 impl<S> StepState<S> {
+    /// Transitions from the current step to the next step.
     pub fn to_next(step: S) -> TaskResult<Self> {
         Ok(Self::Next(step))
     }
 
-    pub fn delay_for(step: S, span: Span) -> TaskResult<Self> {
-        Ok(Self::Delay((step, span)))
+    /// Transitions from the current step to the next step, but after the given
+    /// delay.
+    ///
+    /// The next step will be enqueued immediately, but won't be dequeued until
+    /// the span has elapsed.
+    pub fn delay_for(step: S, delay: Span) -> TaskResult<Self> {
+        Ok(Self::Delay((step, delay)))
     }
 }
 
 impl StepState<()> {
+    /// Signals that this is the final step and no more steps will follow.
     pub fn done() -> TaskResult<StepState<()>> {
         Ok(StepState::Done)
     }
@@ -713,7 +729,7 @@ where
         + Sync
         + 'static,
 {
-    pub fn new(func: F) -> Self {
+    fn new(func: F) -> Self {
         Self {
             func: Arc::new(func),
             _marker: PhantomData,
@@ -784,34 +800,41 @@ mod builder_states {
 
     pub struct Initial;
 
-    pub struct StepSet<Current> {
+    pub struct StateSet<S> {
+        pub state: S,
+    }
+
+    pub struct StepSet<Current, S> {
+        pub state: S,
         pub _marker: PhantomData<Current>,
     }
 
     pub struct QueueSet<I, S>
     where
         I: Send + Sync + 'static,
-        S: Default + Clone + Send + Sync + 'static,
+        S: Clone + Send + Sync + 'static,
     {
+        pub state: S,
         pub queue: JobQueue<I, S>,
     }
 
-    pub struct QueueNameSet {
+    pub struct QueueNameSet<S> {
+        pub state: S,
         pub queue_name: String,
     }
 
-    pub struct PoolSet {
+    pub struct PoolSet<S> {
+        pub state: S,
         pub queue_name: String,
         pub pool: PgPool,
     }
 }
 
 /// A builder for constructing a `Job` with a sequence of steps.
-pub struct Builder<I, O, S, B> {
+pub struct Builder<I, O, S, B = Initial> {
     builder_state: B,
     steps: Vec<(Box<dyn StepExecutor<S>>, RetryPolicy)>,
-    state: Option<S>,
-    _marker: PhantomData<(I, O)>,
+    _marker: PhantomData<(I, O, S)>,
 }
 
 impl<I, S> Default for Builder<I, I, S, Initial> {
@@ -826,7 +849,6 @@ impl<I, S> Builder<I, I, S, Initial> {
         Builder::<I, I, S, _> {
             builder_state: Initial,
             steps: Vec::new(),
-            state: None,
             _marker: PhantomData,
         }
     }
@@ -835,16 +857,19 @@ impl<I, S> Builder<I, I, S, Initial> {
     ///
     /// **Note:** State is not persisted and therefore should not be relied on
     /// when durability is needed.
-    pub fn state(mut self, state: S) -> Builder<I, I, S, Initial> {
-        self.state = Some(state);
-        self
+    pub fn state(self, state: S) -> Builder<I, I, S, StateSet<S>> {
+        Builder {
+            builder_state: StateSet { state },
+            steps: self.steps,
+            _marker: PhantomData,
+        }
     }
 
     /// Add a step to the job.
     ///
     /// This method ensures that the input type of the new step matches the
     /// output type of the previous step.
-    pub fn step<F, O, Fut>(mut self, func: F) -> Builder<I, O, S, StepSet<O>>
+    pub fn step<F, O, Fut>(mut self, func: F) -> Builder<I, O, S, StepSet<O, ()>>
     where
         I: DeserializeOwned + Serialize + Send + Sync + 'static,
         O: Serialize + Send + Sync + 'static,
@@ -857,21 +882,49 @@ impl<I, S> Builder<I, I, S, Initial> {
 
         Builder {
             builder_state: StepSet {
+                state: (),
                 _marker: PhantomData,
             },
             steps: self.steps,
-            state: self.state,
             _marker: PhantomData,
         }
     }
 }
 
-impl<I, Current, S> Builder<I, Current, S, StepSet<Current>> {
+// After state set.
+impl<I, S> Builder<I, I, S, StateSet<S>> {
+    /// Add a step to the job.
+    ///
+    /// This method ensures that the input type of the new step matches the
+    /// output type of the previous step.
+    pub fn step<F, O, Fut>(mut self, func: F) -> Builder<I, O, S, StepSet<O, S>>
+    where
+        I: DeserializeOwned + Serialize + Send + Sync + 'static,
+        O: Serialize + Send + Sync + 'static,
+        S: Send + Sync + 'static,
+        F: Fn(JobContext<S>, I) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = TaskResult<StepState<O>>> + Send + 'static,
+    {
+        let step_fn = StepFn::new(move |ctx, input| Box::pin(func(ctx, input)));
+        self.steps.push((Box::new(step_fn), RetryPolicy::default()));
+
+        Builder {
+            builder_state: StepSet {
+                state: self.builder_state.state,
+                _marker: PhantomData,
+            },
+            steps: self.steps,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
     /// Add a subsequent step to the job.
     ///
     /// This method ensures that the input type of the new step matches the
     /// output type of the previous step.
-    pub fn step<F, New, Fut>(mut self, func: F) -> Builder<I, New, S, StepSet<New>>
+    pub fn step<F, New, Fut>(mut self, func: F) -> Builder<I, New, S, StepSet<New, S>>
     where
         Current: DeserializeOwned + Serialize + Send + Sync + 'static,
         New: Serialize + Send + Sync + 'static,
@@ -884,81 +937,89 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current>> {
 
         Builder {
             builder_state: StepSet {
+                state: self.builder_state.state,
                 _marker: PhantomData,
             },
             steps: self.steps,
-            state: self.state,
             _marker: PhantomData,
         }
     }
 
+    /// Sets the retry policy of the previous step.
     pub fn retry_policy(
         mut self,
         retry_policy: RetryPolicy,
-    ) -> Builder<I, Current, S, StepSet<Current>> {
+    ) -> Builder<I, Current, S, StepSet<Current, S>> {
         let (_, default_policy) = self.steps.last_mut().expect("Steps should not be empty");
         *default_policy = retry_policy;
 
         Builder {
             builder_state: StepSet {
+                state: self.builder_state.state,
                 _marker: PhantomData,
             },
             steps: self.steps,
-            state: self.state,
             _marker: PhantomData,
         }
     }
 }
 
 // Encapsulate queue creation.
-impl<I, S> Builder<I, (), S, StepSet<()>>
+impl<I, S> Builder<I, (), S, StepSet<(), S>>
 where
     I: Send + Sync + 'static,
-    S: Default + Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
 {
     /// Set the name of the job's queue.
-    pub fn name(self, name: impl Into<String>) -> Builder<I, (), S, QueueNameSet> {
+    pub fn name(self, name: impl Into<String>) -> Builder<I, (), S, QueueNameSet<S>> {
         Builder {
             builder_state: QueueNameSet {
+                state: self.builder_state.state,
                 queue_name: name.into(),
             },
             steps: self.steps,
-            state: self.state,
             _marker: PhantomData,
         }
     }
 }
 
-impl<I, S> Builder<I, (), S, QueueNameSet>
+impl<I, S> Builder<I, (), S, QueueNameSet<S>>
 where
     I: Send + Sync + 'static,
-    S: Default + Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
 {
     /// Set the name of the job's queue.
-    pub fn pool(self, pool: PgPool) -> Builder<I, (), S, PoolSet> {
-        let QueueNameSet { queue_name } = self.builder_state;
+    pub fn pool(self, pool: PgPool) -> Builder<I, (), S, PoolSet<S>> {
+        let QueueNameSet { queue_name, state } = self.builder_state;
         Builder {
-            builder_state: PoolSet { queue_name, pool },
+            builder_state: PoolSet {
+                state,
+                queue_name,
+                pool,
+            },
             steps: self.steps,
-            state: self.state,
             _marker: PhantomData,
         }
     }
 }
 
-impl<I, S> Builder<I, (), S, PoolSet>
+impl<I, S> Builder<I, (), S, PoolSet<S>>
 where
     I: Send + Sync + 'static,
-    S: Default + Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
 {
     /// Finalize the builder into a `Job`.
     pub async fn build(self) -> Result<Job<I, S>> {
-        let PoolSet { queue_name, pool } = self.builder_state;
+        let PoolSet {
+            state,
+            queue_name,
+            pool,
+        } = self.builder_state;
         let queue = Queue::builder().name(queue_name).pool(pool).build().await?;
         Ok(Job {
             queue,
             steps: Arc::new(self.steps),
-            state: self.state,
+            state,
             current_index: Arc::new(AtomicUsize::new(0)),
             _marker: PhantomData,
         })
@@ -966,17 +1027,19 @@ where
 }
 
 // Directly provide queue.
-impl<I, S> Builder<I, (), S, StepSet<()>>
+impl<I, S> Builder<I, (), S, StepSet<(), S>>
 where
     I: Send + Sync + 'static,
-    S: Default + Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
 {
     /// Set the queue.
     pub fn queue(self, queue: JobQueue<I, S>) -> Builder<I, (), S, QueueSet<I, S>> {
         Builder {
-            builder_state: QueueSet { queue },
+            builder_state: QueueSet {
+                state: self.builder_state.state,
+                queue,
+            },
             steps: self.steps,
-            state: self.state,
             _marker: PhantomData,
         }
     }
@@ -985,15 +1048,15 @@ where
 impl<I, S> Builder<I, (), S, QueueSet<I, S>>
 where
     I: Send + Sync + 'static,
-    S: Default + Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
 {
     /// Finalize the builder into a `Job`.
     pub fn build(self) -> Job<I, S> {
-        let QueueSet { queue } = self.builder_state;
+        let QueueSet { state, queue } = self.builder_state;
         Job {
             queue,
             steps: Arc::new(self.steps),
-            state: self.state,
+            state,
             current_index: Arc::new(AtomicUsize::new(0)),
             _marker: PhantomData,
         }
