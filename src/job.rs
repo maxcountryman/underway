@@ -368,101 +368,16 @@
 use std::{future::Future, marker::PhantomData, pin::Pin, sync::Arc};
 
 use builder_states::{Initial, PoolSet, QueueNameSet, QueueSet, StepSet};
-use futures::FutureExt;
 use jiff::Span;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use sqlx::{PgConnection, PgExecutor, PgPool};
+use sqlx::{PgExecutor, PgPool, Postgres, Transaction};
 
 use crate::{
     queue::{Error as QueueError, Queue},
     scheduler::{Error as SchedulerError, Result as SchedulerResult, Scheduler, ZonedSchedule},
-    task::{self, Error as TaskError, Id as TaskId, Result as TaskResult, RetryPolicy, Task},
+    task::{Error as TaskError, Id as TaskId, Result as TaskResult, RetryPolicy, Task},
     worker::{Error as WorkerError, Result as WorkerResult, Worker},
 };
-type JobQueue<S> = Queue<Job<S>>;
-
-/// Represents the state after executing a step.
-#[derive(Deserialize, Serialize)]
-pub enum StepState<S> {
-    Next(S),
-    Delay((S, Span)),
-    Done,
-}
-
-impl<S> StepState<S> {
-    pub fn to_next(step: S) -> TaskResult<Self> {
-        Ok(Self::Next(step))
-    }
-
-    pub fn delay_for(step: S, span: Span) -> TaskResult<Self> {
-        Ok(Self::Delay((step, span)))
-    }
-}
-
-impl StepState<()> {
-    pub fn done() -> TaskResult<StepState<()>> {
-        Ok(StepState::Done)
-    }
-}
-
-/// Trait for defining a single step in a job.
-pub trait Step: Send + Sync {
-    type Input: DeserializeOwned + Serialize + Send + 'static;
-    type Output: Serialize + Send + 'static;
-
-    /// Executes the step with the provided input.
-    fn execute(
-        &self,
-        input: Self::Input,
-    ) -> Pin<Box<dyn Future<Output = TaskResult<StepState<Self::Output>>> + Send>>;
-}
-
-/// A concrete implementation of a step using a closure.
-pub struct StepFn<I, O, F>
-where
-    F: Fn(I) -> Pin<Box<dyn Future<Output = TaskResult<StepState<O>>> + Send>>
-        + Send
-        + Sync
-        + 'static,
-{
-    func: Arc<F>,
-    _marker: PhantomData<(I, O)>,
-}
-
-impl<I, O, F> StepFn<I, O, F>
-where
-    F: Fn(I) -> Pin<Box<dyn Future<Output = TaskResult<StepState<O>>> + Send>>
-        + Send
-        + Sync
-        + 'static,
-{
-    pub fn new(func: F) -> Self {
-        Self {
-            func: Arc::new(func),
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<I, O, F> Step for StepFn<I, O, F>
-where
-    I: serde::de::DeserializeOwned + serde::Serialize + Send + Sync + 'static,
-    O: serde::Serialize + Send + Sync + 'static,
-    F: Fn(I) -> Pin<Box<dyn Future<Output = TaskResult<StepState<O>>> + Send>>
-        + Send
-        + Sync
-        + 'static,
-{
-    type Input = I;
-    type Output = O;
-
-    fn execute(
-        &self,
-        input: Self::Input,
-    ) -> Pin<Box<dyn Future<Output = TaskResult<StepState<Self::Output>>> + Send>> {
-        (self.func)(input)
-    }
-}
 
 type Result<T = ()> = std::result::Result<T, Error>;
 
@@ -494,22 +409,49 @@ pub enum Error {
     Database(#[from] sqlx::Error),
 }
 
-/// Ergnomic implementation of the `Task` trait.
-pub struct Job<S>
-where
-    S: Sync + Send + 'static,
-{
-    pub(crate) queue: JobQueue<S>,
-    steps: Arc<Vec<Box<dyn StepExecutor>>>,
-    _marker: PhantomData<S>,
+type JobQueue<T, S> = Queue<Job<T, S>>;
+
+// TODO: Versioning?
+#[derive(Serialize, Deserialize)]
+pub struct JobState {
+    step_index: usize,
+    step_input: serde_json::Value,
 }
 
-impl<I> Job<I>
+impl JobState {
+    fn new(step_input: serde_json::Value) -> Self {
+        Self {
+            step_index: 0,
+            step_input,
+        }
+    }
+}
+
+pub struct JobContext<S> {
+    ///// The current step's ID.
+    //id: TaskId,
+    pub state: S,
+}
+
+/// Ergnomic implementation of the `Task` trait.
+pub struct Job<I, S>
+where
+    I: Sync + Send + 'static,
+    S: Default + Clone + Sync + Send + 'static,
+{
+    pub(crate) queue: JobQueue<I, S>,
+    steps: Arc<Vec<Box<dyn StepExecutor<S>>>>,
+    state: Option<S>,
+    _marker: PhantomData<I>,
+}
+
+impl<I, S> Job<I, S>
 where
     I: Serialize + Sync + Send + 'static,
+    S: Default + Clone + Send + Sync + 'static,
 {
     /// Create a new job builder.
-    pub fn builder() -> Builder<I, I, Initial> {
+    pub fn builder() -> Builder<I, I, S, Initial> {
         Builder::new()
     }
 
@@ -532,9 +474,9 @@ where
         E: PgExecutor<'a>,
         I: Serialize,
     {
-        let step_input = serde_json::to_value(input).unwrap(); // TODO: Queue error
-        let input = JobState::new(step_input);
-        let id = self.queue.enqueue(executor, self, input).await?;
+        let id = self
+            .enqueue_after_using(executor, input, Span::new())
+            .await?;
 
         Ok(id)
     }
@@ -580,42 +522,47 @@ where
         Ok(id)
     }
 
-    ///// Schedule the job using a connection from the queue's pool.
-    //pub async fn schedule(&self, zoned_schedule: ZonedSchedule, input:
-    // JobInput<I, O>) -> Result {    let mut conn =
-    // self.queue.pool.acquire().await?;    self.schedule_using(&mut *conn,
-    // zoned_schedule, input).await
-    //}
+    /// Schedule the job using a connection from the queue's pool.
+    pub async fn schedule(&self, zoned_schedule: ZonedSchedule, input: I) -> Result {
+        let mut conn = self.queue.pool.acquire().await?;
+        self.schedule_using(&mut *conn, zoned_schedule, input).await
+    }
 
-    ///// Schedule the job using the provided executor.
-    /////
-    ///// This allows jobs to be scheduled using the same transaction as an
-    ///// application may already be using in a given context.
-    //pub async fn schedule_using<'a, E>(
-    //    &self,
-    //    executor: E,
-    //    zoned_schedule: ZonedSchedule,
-    //    input: JobInput<I, O>,
-    //) -> Result
-    //where
-    //    E: PgExecutor<'a>,
-    //{
-    //    self.queue.schedule(executor, zoned_schedule, input).await?;
+    /// Schedule the job using the provided executor.
+    ///
+    /// This allows jobs to be scheduled using the same transaction as an
+    /// application may already be using in a given context.
+    pub async fn schedule_using<'a, E>(
+        &self,
+        executor: E,
+        zoned_schedule: ZonedSchedule,
+        input: I,
+    ) -> Result
+    where
+        E: PgExecutor<'a>,
+    {
+        let step_input = serde_json::to_value(input).unwrap(); // TODO: Queue error
+        let input = JobState::new(step_input);
+        self.queue.schedule(executor, zoned_schedule, input).await?;
 
-    //    Ok(())
-    //}
+        Ok(())
+    }
 
-    ///// Constructs a worker which then immediately runs task processing.
-    //pub async fn run_worker(&self) -> WorkerResult {
-    //    let worker = Worker::from(self);
-    //    worker.run().await
-    //}
+    /// Constructs a worker which then immediately runs task processing.
+    pub async fn run_worker(self) -> WorkerResult {
+        let queue = self.queue.clone();
+        let job = Arc::new(self);
+        let worker = Worker::new(queue, job.clone());
+        worker.run().await
+    }
 
-    ///// Contructs a worker which then immediately runs schedule processing.
-    //pub async fn run_scheduler(&self) -> SchedulerResult {
-    //    let scheduler = Scheduler::from(self);
-    //    scheduler.run().await
-    //}
+    /// Contructs a worker which then immediately runs schedule processing.
+    pub async fn run_scheduler(self) -> SchedulerResult {
+        let queue = self.queue.clone();
+        let job = Arc::new(self);
+        let scheduler = Scheduler::new(queue, job.clone());
+        scheduler.run().await
+    }
 
     /// Runs both a worker and scheduler for the job.
     pub async fn run(self) -> Result {
@@ -648,32 +595,17 @@ where
     }
 }
 
-// TODO: Versioning?
-#[derive(Serialize, Deserialize)]
-pub struct JobState {
-    step_index: usize,
-    step_input: serde_json::Value,
-}
-
-impl JobState {
-    fn new(step_input: serde_json::Value) -> Self {
-        Self {
-            step_index: 0,
-            step_input,
-        }
-    }
-}
-
-impl<S> Task for Job<S>
+impl<I, S> Task for Job<I, S>
 where
-    S: Send + Sync + 'static,
+    I: Send + Sync + 'static,
+    S: Default + Clone + Send + Sync + 'static,
 {
     type Input = JobState;
     type Output = ();
 
-    async fn execute(
+    async fn execute<'a>(
         &self,
-        conn: &mut PgConnection,
+        mut tx: Transaction<'a, Postgres>,
         input: Self::Input,
     ) -> TaskResult<Self::Output> {
         let JobState {
@@ -687,11 +619,16 @@ where
 
         let step = &self.steps[step_index];
 
+        let ctx = JobContext {
+            state: self.state.clone().unwrap_or_default(),
+        };
+
         // Enqueue the next step if one is given.
-        if let Some((step_input, delay)) = step.execute_step(step_input).await? {
+        if let Some((step_input, delay)) = step.execute_step(ctx, step_input).await? {
             let next_job = Job {
                 queue: self.queue.clone(),
                 steps: Arc::clone(&self.steps),
+                state: self.state.clone(),
                 _marker: PhantomData,
             };
             let next_job_input = JobState {
@@ -699,42 +636,100 @@ where
                 step_index: step_index + 1,
             };
             self.queue
-                .enqueue_after(conn, &next_job, next_job_input, delay)
+                .enqueue_after(&mut *tx, &next_job, next_job_input, delay)
                 .await
                 .map_err(|err| TaskError::Retryable(err.to_string()))?;
+
+            tx.commit().await?;
         };
 
         Ok(())
     }
 }
+
+/// Represents the state after executing a step.
+#[derive(Deserialize, Serialize)]
+pub enum StepState<N> {
+    Next(N),
+    Delay((N, Span)),
+    Done,
+}
+
+impl<S> StepState<S> {
+    pub fn to_next(step: S) -> TaskResult<Self> {
+        Ok(Self::Next(step))
+    }
+
+    pub fn delay_for(step: S, span: Span) -> TaskResult<Self> {
+        Ok(Self::Delay((step, span)))
+    }
+}
+
+impl StepState<()> {
+    pub fn done() -> TaskResult<StepState<()>> {
+        Ok(StepState::Done)
+    }
+}
+
+/// A concrete implementation of a step using a closure.
+pub struct StepFn<I, O, S, F>
+where
+    F: Fn(JobContext<S>, I) -> Pin<Box<dyn Future<Output = TaskResult<StepState<O>>> + Send>>
+        + Send
+        + Sync
+        + 'static,
+{
+    func: Arc<F>,
+    _marker: PhantomData<(I, O, S)>,
+}
+
+impl<I, O, S, F> StepFn<I, O, S, F>
+where
+    F: Fn(JobContext<S>, I) -> Pin<Box<dyn Future<Output = TaskResult<StepState<O>>> + Send>>
+        + Send
+        + Sync
+        + 'static,
+{
+    pub fn new(func: F) -> Self {
+        Self {
+            func: Arc::new(func),
+            _marker: PhantomData,
+        }
+    }
+}
+
 /// A trait object wrapper for steps to allow heterogeneous step types in a
 /// vector.
-pub trait StepExecutor: Send + Sync {
+pub trait StepExecutor<S>: Send + Sync {
     /// Execute the step with the given input serialized as JSON.
     fn execute_step(
         &self,
+        ctx: JobContext<S>,
         input: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = TaskResult<Option<(serde_json::Value, Span)>>> + Send>>;
 }
 
-impl<I, O, F> StepExecutor for StepFn<I, O, F>
+impl<I, O, S, F> StepExecutor<S> for StepFn<I, O, S, F>
 where
     I: DeserializeOwned + Serialize + Send + Sync + 'static,
     O: Serialize + Send + Sync + 'static,
-    F: Fn(I) -> Pin<Box<dyn Future<Output = TaskResult<StepState<O>>> + Send>>
+    S: Send + Sync + 'static,
+    F: Fn(JobContext<S>, I) -> Pin<Box<dyn Future<Output = TaskResult<StepState<O>>> + Send>>
         + Send
         + Sync
         + 'static,
 {
     fn execute_step(
         &self,
+        ctx: JobContext<S>,
         input: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = TaskResult<Option<(serde_json::Value, Span)>>> + Send>> {
         let deserialized_input: I = match serde_json::from_value(input) {
             Ok(val) => val,
             Err(e) => return Box::pin(async move { Err(TaskError::Fatal(e.to_string())) }),
         };
-        let fut = self.execute(deserialized_input);
+        let fut = (self.func)(ctx, deserialized_input);
+
         Box::pin(async move {
             match fut.await {
                 Ok(StepState::Next(output)) => {
@@ -770,11 +765,12 @@ mod builder_states {
         pub _marker: PhantomData<Current>,
     }
 
-    pub struct QueueSet<I>
+    pub struct QueueSet<I, S>
     where
         I: Send + Sync + 'static,
+        S: Default + Clone + Send + Sync + 'static,
     {
-        pub queue: JobQueue<I>,
+        pub queue: JobQueue<I, S>,
     }
 
     pub struct QueueNameSet {
@@ -788,40 +784,48 @@ mod builder_states {
 }
 
 /// A builder for constructing a `Job` with a sequence of steps.
-pub struct Builder<I, O, State = Initial> {
-    builder_state: State,
-    steps: Vec<Box<dyn StepExecutor>>,
+pub struct Builder<I, O, S, B> {
+    builder_state: B,
+    steps: Vec<Box<dyn StepExecutor<S>>>,
+    state: Option<S>,
     _marker: PhantomData<(I, O)>,
 }
 
-impl<I> Default for Builder<I, I, Initial> {
+impl<I, S> Default for Builder<I, I, S, Initial> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<I> Builder<I, I, Initial> {
+impl<I, S> Builder<I, I, S, Initial> {
     /// Create a new builder.
-    pub fn new() -> Builder<I, I, Initial> {
-        Builder::<I, I, _> {
+    pub fn new() -> Builder<I, I, S, Initial> {
+        Builder::<I, I, S, _> {
             builder_state: Initial,
             steps: Vec::new(),
+            state: None,
             _marker: PhantomData,
         }
+    }
+
+    pub fn state(mut self, state: S) -> Builder<I, I, S, Initial> {
+        self.state = Some(state);
+        self
     }
 
     /// Add a step to the job.
     ///
     /// This method ensures that the input type of the new step matches the
     /// output type of the previous step.
-    pub fn step<F, O, Fut>(mut self, func: F) -> Builder<I, O, StepSet<O>>
+    pub fn step<F, O, Fut>(mut self, func: F) -> Builder<I, O, S, StepSet<O>>
     where
         I: DeserializeOwned + Serialize + Send + Sync + 'static,
         O: Serialize + Send + Sync + 'static,
-        F: Fn(I) -> Fut + Send + Sync + 'static,
+        S: Send + Sync + 'static,
+        F: Fn(JobContext<S>, I) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = TaskResult<StepState<O>>> + Send + 'static,
     {
-        let step_fn = StepFn::new(move |input: I| func(input).boxed());
+        let step_fn = StepFn::new(move |ctx: JobContext<S>, input: I| Box::pin(func(ctx, input)));
         self.steps.push(Box::new(step_fn));
 
         Builder {
@@ -829,24 +833,27 @@ impl<I> Builder<I, I, Initial> {
                 _marker: PhantomData,
             },
             steps: self.steps,
+            state: self.state,
             _marker: PhantomData,
         }
     }
 }
 
-impl<I, Current> Builder<I, Current, StepSet<Current>> {
+impl<I, Current, S> Builder<I, Current, S, StepSet<Current>> {
     /// Add a subsequent step to the job.
     ///
     /// This method ensures that the input type of the new step matches the
     /// output type of the previous step.
-    pub fn step<F, New, Fut>(mut self, func: F) -> Builder<I, New, StepSet<New>>
+    pub fn step<F, New, Fut>(mut self, func: F) -> Builder<I, New, S, StepSet<New>>
     where
         Current: DeserializeOwned + Serialize + Send + Sync + 'static,
         New: Serialize + Send + Sync + 'static,
-        F: Fn(Current) -> Fut + Send + Sync + 'static,
+        S: Send + Sync + 'static,
+        F: Fn(JobContext<S>, Current) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = TaskResult<StepState<New>>> + Send + 'static,
     {
-        let step_fn = StepFn::new(move |input: Current| func(input).boxed());
+        let step_fn =
+            StepFn::new(move |ctx: JobContext<S>, input: Current| Box::pin(func(ctx, input)));
         self.steps.push(Box::new(step_fn));
 
         Builder {
@@ -854,84 +861,95 @@ impl<I, Current> Builder<I, Current, StepSet<Current>> {
                 _marker: PhantomData,
             },
             steps: self.steps,
+            state: self.state,
             _marker: PhantomData,
         }
     }
 }
 
 // Encapsulate queue creation.
-impl<I> Builder<I, (), StepSet<()>>
+impl<I, S> Builder<I, (), S, StepSet<()>>
 where
     I: Send + Sync + 'static,
+    S: Default + Clone + Send + Sync + 'static,
 {
     /// Set the name of the job's queue.
-    pub fn name(self, name: impl Into<String>) -> Builder<I, (), QueueNameSet> {
+    pub fn name(self, name: impl Into<String>) -> Builder<I, (), S, QueueNameSet> {
         Builder {
             builder_state: QueueNameSet {
                 queue_name: name.into(),
             },
             steps: self.steps,
+            state: self.state,
             _marker: PhantomData,
         }
     }
 }
 
-impl<I> Builder<I, (), QueueNameSet>
+impl<I, S> Builder<I, (), S, QueueNameSet>
 where
     I: Send + Sync + 'static,
+    S: Default + Clone + Send + Sync + 'static,
 {
     /// Set the name of the job's queue.
-    pub fn pool(self, pool: PgPool) -> Builder<I, (), PoolSet> {
+    pub fn pool(self, pool: PgPool) -> Builder<I, (), S, PoolSet> {
         let QueueNameSet { queue_name } = self.builder_state;
         Builder {
             builder_state: PoolSet { queue_name, pool },
             steps: self.steps,
+            state: self.state,
             _marker: PhantomData,
         }
     }
 }
 
-impl<I> Builder<I, (), PoolSet>
+impl<I, S> Builder<I, (), S, PoolSet>
 where
     I: Send + Sync + 'static,
+    S: Default + Clone + Send + Sync + 'static,
 {
     /// Finalize the builder into a `Job`.
-    pub async fn build(self) -> Result<Job<I>> {
+    pub async fn build(self) -> Result<Job<I, S>> {
         let PoolSet { queue_name, pool } = self.builder_state;
         let queue = Queue::builder().name(queue_name).pool(pool).build().await?;
         Ok(Job {
             queue,
             steps: Arc::new(self.steps),
+            state: self.state,
             _marker: PhantomData,
         })
     }
 }
 
 // Directly provide queue.
-impl<I> Builder<I, (), StepSet<()>>
+impl<I, S> Builder<I, (), S, StepSet<()>>
 where
     I: Send + Sync + 'static,
+    S: Default + Clone + Send + Sync + 'static,
 {
     /// Set the queue.
-    pub fn queue(self, queue: JobQueue<I>) -> Builder<I, (), QueueSet<I>> {
+    pub fn queue(self, queue: JobQueue<I, S>) -> Builder<I, (), S, QueueSet<I, S>> {
         Builder {
             builder_state: QueueSet { queue },
             steps: self.steps,
+            state: self.state,
             _marker: PhantomData,
         }
     }
 }
 
-impl<I> Builder<I, (), QueueSet<I>>
+impl<I, S> Builder<I, (), S, QueueSet<I, S>>
 where
     I: Send + Sync + 'static,
+    S: Default + Clone + Send + Sync + 'static,
 {
     /// Finalize the builder into a `Job`.
-    pub fn build(self) -> Job<I> {
+    pub fn build(self) -> Job<I, S> {
         let QueueSet { queue } = self.builder_state;
         Job {
             queue,
             steps: Arc::new(self.steps),
+            state: self.state,
             _marker: PhantomData,
         }
     }

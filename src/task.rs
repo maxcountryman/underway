@@ -71,7 +71,7 @@ use std::{future::Future, result::Result as StdResult};
 
 use jiff::{Span, ToSpan};
 use serde::{de::DeserializeOwned, Serialize};
-use sqlx::{postgres::types::PgInterval, PgConnection};
+use sqlx::{postgres::types::PgInterval, Postgres, Transaction};
 use uuid::Uuid;
 
 pub(crate) use self::retry_policy::RetryCount;
@@ -210,7 +210,7 @@ pub trait Task: Send + 'static {
     ///     /// Simulate sending a welcome email by printing a message to the console.
     ///     async fn execute(
     ///         &self,
-    ///         _conn: &mut PgConnection,
+    ///         conn: &mut PgConnection,
     ///         input: Self::Input,
     ///     ) -> TaskResult<Self::Output> {
     ///         println!(
@@ -224,9 +224,9 @@ pub trait Task: Send + 'static {
     ///     }
     /// }
     /// ```
-    fn execute(
+    fn execute<'a>(
         &self,
-        conn: &mut PgConnection,
+        conn: Transaction<'a, Postgres>,
         input: Self::Input,
     ) -> impl Future<Output = Result<Self::Output>> + Send;
 

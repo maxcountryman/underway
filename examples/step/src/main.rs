@@ -38,23 +38,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Run migrations.
     underway::MIGRATOR.run(&pool).await?;
 
+    #[derive(Debug, Default, Clone)]
+    struct MyState {
+        content: String,
+    }
+
     // Create our job.
     let job = Job::builder()
-        .step(|Start { n }| async move {
-            tracing::info!("Starting with {}", n);
-            let n = n.pow(2);
-
+        .state(MyState {
+            content: "hello, world".to_string(),
+        })
+        .step(|_ctx, Start { n }| async move {
+            tracing::info!("Starting with: {n}");
             StepState::to_next(Power { n })
         })
-        .step(|Power { n }| async move {
-            tracing::info!("Squared: {}", n);
+        .step(|ctx, Power { n }| async move {
+            tracing::info!(?ctx.state, "Squared: {n}");
             let n = n % 10;
 
             tracing::info!("The next step is delayed for five seconds");
-            StepState::delay_for(Modulo { n }, 3.seconds())
+            StepState::delay_for(Modulo { n }, 5.seconds())
         })
-        .step(|Modulo { n }| async move {
-            tracing::info!("Modulo 10 result: {}", n);
+        .step(|_ctx, Modulo { n }| async move {
+            tracing::info!("Modulo 10 result: {n}");
             StepState::done()
         })
         .name("example-step")

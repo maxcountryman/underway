@@ -125,7 +125,7 @@ use std::sync::{
 use jiff::{Span, ToSpan};
 use sqlx::{
     postgres::{types::PgInterval, PgListener},
-    PgConnection,
+    Acquire, PgConnection,
 };
 use tokio::{sync::Semaphore, task::JoinSet};
 use tracing::instrument;
@@ -325,8 +325,9 @@ impl<T: Task + Sync> Worker<T> {
                 .try_into()
                 .expect("Task timeout should be compatible with std::time");
 
+            let execute_tx = tx.begin().await?;
             tokio::select! {
-                result = self.task.execute(&mut tx, input) => {
+                result = self.task.execute(execute_tx, input) => {
                     match result {
                         Ok(_) => {
                             self.queue.mark_task_succeeded(&mut *tx, task_id).await?;
