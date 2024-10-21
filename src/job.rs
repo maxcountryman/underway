@@ -365,7 +365,15 @@
 //! # }
 //! ```
 
-use std::{future::Future, marker::PhantomData, pin::Pin, sync::Arc};
+use std::{
+    future::Future,
+    marker::PhantomData,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
 use builder_states::{Initial, PoolSet, QueueNameSet, QueueSet, StepSet};
 use jiff::Span;
@@ -411,12 +419,15 @@ pub enum Error {
 
 type JobQueue<T, S> = Queue<Job<T, S>>;
 
-// TODO: Versioning?
+/// Represents the serialized state of the job.
+///
+/// Step index is used to select the step to execute and step input is provide
+/// to the selected function.
 #[derive(Serialize, Deserialize)]
 pub struct JobState {
     step_index: usize,
     step_input: serde_json::Value,
-}
+} // TODO: Versioning?
 
 impl JobState {
     fn new(step_input: serde_json::Value) -> Self {
@@ -427,9 +438,9 @@ impl JobState {
     }
 }
 
+/// Context passed in to each step.
 pub struct JobContext<S> {
-    ///// The current step's ID.
-    //id: TaskId,
+    /// Shared step state.
     pub state: S,
 }
 
@@ -440,8 +451,9 @@ where
     S: Default + Clone + Sync + Send + 'static,
 {
     pub(crate) queue: JobQueue<I, S>,
-    steps: Arc<Vec<Box<dyn StepExecutor<S>>>>,
+    steps: Arc<Vec<(Box<dyn StepExecutor<S>>, RetryPolicy)>>,
     state: Option<S>,
+    current_index: Arc<AtomicUsize>,
     _marker: PhantomData<I>,
 }
 
@@ -603,9 +615,9 @@ where
     type Input = JobState;
     type Output = ();
 
-    async fn execute<'a>(
+    async fn execute(
         &self,
-        mut tx: Transaction<'a, Postgres>,
+        mut tx: Transaction<'_, Postgres>,
         input: Self::Input,
     ) -> TaskResult<Self::Output> {
         let JobState {
@@ -617,7 +629,7 @@ where
             return Err(TaskError::Fatal("Invalid step index.".into()));
         }
 
-        let step = &self.steps[step_index];
+        let (step, _) = &self.steps[step_index];
 
         let ctx = JobContext {
             state: self.state.clone().unwrap_or_default(),
@@ -625,16 +637,21 @@ where
 
         // Enqueue the next step if one is given.
         if let Some((step_input, delay)) = step.execute_step(ctx, step_input).await? {
+            // Advance current index after executing the step.
+            self.current_index.store(step_index + 1, Ordering::SeqCst);
+
             let next_job = Job {
                 queue: self.queue.clone(),
                 steps: Arc::clone(&self.steps),
                 state: self.state.clone(),
+                current_index: self.current_index.clone(),
                 _marker: PhantomData,
             };
             let next_job_input = JobState {
                 step_input,
                 step_index: step_index + 1,
             };
+
             self.queue
                 .enqueue_after(&mut *tx, &next_job, next_job_input, delay)
                 .await
@@ -644,6 +661,12 @@ where
         };
 
         Ok(())
+    }
+
+    fn retry_policy(&self) -> RetryPolicy {
+        let current_index = self.current_index.load(Ordering::SeqCst);
+        let (_, retry_policy) = self.steps[current_index];
+        retry_policy
     }
 }
 
@@ -786,7 +809,7 @@ mod builder_states {
 /// A builder for constructing a `Job` with a sequence of steps.
 pub struct Builder<I, O, S, B> {
     builder_state: B,
-    steps: Vec<Box<dyn StepExecutor<S>>>,
+    steps: Vec<(Box<dyn StepExecutor<S>>, RetryPolicy)>,
     state: Option<S>,
     _marker: PhantomData<(I, O)>,
 }
@@ -808,6 +831,10 @@ impl<I, S> Builder<I, I, S, Initial> {
         }
     }
 
+    /// Provides a state shared amongst all steps.
+    ///
+    /// **Note:** State is not persisted and therefore should not be relied on
+    /// when durability is needed.
     pub fn state(mut self, state: S) -> Builder<I, I, S, Initial> {
         self.state = Some(state);
         self
@@ -825,8 +852,8 @@ impl<I, S> Builder<I, I, S, Initial> {
         F: Fn(JobContext<S>, I) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = TaskResult<StepState<O>>> + Send + 'static,
     {
-        let step_fn = StepFn::new(move |ctx: JobContext<S>, input: I| Box::pin(func(ctx, input)));
-        self.steps.push(Box::new(step_fn));
+        let step_fn = StepFn::new(move |ctx, input| Box::pin(func(ctx, input)));
+        self.steps.push((Box::new(step_fn), RetryPolicy::default()));
 
         Builder {
             builder_state: StepSet {
@@ -852,9 +879,25 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current>> {
         F: Fn(JobContext<S>, Current) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = TaskResult<StepState<New>>> + Send + 'static,
     {
-        let step_fn =
-            StepFn::new(move |ctx: JobContext<S>, input: Current| Box::pin(func(ctx, input)));
-        self.steps.push(Box::new(step_fn));
+        let step_fn = StepFn::new(move |ctx, input| Box::pin(func(ctx, input)));
+        self.steps.push((Box::new(step_fn), RetryPolicy::default()));
+
+        Builder {
+            builder_state: StepSet {
+                _marker: PhantomData,
+            },
+            steps: self.steps,
+            state: self.state,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn retry_policy(
+        mut self,
+        retry_policy: RetryPolicy,
+    ) -> Builder<I, Current, S, StepSet<Current>> {
+        let (_, default_policy) = self.steps.last_mut().expect("Steps should not be empty");
+        *default_policy = retry_policy;
 
         Builder {
             builder_state: StepSet {
@@ -916,6 +959,7 @@ where
             queue,
             steps: Arc::new(self.steps),
             state: self.state,
+            current_index: Arc::new(AtomicUsize::new(0)),
             _marker: PhantomData,
         })
     }
@@ -950,6 +994,7 @@ where
             queue,
             steps: Arc::new(self.steps),
             state: self.state,
+            current_index: Arc::new(AtomicUsize::new(0)),
             _marker: PhantomData,
         }
     }
