@@ -18,7 +18,7 @@
 //! worker. However, workers can be manually constructed and only require a
 //! queue and task:
 //!
-//! ```rust
+//! ```rust,no_run
 //! # use tokio::runtime::Runtime;
 //! # use underway::Task;
 //! # use underway::task::Result as TaskResult;
@@ -40,7 +40,7 @@
 //! # /*
 //! let pool = { /* A `PgPool`. */ };
 //! # */
-//! # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
+//! # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
 //! let queue = Queue::builder()
 //!     .name("example_queue")
 //!     .pool(pool.clone())
@@ -69,25 +69,24 @@
 //! manner. Also note that workers do not need to be run in-process, and can be
 //! run from a separate binary altogether.
 //!
-//! ```rust
+//! ```rust,no_run
 //! # use tokio::runtime::Runtime;
 //! # use underway::Task;
 //! # use underway::task::Result as TaskResult;
-//! # use sqlx::PgPool;
+//! # use sqlx::{Transaction, Postgres, PgPool};
 //! # use underway::{Queue, Worker};
-//! # #[derive(Clone)]
 //! # struct MyTask;
 //! # impl Task for MyTask {
 //! #    type Input = ();
 //! #    type Output = ();
-//! #    async fn execute(&self, input: Self::Input) -> TaskResult<Self::Output> {
+//! #    async fn execute(&self, _tx: Transaction<'_, Postgres>, input: Self::Input) -> TaskResult<Self::Output> {
 //! #        Ok(())
 //! #    }
 //! # }
 //! # fn main() {
 //! # let rt = Runtime::new().unwrap();
 //! # rt.block_on(async {
-//! # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
+//! # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
 //! # let queue = Queue::builder()
 //! #    .name("example_queue")
 //! #    .pool(pool.clone())

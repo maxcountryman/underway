@@ -13,7 +13,7 @@
 //! A builder is provided allowing applications to define the configuration of
 //! their jobs. Minimally one step must be provided.
 //!
-//! ```rust
+//! ```rust,no_run
 //! # use sqlx::PgPool;
 //! # use underway::Queue;
 //! use serde::{Deserialize, Serialize};
@@ -23,7 +23,7 @@
 //! # fn main() {
 //! # let rt = Runtime::new().unwrap();
 //! # rt.block_on(async {
-//! # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
+//! # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
 //! # /*
 //! let pool = { /* A PgPool */ };
 //! # */
@@ -57,7 +57,8 @@
 //! Of course the point of creating a job is to use it to do something useful
 //! for us. In order to do so, we need to enqueue some input onto the job's
 //! queue. [`Job::enqueue`] does exactly this:
-//! ```rust
+//!
+//! ```rust,no_run
 //! # use sqlx::PgPool;
 //! use serde::{Deserialize, Serialize};
 //! use underway::{job::StepState, Job};
@@ -66,7 +67,7 @@
 //! # fn main() {
 //! # let rt = Runtime::new().unwrap();
 //! # rt.block_on(async {
-//! # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
+//! # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
 //! # /*
 //! let pool = { /* A `PgPool`. */ };
 //! # */
@@ -108,7 +109,8 @@
 //! transaction be rolled back, then our job won't be enqueued. (An ID will
 //! still be returned by this method, so it's up to our application to recognize
 //! when a failure has occurred and ignore any such IDs.)
-//! ```rust
+//!
+//! ```rust,no_run
 //! # use sqlx::PgPool;
 //! # use underway::{Queue, job::StepState};
 //! # use serde::{Deserialize, Serialize};
@@ -117,7 +119,7 @@
 //! # fn main() {
 //! # let rt = Runtime::new().unwrap();
 //! # rt.block_on(async {
-//! # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
+//! # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
 //! # let queue = Queue::builder()
 //! #    .name("example_queue")
 //! #    .pool(pool.clone())
@@ -161,7 +163,8 @@
 //! Once a job has been enqueued, a worker must be run in order to process it.
 //! Workers can be consructed from tasks, such as jobs. Jobs also provide a
 //! convenience method, [`Job::run`], for constructing and running a worker:
-//! ```rust
+//!
+//! ```rust,no_run
 //! # use sqlx::PgPool;
 //! # use underway::Queue;
 //! # use underway::{Job, job::StepState};
@@ -169,7 +172,7 @@
 //! # fn main() {
 //! # let rt = Runtime::new().unwrap();
 //! # rt.block_on(async {
-//! # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
+//! # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
 //! # let queue = Queue::builder()
 //! #    .name("example_queue")
 //! #    .pool(pool)
@@ -197,7 +200,8 @@
 //! that daylight saving time (DST) arithmetic is performed correctly. DST can
 //! introduce subtle scheduling errors, so by explicitly running schedules in
 //! the provided time zone we ensure to account for it.
-//! ```rust
+//!
+//! ```rust,no_run
 //! # use sqlx::PgPool;
 //! # use underway::Queue;
 //! # use underway::Job;
@@ -207,14 +211,14 @@
 //! # fn main() {
 //! # let rt = Runtime::new().unwrap();
 //! # rt.block_on(async {
-//! # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
+//! # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
 //! # let queue = Queue::builder()
 //! #    .name("example_queue")
 //! #    .pool(pool)
 //! #    .build()
 //! #    .await?;
 //! // Our task input type, used as config context here.
-//! #[derive(Clone, Serialize, Deserialize)]
+//! #[derive(Serialize, Deserialize)]
 //! struct JobConfig {
 //!     report_title: String,
 //! }
@@ -252,7 +256,8 @@
 //!
 //! Note that when a state is provided, the execute function must take first the
 //! input and then the state.
-//! ```rust
+//!
+//! ```rust,no_run
 //! # use sqlx::PgPool;
 //! # use underway::Queue;
 //! use serde::{Deserialize, Serialize};
@@ -262,7 +267,7 @@
 //! # fn main() {
 //! # let rt = Runtime::new().unwrap();
 //! # rt.block_on(async {
-//! # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
+//! # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
 //! # let queue = Queue::builder()
 //! #    .name("example_queue")
 //! #    .pool(pool.clone())
@@ -310,7 +315,8 @@
 //! If the mutex is held across await points then an async-aware lock (such as
 //! [`tokio::sync::Mutex`]) is needed. That said, generally a synchronous lock
 //! is what you want and should be preferred.
-//! ```rust
+//!
+//! ```rust,no_run
 //! # use sqlx::PgPool;
 //! use std::sync::{Arc, Mutex};
 //!
@@ -321,7 +327,7 @@
 //! # fn main() {
 //! # let rt = Runtime::new().unwrap();
 //! # rt.block_on(async {
-//! # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
+//! # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
 //! # /*
 //! let pool = { /* A `PgPool`. */ };
 //! # */

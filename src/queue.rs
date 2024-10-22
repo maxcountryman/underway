@@ -19,18 +19,19 @@
 //!
 //! To enable dead-letter queues, simply provide its name:
 //!
-//! ```rust
+//! ```rust,no_run
 //! # use tokio::runtime::Runtime;
 //! # use underway::Task;
 //! # use underway::task::Result as TaskResult;
 //! # use sqlx::PgPool;
+//! # use sqlx::{Transaction, Postgres};
 //! use underway::Queue;
 //!
 //! # struct MyTask;
 //! # impl Task for MyTask {
 //! #    type Input = ();
 //! #    type Output = ();
-//! #    async fn execute(&self, input: Self::Input) -> TaskResult<Self::Output> {
+//! #    async fn execute(&self, _tx: Transaction<'_, Postgres>, input: Self::Input) -> TaskResult<Self::Output> {
 //! #        Ok(())
 //! #    }
 //! # }
@@ -40,7 +41,7 @@
 //! # /*
 //! let pool = { /* A `PgPool`. */ };
 //! # */
-//! # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
+//! # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
 //! let queue = Queue::builder()
 //!     .name("example_queue")
 //!     // Enable the dead-letter queue.
@@ -69,18 +70,18 @@
 //! With that said, a queue may be interfaced with directly and operated
 //! manually if desired:
 //!
-//! ```rust
+//! ```rust,no_run
 //! # use tokio::runtime::Runtime;
 //! # use underway::Task;
 //! # use underway::task::Result as TaskResult;
-//! # use sqlx::PgPool;
+//! # use sqlx::{Transaction, Postgres, PgPool};
 //! use underway::Queue;
 //!
 //! # struct MyTask;
 //! # impl Task for MyTask {
 //! #    type Input = ();
 //! #    type Output = ();
-//! #    async fn execute(&self, input: Self::Input) -> TaskResult<Self::Output> {
+//! #    async fn execute(&self, _tx: Transaction<'_, Postgres>, input: Self::Input) -> TaskResult<Self::Output> {
 //! #        Ok(())
 //! #    }
 //! # }
@@ -90,7 +91,7 @@
 //! # /*
 //! let pool = { /* A `PgPool`. */ };
 //! # */
-//! # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
+//! # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
 //! let queue = Queue::builder()
 //!     .name("example_queue")
 //!     .pool(pool.clone())
@@ -129,18 +130,18 @@
 //! used to run the schedule via the [`Scheduler::run`](crate::Scheduler::run)
 //! method:
 //!
-//! ```rust
+//! ```rust,no_run
 //! # use tokio::runtime::Runtime;
 //! # use underway::Task;
 //! # use underway::task::Result as TaskResult;
-//! # use sqlx::PgPool;
+//! # use sqlx::{Transaction, Postgres, PgPool};
 //! use underway::{Queue, Scheduler};
 //!
 //! # struct MyTask;
 //! # impl Task for MyTask {
 //! #    type Input = ();
 //! #    type Output = ();
-//! #    async fn execute(&self, input: Self::Input) -> TaskResult<Self::Output> {
+//! #    async fn execute(&self, _tx: Transaction<'_, Postgres>, input: Self::Input) -> TaskResult<Self::Output> {
 //! #        Ok(())
 //! #    }
 //! # }
@@ -150,7 +151,7 @@
 //! # /*
 //! let pool = { /* A `PgPool`. */ };
 //! # */
-//! # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
+//! # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
 //! let queue = Queue::builder()
 //!     .name("example_queue")
 //!     .pool(pool.clone())
@@ -187,18 +188,18 @@
 //! **Note**: Tasks will not be deleted from the queue if this routine is not
 //! running!
 //!
-//! ```rust
+//! ```rust,no_run
 //! # use tokio::runtime::Runtime;
 //! # use underway::Task;
 //! # use underway::task::Result as TaskResult;
-//! # use sqlx::PgPool;
+//! # use sqlx::{Postgres, PgPool, Transaction};
 //! use underway::queue;
 //!
 //! # struct MyTask;
 //! # impl Task for MyTask {
 //! #    type Input = ();
 //! #    type Output = ();
-//! #    async fn execute(&self, input: Self::Input) -> TaskResult<Self::Output> {
+//! #    async fn execute(&self, _tx: Transaction<'_, Postgres>, input: Self::Input) -> TaskResult<Self::Output> {
 //! #        Ok(())
 //! #    }
 //! # }
@@ -208,7 +209,7 @@
 //! # /*
 //! let pool = { /* A `PgPool`. */ };
 //! # */
-//! # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
+//! # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
 //!
 //! // Ensure we remove tasks that have an expired TTL.
 //! queue::run_deletion(&pool).await?;

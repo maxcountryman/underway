@@ -41,7 +41,7 @@
 //!
 //! use serde::{Deserialize, Serialize};
 //! use sqlx::PgPool;
-//! use underway::{Job, Queue};
+//! use underway::{Job, Queue, StepState};
 //!
 //! const QUEUE_NAME: &str = "email";
 //!
@@ -66,15 +66,16 @@
 //!
 //!     // Build the job.
 //!     let job = Job::builder()
-//!         .execute(
-//!             |WelcomeEmail {
+//!         .step(
+//!             |_ctx,
+//!              WelcomeEmail {
 //!                  user_id,
 //!                  email,
 //!                  name,
 //!              }| async move {
 //!                 // Simulate sending an email.
 //!                 println!("Sending welcome email to {name} <{email}> (user_id: {user_id})");
-//!                 Ok(())
+//!                 StepState::done()
 //!             },
 //!         )
 //!         .queue(queue)
@@ -147,7 +148,7 @@
 use sqlx::migrate::Migrator;
 
 pub use crate::{
-    job::Job,
+    job::{Job, StepState},
     queue::Queue,
     scheduler::{Scheduler, ZonedSchedule},
     task::{Task, ToTaskResult},

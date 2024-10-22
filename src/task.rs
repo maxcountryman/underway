@@ -63,15 +63,16 @@
 //!         Ok(())
 //!     }
 //! }
-//! # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
-//! # let tx = pool.begin().await.unwrap();
+//! # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+//! # let tx = pool.begin().await?;
 //! # let task = WelcomeEmailTask;
 //! # let input = WelcomeEmail {
 //! #     user_id: 1,
 //! #     email: "user@example.com".to_string(),
 //! #     name: "Alice".to_string(),
 //! # };
-//! # task.execute(tx, input).await.unwrap();
+//! # task.execute(tx, input).await?;
+//! # Ok::<(), Box<dyn std::error::Error>>(())
 //! # });
 //! # }
 //! ```
@@ -130,13 +131,13 @@ pub enum Error {
 ///
 ///```rust
 /// use tokio::net;
-/// use underway::{Job, ToTaskResult};
+/// use underway::{Job, StepState, ToTaskResult};
 ///
-/// Job::<(), ()>::builder().execute(|_| async {
+/// Job::<(), ()>::builder().step(|_, _| async {
 ///     // If we can't resolve DNS the issue may be transient and recoverable.
 ///     net::lookup_host("example.com:80").await.retryable()?;
 ///
-///     Ok(())
+///     StepState::done()
 /// });
 /// ```
 ///
@@ -145,13 +146,13 @@ pub enum Error {
 /// ```rust
 /// use std::env;
 ///
-/// use underway::{Job, ToTaskResult};
+/// use underway::{Job, StepState, ToTaskResult};
 ///
-/// Job::<(), ()>::builder().execute(|_| async {
+/// Job::<(), ()>::builder().step(|_, _| async {
 ///     // If the API_KEY environment variable isn't set we can't recover.
 ///     let api_key = env::var("API_KEY").fatal()?;
 ///
-///     Ok(())
+///     StepState::done()
 /// });
 /// ```
 pub trait ToTaskResult<T> {
@@ -248,6 +249,7 @@ pub trait Task: Send + 'static {
     /// # Example
     ///
     /// ```rust
+    /// use sqlx::{Postgres, Transaction};
     /// use underway::{
     ///     task::{Result as TaskResult, RetryPolicy},
     ///     Task,
@@ -259,7 +261,11 @@ pub trait Task: Send + 'static {
     ///     type Input = ();
     ///     type Output = ();
     ///
-    ///     async fn execute(&self, _input: Self::Input) -> TaskResult<Self::Output> {
+    ///     async fn execute(
+    ///         &self,
+    ///         _tx: Transaction<'_, Postgres>,
+    ///         _input: Self::Input,
+    ///     ) -> TaskResult<Self::Output> {
     ///         Ok(())
     ///     }
     ///
@@ -287,6 +293,7 @@ pub trait Task: Send + 'static {
     ///
     /// ```rust
     /// use jiff::{Span, ToSpan};
+    /// use sqlx::{Postgres, Transaction};
     /// use underway::{task::Result as TaskResult, Task};
     ///
     /// struct MyImpatientTask;
@@ -295,7 +302,11 @@ pub trait Task: Send + 'static {
     ///     type Input = ();
     ///     type Output = ();
     ///
-    ///     async fn execute(&self, _input: Self::Input) -> TaskResult<Self::Output> {
+    ///     async fn execute(
+    ///         &self,
+    ///         _tx: Transaction<'_, Postgres>,
+    ///         _input: Self::Input,
+    ///     ) -> TaskResult<Self::Output> {
     ///         Ok(())
     ///     }
     ///
@@ -323,6 +334,7 @@ pub trait Task: Send + 'static {
     ///
     /// ```rust
     /// use jiff::{Span, ToSpan};
+    /// use sqlx::{Postgres, Transaction};
     /// use underway::{task::Result as TaskResult, Task};
     ///
     /// struct MyLongLivedTask;
@@ -331,7 +343,11 @@ pub trait Task: Send + 'static {
     ///     type Input = ();
     ///     type Output = ();
     ///
-    ///     async fn execute(&self, _input: Self::Input) -> TaskResult<Self::Output> {
+    ///     async fn execute(
+    ///         &self,
+    ///         _tx: Transaction<'_, Postgres>,
+    ///         _input: Self::Input,
+    ///     ) -> TaskResult<Self::Output> {
     ///         Ok(())
     ///     }
     ///
@@ -356,6 +372,7 @@ pub trait Task: Send + 'static {
     ///
     /// ```rust
     /// use jiff::{Span, ToSpan};
+    /// use sqlx::{Postgres, Transaction};
     /// use underway::{task::Result as TaskResult, Task};
     ///
     /// struct MyDelayedTask;
@@ -364,7 +381,11 @@ pub trait Task: Send + 'static {
     ///     type Input = ();
     ///     type Output = ();
     ///
-    ///     async fn execute(&self, _input: Self::Input) -> TaskResult<Self::Output> {
+    ///     async fn execute(
+    ///         &self,
+    ///         _tx: Transaction<'_, Postgres>,
+    ///         _input: Self::Input,
+    ///     ) -> TaskResult<Self::Output> {
     ///         Ok(())
     ///     }
     ///
@@ -397,6 +418,7 @@ pub trait Task: Send + 'static {
     /// ```rust
     /// use std::path::PathBuf;
     ///
+    /// use sqlx::{Postgres, Transaction};
     /// use underway::{task::Result as TaskResult, Task};
     ///
     /// struct MyUniqueTask(PathBuf);
@@ -405,7 +427,11 @@ pub trait Task: Send + 'static {
     ///     type Input = ();
     ///     type Output = ();
     ///
-    ///     async fn execute(&self, _input: Self::Input) -> TaskResult<Self::Output> {
+    ///     async fn execute(
+    ///         &self,
+    ///         _tx: Transaction<'_, Postgres>,
+    ///         _input: Self::Input,
+    ///     ) -> TaskResult<Self::Output> {
     ///         Ok(())
     ///     }
     ///
@@ -431,6 +457,7 @@ pub trait Task: Send + 'static {
     /// # Example
     ///
     /// ```rust
+    /// use sqlx::{Postgres, Transaction};
     /// use underway::{task::Result as TaskResult, Task};
     ///
     /// struct HighPriorityTask;
@@ -439,7 +466,11 @@ pub trait Task: Send + 'static {
     ///     type Input = ();
     ///     type Output = ();
     ///
-    ///     async fn execute(&self, _input: Self::Input) -> TaskResult<Self::Output> {
+    ///     async fn execute(
+    ///         &self,
+    ///         _tx: Transaction<'_, Postgres>,
+    ///         _input: Self::Input,
+    ///     ) -> TaskResult<Self::Output> {
     ///         Ok(())
     ///     }
     ///
