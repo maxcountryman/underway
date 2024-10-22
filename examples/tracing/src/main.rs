@@ -3,7 +3,7 @@ use std::env;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use underway::{Job, Queue};
+use underway::{Job, StepState};
 
 const QUEUE_NAME: &str = "example-tracing";
 
@@ -31,24 +31,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Run migrations.
     underway::MIGRATOR.run(&pool).await?;
 
-    // Create the task queue.
-    let queue = Queue::builder().name(QUEUE_NAME).pool(pool).build().await?;
-
     // Build the job.
     let job = Job::builder()
-        .execute(
-            |WelcomeEmail {
+        .step(
+            |_ctx,
+             WelcomeEmail {
                  user_id,
                  email,
                  name,
              }| async move {
                 // Simulate sending an email.
                 tracing::info!("Sending welcome email to {name} <{email}> (user_id: {user_id})");
-                Ok(())
+                StepState::done()
             },
         )
-        .queue(queue)
-        .build();
+        .name(QUEUE_NAME)
+        .pool(pool)
+        .build()
+        .await?;
 
     // Enqueue a job task.
     let task_id = job

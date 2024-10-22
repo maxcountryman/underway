@@ -1,7 +1,7 @@
 use std::env;
 
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use underway::{
     queue::Error as QueueError,
@@ -37,8 +37,9 @@ impl WelcomeEmailTask {
 
 impl Task for WelcomeEmailTask {
     type Input = WelcomeEmail;
+    type Output = ();
 
-    async fn execute(&self, input: Self::Input) -> TaskResult {
+    async fn execute(&self, _tx: Transaction<'_, Postgres>, input: Self::Input) -> TaskResult<()> {
         tracing::info!(?input, "Simulate sending a welcome email");
         Ok(())
     }
@@ -69,8 +70,9 @@ impl OrderTask {
 
 impl Task for OrderTask {
     type Input = Order;
+    type Output = ();
 
-    async fn execute(&self, input: Self::Input) -> TaskResult {
+    async fn execute(&self, _tx: Transaction<'_, Postgres>, input: Self::Input) -> TaskResult<()> {
         tracing::info!(?input, "Simulate order processing");
         Ok(())
     }
@@ -124,11 +126,12 @@ impl From<&OrderTask> for Multitask {
 
 impl Task for Multitask {
     type Input = TaskInput;
+    type Output = ();
 
-    async fn execute(&self, input: Self::Input) -> TaskResult {
+    async fn execute(&self, tx: Transaction<'_, Postgres>, input: Self::Input) -> TaskResult<()> {
         match input {
-            TaskInput::WelcomeEmail(input) => self.welcome_email.execute(input).await,
-            TaskInput::Order(input) => self.order.execute(input).await,
+            TaskInput::WelcomeEmail(input) => self.welcome_email.execute(tx, input).await,
+            TaskInput::Order(input) => self.order.execute(tx, input).await,
         }
     }
 
