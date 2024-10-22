@@ -22,14 +22,15 @@
 //! # use tokio::runtime::Runtime;
 //! # use underway::Task;
 //! # use underway::task::Result as TaskResult;
-//! # use sqlx::PgPool;
+//! # use sqlx::{PgPool, Transaction, Postgres};
+//! # use std::sync::Arc;
 //! use underway::{Queue, Worker};
 //!
 //! # struct MyTask;
 //! # impl Task for MyTask {
 //! #    type Input = ();
 //! #    type Output = ();
-//! #    async fn execute(&self, input: Self::Input) -> TaskResult<Self::Output> {
+//! #    async fn execute(&self, tx: Transaction<'_, Postgres>, input: Self::Input) -> TaskResult<Self::Output> {
 //! #        Ok(())
 //! #    }
 //! # }
@@ -47,9 +48,9 @@
 //!     .await?;
 //!
 //! # /*
-//! let task = { /* A type that implements `Task`. */ };
+//! let task = { /* An `Arc<Task>`. */ };
 //! # */
-//! # let task = MyTask;
+//! # let task = Arc::new(MyTask);
 //!
 //! // Create a new worker from the queue and task.
 //! let worker = Worker::new(queue, task);
@@ -458,7 +459,7 @@ pub(crate) fn pg_interval_to_span(
 mod tests {
     use std::{sync::Arc, time::Duration as StdDuration};
 
-    use sqlx::PgPool;
+    use sqlx::{PgPool, Postgres, Transaction};
     use tokio::sync::Mutex;
 
     use super::*;
@@ -473,7 +474,11 @@ mod tests {
         type Input = ();
         type Output = ();
 
-        async fn execute(&self, _: Self::Input) -> TaskResult<Self::Output> {
+        async fn execute(
+            &self,
+            _: Transaction<'_, Postgres>,
+            _: Self::Input,
+        ) -> TaskResult<Self::Output> {
             Ok(())
         }
     }
@@ -487,7 +492,11 @@ mod tests {
         type Input = ();
         type Output = ();
 
-        async fn execute(&self, _: Self::Input) -> TaskResult<Self::Output> {
+        async fn execute(
+            &self,
+            _: Transaction<'_, Postgres>,
+            _: Self::Input,
+        ) -> TaskResult<Self::Output> {
             let mut fail_times = self.fail_times.lock().await;
             if *fail_times > 0 {
                 *fail_times -= 1;
@@ -507,8 +516,8 @@ mod tests {
             .await?;
 
         // Enqueue a task.
-        let task = TestTask;
-        queue.enqueue(&pool, &task, ()).await?;
+        let task = Arc::new(TestTask);
+        queue.enqueue(&pool, &*task, ()).await?;
         assert!(queue.dequeue(&pool).await?.is_some());
 
         // Process the task.
@@ -530,9 +539,9 @@ mod tests {
             .await?;
 
         let fail_times = Arc::new(Mutex::new(2));
-        let task = FailingTask {
+        let task = Arc::new(FailingTask {
             fail_times: fail_times.clone(),
-        };
+        });
         let worker = Worker::new(queue.clone(), task.clone());
 
         // Enqueue the task
@@ -581,19 +590,25 @@ mod tests {
             type Input = ();
             type Output = ();
 
-            async fn execute(&self, _: Self::Input) -> TaskResult<Self::Output> {
+            async fn execute(
+                &self,
+                _: Transaction<'_, Postgres>,
+                _: Self::Input,
+            ) -> TaskResult<Self::Output> {
                 tokio::time::sleep(StdDuration::from_secs(1)).await;
                 Ok(())
             }
         }
 
+        let task = Arc::new(LongRunningTask);
+
         // Enqueue some tasks
         for _ in 0..5 {
-            queue.enqueue(&pool, &LongRunningTask, ()).await?;
+            queue.enqueue(&pool, &*task, ()).await?;
         }
 
         // Start workers
-        let worker = Worker::new(queue.clone(), LongRunningTask);
+        let worker = Worker::new(queue.clone(), task);
         for _ in 0..2 {
             let worker = worker.clone();
             tokio::spawn(async move { worker.run().await });

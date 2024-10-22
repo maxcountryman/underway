@@ -433,7 +433,7 @@ type JobQueue<T, S> = Queue<Job<T, S>>;
 ///
 /// Step index is used to select the step to execute and step input is provide
 /// to the selected function.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct JobState {
     step_index: usize,
     step_input: serde_json::Value,
@@ -1103,115 +1103,151 @@ where
 mod tests {
     use std::sync::Mutex;
 
-    use jiff::ToSpan;
     use serde::{Deserialize, Serialize};
     use sqlx::PgPool;
 
     use super::*;
-    use crate::queue::graceful_shutdown;
+    use crate::{queue::graceful_shutdown, task::State as TaskState};
 
     #[sqlx::test]
-    async fn create_job(pool: PgPool) -> sqlx::Result<(), Error> {
-        let queue = Queue::builder()
-            .name("create_job")
-            .pool(pool)
-            .build()
-            .await?;
-
-        #[derive(Clone, Serialize, Deserialize)]
+    async fn one_step(pool: PgPool) -> sqlx::Result<(), Error> {
+        #[derive(Serialize, Deserialize)]
         struct Input {
             message: String,
         }
 
         let job = Job::builder()
-            .execute(|input: Input| async move {
-                println!("Executing job with message: {}", input.message);
-                Ok(())
+            .step(|_ctx, Input { message }| async move {
+                println!("Executing job with message: {message}");
+                StepState::done()
             })
-            .retry_policy(RetryPolicy::default())
-            .timeout(5.minutes())
-            .ttl(1.day())
-            .delay(10.seconds())
-            .concurrency_key("test_key")
-            .priority(10)
-            .queue(queue.clone())
-            .build();
+            .name("one_step")
+            .pool(pool)
+            .build()
+            .await?;
 
-        // Assert that job properties are correctly set.
         assert_eq!(job.retry_policy(), RetryPolicy::default());
-        assert_eq!(job.timeout(), 5.minutes());
-        assert_eq!(job.ttl(), 1.day());
-        assert_eq!(job.delay(), 10.seconds());
-        assert_eq!(job.concurrency_key(), Some("test_key".to_string()));
-        assert_eq!(job.priority(), 10);
 
         Ok(())
     }
 
     #[sqlx::test]
-    async fn create_job_with_state(pool: PgPool) -> sqlx::Result<(), Error> {
-        let queue = Queue::builder()
-            .name("create_job")
+    async fn one_step_named(pool: PgPool) -> sqlx::Result<(), Error> {
+        #[derive(Serialize, Deserialize)]
+        struct Input {
+            message: String,
+        }
+
+        async fn step(_ctx: JobContext<()>, Input { message }: Input) -> TaskResult<StepState<()>> {
+            println!("Executing job with message: {message}");
+            StepState::done()
+        }
+
+        let job = Job::builder()
+            .step(step)
+            .name("one_step_named")
             .pool(pool)
             .build()
             .await?;
 
+        assert_eq!(job.retry_policy(), RetryPolicy::default());
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn one_step_with_state(pool: PgPool) -> sqlx::Result<(), Error> {
         #[derive(Clone)]
         struct State {
-            env: String,
+            data: String,
         }
 
-        #[derive(Clone, Serialize, Deserialize)]
+        #[derive(Serialize, Deserialize)]
         struct Input {
             message: String,
         }
 
         let job = Job::builder()
             .state(State {
-                env: "test".to_string(),
+                data: "data".to_string(),
             })
-            .execute(|input: Input, state: State| async move {
+            .step(|ctx, Input { message }| async move {
                 println!(
-                    "Executing job with message: {} in environment {}",
-                    input.message, state.env
+                    "Executing job with message: {message} and state: {state}",
+                    state = ctx.state.data
                 );
-                Ok(())
+                StepState::done()
             })
-            .retry_policy(RetryPolicy::default())
-            .timeout(5.minutes())
-            .ttl(1.day())
-            .delay(10.seconds())
-            .concurrency_key("test_key")
-            .priority(10)
-            .queue(queue.clone())
-            .build();
+            .name("one_step_with_state")
+            .pool(pool)
+            .build()
+            .await?;
 
-        // Assert that job properties are correctly set.
         assert_eq!(job.retry_policy(), RetryPolicy::default());
-        assert_eq!(job.timeout(), 5.minutes());
-        assert_eq!(job.ttl(), 1.day());
-        assert_eq!(job.delay(), 10.seconds());
-        assert_eq!(job.concurrency_key(), Some("test_key".to_string()));
-        assert_eq!(job.priority(), 10);
 
         Ok(())
     }
 
     #[sqlx::test]
-    async fn enqueue_job(pool: PgPool) -> sqlx::Result<(), Error> {
-        let queue = Queue::builder()
-            .name("enqueue_job")
+    async fn one_step_with_mutable_state(pool: PgPool) -> sqlx::Result<(), Error> {
+        #[derive(Clone)]
+        struct State {
+            data: Arc<Mutex<String>>,
+        }
+
+        let state = State {
+            data: Arc::new(Mutex::new("foo".to_string())),
+        };
+
+        let job = Job::builder()
+            .state(state.clone())
+            .step(|ctx, _| async move {
+                let mut data = ctx.state.data.lock().expect("Mutex should not be poisoned");
+                *data = "bar".to_string();
+                StepState::done()
+            })
+            .name("one_step_with_mutable_state")
             .pool(pool.clone())
             .build()
             .await?;
 
+        job.enqueue(()).await?;
+
+        job.start();
+
+        // Give the job a moment to process.
+        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+
+        assert_eq!(
+            *state.data.lock().expect("Mutex should not be poisoned"),
+            "bar".to_string()
+        );
+
+        // Shutdown and wait for a bit to ensure the test can exit.
+        tokio::spawn(async move { graceful_shutdown(&pool).await });
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn one_step_enqueue(pool: PgPool) -> sqlx::Result<(), Error> {
         #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
         struct Input {
             message: String,
         }
 
+        let queue = Queue::builder()
+            .name("one_step_enqueue")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
         let job = Job::builder()
-            .execute(|_: Input| async { Ok(()) })
+            .step(|_ctx, Input { message }| async move {
+                println!("Executing job with message: {message}");
+                StepState::done()
+            })
             .queue(queue.clone())
             .build();
 
@@ -1226,23 +1262,26 @@ mod tests {
 
         assert_eq!(task_id, dequeued_task.id);
         assert_eq!(
-            input,
-            serde_json::from_value::<Input>(dequeued_task.input).unwrap(),
+            JobState {
+                step_index: 0,
+                step_input: serde_json::to_value(input).unwrap()
+            },
+            serde_json::from_value(dequeued_task.input).unwrap()
         );
 
         Ok(())
     }
 
     #[sqlx::test]
-    async fn schedule_job(pool: PgPool) -> sqlx::Result<(), Error> {
+    async fn one_step_schedule(pool: PgPool) -> sqlx::Result<(), Error> {
         let queue = Queue::builder()
-            .name("schedule_job")
+            .name("one_step_schedule")
             .pool(pool.clone())
             .build()
             .await?;
 
         let job = Job::builder()
-            .execute(|_: ()| async { Ok(()) })
+            .step(|_, _| async { StepState::done() })
             .queue(queue.clone())
             .build();
 
@@ -1251,7 +1290,10 @@ mod tests {
             .expect("A valid zoned scheduled should be provided");
         job.schedule(monthly, ()).await?;
 
-        let (schedule, _) = queue.task_schedule(&pool).await?;
+        let (schedule, _) = queue
+            .task_schedule(&pool)
+            .await?
+            .expect("A schedule should be set");
 
         assert_eq!(
             schedule,
@@ -1264,44 +1306,250 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn shared_mutable_state(pool: PgPool) -> sqlx::Result<(), Error> {
+    async fn multi_step(pool: PgPool) -> sqlx::Result<(), Error> {
+        #[derive(Serialize, Deserialize)]
+        struct Step1 {
+            message: String,
+        }
+
+        #[derive(Serialize, Deserialize)]
+        struct Step2 {
+            data: Vec<u8>,
+        }
+
+        let job = Job::builder()
+            .step(|_ctx, Step1 { message }| async move {
+                println!("Executing job with message: {message}");
+                StepState::to_next(Step2 {
+                    data: message.as_bytes().into(),
+                })
+            })
+            .step(|_ctx, Step2 { data }| async move {
+                println!("Executing job with data: {data:?}");
+                StepState::done()
+            })
+            .name("multi_step")
+            .pool(pool)
+            .build()
+            .await?;
+
+        assert_eq!(job.retry_policy(), RetryPolicy::default());
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn multi_step_retry_policy(pool: PgPool) -> sqlx::Result<(), Error> {
+        #[derive(Serialize, Deserialize)]
+        struct Step1 {
+            message: String,
+        }
+
+        let step1_policy = RetryPolicy::builder().max_attempts(1).build();
+
+        #[derive(Serialize, Deserialize)]
+        struct Step2 {
+            data: Vec<u8>,
+        }
+
+        let step2_policy = RetryPolicy::builder().max_attempts(15).build();
+
         let queue = Queue::builder()
-            .name("shared_mutable_state")
+            .name("multi_step_retry_policy")
             .pool(pool.clone())
             .build()
             .await?;
 
-        #[derive(Clone)]
-        struct State {
-            data: Arc<Mutex<String>>,
-        }
-
-        let state = State {
-            data: Arc::new(Mutex::new("foo".to_string())),
-        };
-
         let job = Job::builder()
-            .state(state.clone())
-            .execute(|_: (), State { data }| async move {
-                let mut data = data.lock().unwrap();
-                *data = "bar".to_string();
-                Ok(())
+            .step(|_ctx, Step1 { message }| async move {
+                println!("Executing job with message: {message}");
+                StepState::to_next(Step2 {
+                    data: message.as_bytes().into(),
+                })
             })
-            .queue(queue)
+            .retry_policy(step1_policy)
+            .step(|_ctx, Step2 { data }| async move {
+                println!("Executing job with data: {data:?}");
+                StepState::done()
+            })
+            .retry_policy(step2_policy)
+            .queue(queue.clone())
             .build();
 
-        job.enqueue(()).await?;
+        assert_eq!(job.retry_policy(), step1_policy);
 
-        tokio::spawn(async move { job.run().await });
+        let input = Step1 {
+            message: "Hello, world!".to_string(),
+        };
+        let task_id = job.enqueue(input).await?;
 
-        // Wait for job to complete
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // Dequeue the first task.
+        let Some(dequeued_task) = queue.dequeue(&pool).await? else {
+            panic!("Task should exist");
+        };
 
-        assert_eq!(*state.data.lock().unwrap(), "bar".to_string());
+        assert_eq!(task_id, dequeued_task.id);
+        assert_eq!(dequeued_task.max_attempts, 1);
 
-        // Shutdown and wait for a bit to ensure the test can exit.
-        tokio::spawn(async move { graceful_shutdown(&pool).await });
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        // TODO: This really should be a method on `Queue`.
+        //
+        // Return the task back to the queue so we can process it with the worker.
+        sqlx::query!(
+            "update underway.task set state = $2 where id = $1",
+            dequeued_task.id,
+            TaskState::Pending as _
+        )
+        .execute(&pool)
+        .await?;
+
+        // Process the task to ensure the next task is enqueued.
+        let worker = {
+            let worker_job = Arc::new(job);
+            Worker::new(queue.clone(), worker_job)
+        };
+        worker.process_next_task().await?;
+
+        // Dequeue the second task.
+        let Some(dequeued_task) = queue.dequeue(&pool).await? else {
+            panic!("Next task should exist");
+        };
+
+        assert_eq!(dequeued_task.max_attempts, 15);
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn multi_step_with_state(pool: PgPool) -> sqlx::Result<(), Error> {
+        #[derive(Clone)]
+        struct State {
+            data: String,
+        }
+
+        #[derive(Serialize, Deserialize)]
+        struct Step1 {
+            message: String,
+        }
+
+        #[derive(Serialize, Deserialize)]
+        struct Step2 {
+            data: Vec<u8>,
+        }
+
+        let job = Job::builder()
+            .state(State {
+                data: "data".to_string(),
+            })
+            .step(|ctx, Step1 { message }| async move {
+                println!(
+                    "Executing job with message: {message} and state: {state}",
+                    state = ctx.state.data
+                );
+                StepState::to_next(Step2 {
+                    data: message.as_bytes().into(),
+                })
+            })
+            .step(|ctx, Step2 { data }| async move {
+                println!(
+                    "Executing job with data: {data:?} and state: {state}",
+                    state = ctx.state.data
+                );
+                StepState::done()
+            })
+            .name("multi_step_with_state")
+            .pool(pool)
+            .build()
+            .await?;
+
+        assert_eq!(job.retry_policy(), RetryPolicy::default());
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn multi_step_enqueue(pool: PgPool) -> sqlx::Result<(), Error> {
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+        struct Step1 {
+            message: String,
+        }
+
+        #[derive(Debug, Serialize, Deserialize, PartialEq)]
+        struct Step2 {
+            data: Vec<u8>,
+        }
+
+        let queue = Queue::builder()
+            .name("multi_step_enqueue")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let job = Job::builder()
+            .step(|_ctx, Step1 { message }| async move {
+                println!("Executing job with message: {message}",);
+                StepState::to_next(Step2 {
+                    data: message.as_bytes().into(),
+                })
+            })
+            .step(|_ctx, Step2 { data }| async move {
+                println!("Executing job with data: {data:?}");
+                StepState::done()
+            })
+            .queue(queue.clone())
+            .build();
+
+        let input = Step1 {
+            message: "Hello, world!".to_string(),
+        };
+        let task_id = job.enqueue(input.clone()).await?;
+
+        // Dequeue the first task.
+        let Some(dequeued_task) = queue.dequeue(&pool).await? else {
+            panic!("Task should exist");
+        };
+
+        assert_eq!(task_id, dequeued_task.id);
+        assert_eq!(
+            JobState {
+                step_index: 0,
+                step_input: serde_json::to_value(input).unwrap()
+            },
+            serde_json::from_value(dequeued_task.input).unwrap()
+        );
+
+        // TODO: This really should be a method on `Queue`.
+        //
+        // Return the task back to the queue so we can process it with the worker.
+        sqlx::query!(
+            "update underway.task set state = $2 where id = $1",
+            dequeued_task.id,
+            TaskState::Pending as _
+        )
+        .execute(&pool)
+        .await?;
+
+        // Process the task to ensure the next task is enqueued.
+        let worker = {
+            let worker_job = Arc::new(job);
+            Worker::new(queue.clone(), worker_job)
+        };
+        worker.process_next_task().await?;
+
+        // Dequeue the second task.
+        let Some(dequeued_task) = queue.dequeue(&pool).await? else {
+            panic!("Next task should exist");
+        };
+
+        let step2_input = Step2 {
+            data: "Hello, world!".to_string().as_bytes().into(),
+        };
+        assert_eq!(
+            JobState {
+                step_index: 1,
+                step_input: serde_json::to_value(step2_input).unwrap()
+            },
+            serde_json::from_value(dequeued_task.input).unwrap()
+        );
 
         Ok(())
     }

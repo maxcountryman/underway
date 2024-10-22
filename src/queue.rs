@@ -979,6 +979,8 @@ where
 mod tests {
     use std::collections::HashSet;
 
+    use sqlx::Transaction;
+
     use super::*;
     use crate::{task::Result as TaskResult, worker::pg_interval_to_span};
 
@@ -988,7 +990,11 @@ mod tests {
         type Input = serde_json::Value;
         type Output = ();
 
-        async fn execute(&self, _: Self::Input) -> TaskResult<Self::Output> {
+        async fn execute(
+            &self,
+            _: Transaction<'_, Postgres>,
+            _: Self::Input,
+        ) -> TaskResult<Self::Output> {
             Ok(())
         }
     }
