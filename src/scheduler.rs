@@ -42,12 +42,12 @@ pub struct Scheduler<T: Task> {
 
 impl<T: Task> Scheduler<T> {
     /// Creates a new scheduler.
-    pub fn new(queue: Queue<T>, task: Arc<T>) -> Self {
+    pub fn new(queue: Queue<T>, task: T) -> Self {
         let queue_lock = queue_scheduler_lock(&queue.name);
         Self {
             queue,
             queue_lock,
-            task,
+            task: Arc::new(task),
         }
     }
 

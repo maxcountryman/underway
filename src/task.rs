@@ -508,7 +508,7 @@ pub enum State {
 #[cfg(test)]
 mod tests {
     use serde::{Deserialize, Serialize};
-    use sqlx::{Acquire, PgPool};
+    use sqlx::PgPool;
 
     use super::*;
 

@@ -453,7 +453,8 @@ pub struct JobContext<S> {
 
 type StepConfig<S> = (Box<dyn StepExecutor<S>>, RetryPolicy);
 
-/// Ergnomic implementation of the `Task` trait.
+/// Sequential set of functions, where the output of the last is the input to
+/// the next.
 pub struct Job<I, S>
 where
     I: Sync + Send + 'static,
@@ -578,7 +579,7 @@ where
     /// Constructs a worker which then immediately runs task processing.
     pub async fn run_worker(self) -> WorkerResult {
         let queue = self.queue.clone();
-        let job = Arc::new(self);
+        let job = self.clone();
         let worker = Worker::new(queue, job);
         worker.run().await
     }
@@ -586,7 +587,7 @@ where
     /// Contructs a worker which then immediately runs schedule processing.
     pub async fn run_scheduler(self) -> SchedulerResult {
         let queue = self.queue.clone();
-        let job = Arc::new(self);
+        let job = self.clone();
         let scheduler = Scheduler::new(queue, job);
         scheduler.run().await
     }
@@ -594,7 +595,7 @@ where
     /// Runs both a worker and scheduler for the job.
     pub async fn run(self) -> Result {
         let queue = self.queue.clone();
-        let job = Arc::new(self);
+        let job = self.clone();
 
         let worker = Worker::new(queue.clone(), job.clone());
         let scheduler = Scheduler::new(queue, job);
@@ -707,6 +708,22 @@ where
         let current_index = self.current_index.load(Ordering::SeqCst);
         let (_, retry_policy) = self.steps[current_index];
         retry_policy
+    }
+}
+
+impl<I, S> Clone for Job<I, S>
+where
+    I: Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
+{
+    fn clone(&self) -> Self {
+        Self {
+            queue: self.queue.clone(),
+            state: self.state.clone(),
+            steps: self.steps.clone(),
+            current_index: self.current_index.clone(),
+            _marker: PhantomData,
+        }
     }
 }
 
@@ -1408,7 +1425,7 @@ mod tests {
 
         // Process the task to ensure the next task is enqueued.
         let worker = {
-            let worker_job = Arc::new(job);
+            let worker_job = job.clone();
             Worker::new(queue.clone(), worker_job)
         };
         worker.process_next_task().await?;
@@ -1537,7 +1554,7 @@ mod tests {
 
         // Process the task to ensure the next task is enqueued.
         let worker = {
-            let worker_job = Arc::new(job);
+            let worker_job = job.clone();
             Worker::new(queue.clone(), worker_job)
         };
         worker.process_next_task().await?;

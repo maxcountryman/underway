@@ -48,9 +48,9 @@
 //!     .await?;
 //!
 //! # /*
-//! let task = { /* An `Arc<Task>`. */ };
+//! let task = { /* An `Task`. */ };
 //! # */
-//! # let task = Arc::new(MyTask);
+//! # let task = MyTask;
 //!
 //! // Create a new worker from the queue and task.
 //! let worker = Worker::new(queue, task);
@@ -188,10 +188,10 @@ pub enum Error {
 
 impl<T: Task + Sync> Worker<T> {
     /// Creates a new worker with the given queue and task.
-    pub fn new(queue: Queue<T>, task: Arc<T>) -> Self {
+    pub fn new(queue: Queue<T>, task: T) -> Self {
         Self {
             queue,
-            task,
+            task: Arc::new(task),
             concurrency_limit: num_cpus::get(),
             queue_shutdown: Arc::new(false.into()),
         }
@@ -516,8 +516,8 @@ mod tests {
             .await?;
 
         // Enqueue a task.
-        let task = Arc::new(TestTask);
-        queue.enqueue(&pool, &*task, ()).await?;
+        let task = TestTask;
+        queue.enqueue(&pool, &task, ()).await?;
         assert!(queue.dequeue(&pool).await?.is_some());
 
         // Process the task.
@@ -539,9 +539,9 @@ mod tests {
             .await?;
 
         let fail_times = Arc::new(Mutex::new(2));
-        let task = Arc::new(FailingTask {
+        let task = FailingTask {
             fail_times: fail_times.clone(),
-        });
+        };
         let worker = Worker::new(queue.clone(), task.clone());
 
         // Enqueue the task
@@ -600,11 +600,11 @@ mod tests {
             }
         }
 
-        let task = Arc::new(LongRunningTask);
+        let task = LongRunningTask;
 
         // Enqueue some tasks
         for _ in 0..5 {
-            queue.enqueue(&pool, &*task, ()).await?;
+            queue.enqueue(&pool, &task, ()).await?;
         }
 
         // Start workers
