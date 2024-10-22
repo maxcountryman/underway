@@ -143,7 +143,6 @@
 //! See [`worker`] for more details about workers.
 
 #![warn(clippy::all, nonstandard_style, future_incompatible, missing_docs)]
-#![forbid(unsafe_code)]
 
 use sqlx::migrate::Migrator;
 

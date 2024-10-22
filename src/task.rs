@@ -24,7 +24,9 @@
 //!
 //! ```
 //! use serde::{Deserialize, Serialize};
+//! use sqlx::{Postgres, Transaction};
 //! use underway::{task::Result as TaskResult, Task};
+//! # use sqlx::PgPool;
 //! # use tokio::runtime::Runtime;
 //! # fn main() {
 //! # let rt = Runtime::new().unwrap();
@@ -46,7 +48,11 @@
 //!     type Output = ();
 //!
 //!     /// Simulate sending a welcome email by printing a message to the console.
-//!     async fn execute(&self, input: Self::Input) -> TaskResult<Self::Output> {
+//!     async fn execute(
+//!         &self,
+//!         _tx: Transaction<'_, Postgres>,
+//!         input: Self::Input,
+//!     ) -> TaskResult<Self::Output> {
 //!         println!(
 //!             "Sending welcome email to {} <{}> (user_id: {})",
 //!             input.name, input.email, input.user_id
@@ -57,13 +63,15 @@
 //!         Ok(())
 //!     }
 //! }
+//! # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
+//! # let tx = pool.begin().await.unwrap();
 //! # let task = WelcomeEmailTask;
 //! # let input = WelcomeEmail {
 //! #     user_id: 1,
 //! #     email: "user@example.com".to_string(),
 //! #     name: "Alice".to_string(),
 //! # };
-//! # task.execute(input).await.unwrap();
+//! # task.execute(tx, input).await.unwrap();
 //! # });
 //! # }
 //! ```
@@ -87,7 +95,7 @@ mod retry_policy;
 pub type Id = Uuid;
 
 /// A type alias for task execution results.
-pub type Result<O> = StdResult<O, Error>;
+pub type Result<T> = StdResult<T, Error>;
 
 /// Task errors.
 #[derive(Debug, thiserror::Error)]
@@ -189,7 +197,7 @@ pub trait Task: Send + 'static {
     ///
     /// ```
     /// use serde::{Deserialize, Serialize};
-    /// use sqlx::PgConnection;
+    /// use sqlx::{Postgres, Transaction};
     /// use underway::{task::Result as TaskResult, Task};
     ///
     /// // Task input representing the data needed to send a welcome email.
@@ -210,7 +218,7 @@ pub trait Task: Send + 'static {
     ///     /// Simulate sending a welcome email by printing a message to the console.
     ///     async fn execute(
     ///         &self,
-    ///         conn: &mut PgConnection,
+    ///         tx: Transaction<'_, Postgres>,
     ///         input: Self::Input,
     ///     ) -> TaskResult<Self::Output> {
     ///         println!(
@@ -224,9 +232,9 @@ pub trait Task: Send + 'static {
     ///     }
     /// }
     /// ```
-    fn execute<'a>(
+    fn execute(
         &self,
-        conn: Transaction<'a, Postgres>,
+        tx: Transaction<'_, Postgres>,
         input: Self::Input,
     ) -> impl Future<Output = Result<Self::Output>> + Send;
 
@@ -500,6 +508,7 @@ pub enum State {
 #[cfg(test)]
 mod tests {
     use serde::{Deserialize, Serialize};
+    use sqlx::{Acquire, PgPool};
 
     use super::*;
 
@@ -516,7 +525,7 @@ mod tests {
 
         async fn execute(
             &self,
-            _conn: &mut PgConnection,
+            _tx: Transaction<'_, Postgres>,
             input: Self::Input,
         ) -> Result<Self::Output> {
             println!("Executing task with message: {}", input.message);
@@ -527,25 +536,27 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn task_execution_success() {
+    #[sqlx::test]
+    async fn task_execution_success(pool: PgPool) {
         let task = TestTask;
         let input = TestTaskInput {
             message: "Hello, World!".to_string(),
         };
 
-        let result = task.execute(input).await;
+        let tx = pool.begin().await.unwrap();
+        let result = task.execute(tx, input).await;
         assert!(result.is_ok())
     }
 
-    #[tokio::test]
-    async fn task_execution_failure() {
+    #[sqlx::test]
+    async fn task_execution_failure(pool: PgPool) {
         let task = TestTask;
         let input = TestTaskInput {
             message: "fail".to_string(),
         };
 
-        let result = task.execute(input).await;
+        let tx = pool.begin().await.unwrap();
+        let result = task.execute(tx, input).await;
         assert!(result.is_err())
     }
 

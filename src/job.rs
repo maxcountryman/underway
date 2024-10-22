@@ -166,6 +166,7 @@
 //! Once a job has been enqueued, a worker must be run in order to process it.
 //! Workers can be consructed from tasks, such as jobs. Jobs also provide a
 //! convenience method, [`Job::run`], for constructing and running a worker:
+//!
 //! ```rust
 //! # use sqlx::PgPool;
 //! # use underway::Queue;
@@ -181,7 +182,7 @@
 //! #    .build()
 //! #    .await?;
 //! # let job = Job::builder()
-//! #    .execute(|_: ()| async move { Ok(()) })
+//! #    .steo(|_, _: ()| async move { Ok(()) })
 //! #    .queue(queue)
 //! #    .build();
 //! // Run the worker directly from the job.
@@ -288,15 +289,18 @@
 //! // The execute state type.
 //! #[derive(Clone)]
 //! struct State {
-//!     db_pool: PgPool,
+//!     data: String,
 //! }
 //!
 //! // Define the job with state.
 //! let job = Job::builder()
-//!     .state(State { db_pool: pool })
-//!     .execute(|ctx, _: Message| async move {
-//!         // Do something with our connection pool...
-//!         Ok(())
+//!     .state(State {
+//!         data: "Some shared data.".to_string(),
+//!     })
+//!     .step(|ctx, _: Message| async move {
+//!         // Use the state data in some way...
+//!         // ctx.state.data
+//!         StepState::done()
 //!     })
 //!     .queue(queue)
 //!     .build();
@@ -368,6 +372,7 @@
 use std::{
     future::Future,
     marker::PhantomData,
+    mem,
     pin::Pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -412,7 +417,7 @@ pub enum Error {
     #[error(transparent)]
     Join(#[from] tokio::task::JoinError),
 
-    /// Error return from serde_json.
+    /// Error returned from serde_json.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 
@@ -449,6 +454,13 @@ pub struct JobContext<S> {
     /// **Note:** State is not persisted and therefore should not be
     /// relied on when durability is needed.
     pub state: S,
+
+    /// A savepoint that originates from the worker executing the task.
+    ///
+    /// This is useful for ensuring atomicity: writes made to the database with
+    /// this handle are only realized if the worker succeeds in processing
+    /// the task.
+    pub tx: Transaction<'static, Postgres>,
 }
 
 /// Ergnomic implementation of the `Task` trait.
@@ -635,14 +647,30 @@ where
 
         let (step, _) = &self.steps[step_index];
 
+        // SAFETY:
+        //
+        // We are given a savepoint as `tx`, provided by the worker processing this
+        // task. The transaction this savepoint belongs to is static. Our task completes
+        // before that transaction and this savepoint would go out of scope. Therefore
+        // we can safely cast this lifetime to static.
+        //
+        // It's also important to point out that this is solely a workaround for the
+        // fact that trait objects and Higher-Rank Trait Bounds don't seem to play nice
+        // in this specific situation. (Where we're leveraging trait objects for dynamic
+        // dispatch.)
+        let step_tx: Transaction<'static, Postgres> = unsafe { mem::transmute_copy(&tx) };
+
         let ctx = JobContext {
             state: self.state.clone(),
+            tx: step_tx,
         };
 
         // Enqueue the next step if one is given.
-        if let Some((step_input, delay)) = step.execute_step(ctx, step_input).await? {
+        if let Some((next_input, delay)) = step.execute_step(ctx, step_input).await? {
+            let next_index = step_index + 1;
+
             // Advance current index after executing the step.
-            self.current_index.store(step_index + 1, Ordering::SeqCst);
+            self.current_index.store(next_index, Ordering::SeqCst);
 
             let next_job = Job {
                 queue: self.queue.clone(),
@@ -651,9 +679,10 @@ where
                 current_index: self.current_index.clone(),
                 _marker: PhantomData,
             };
+
             let next_job_input = JobState {
-                step_input,
-                step_index: step_index + 1,
+                step_input: next_input,
+                step_index: next_index,
             };
 
             self.queue
@@ -831,7 +860,7 @@ mod builder_states {
 }
 
 /// A builder for constructing a `Job` with a sequence of steps.
-pub struct Builder<I, O, S, B = Initial> {
+pub struct Builder<I, O, S, B> {
     builder_state: B,
     steps: Vec<(Box<dyn StepExecutor<S>>, RetryPolicy)>,
     _marker: PhantomData<(I, O, S)>,
@@ -891,7 +920,7 @@ impl<I, S> Builder<I, I, S, Initial> {
     }
 }
 
-// After state set.
+// After state set, before first step set.
 impl<I, S> Builder<I, I, S, StateSet<S>> {
     /// Add a step to the job.
     ///
@@ -919,6 +948,7 @@ impl<I, S> Builder<I, I, S, StateSet<S>> {
     }
 }
 
+// After first step set.
 impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
     /// Add a subsequent step to the job.
     ///

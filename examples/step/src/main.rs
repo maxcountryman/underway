@@ -1,6 +1,5 @@
 use std::env;
 
-use jiff::ToSpan;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -40,19 +39,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create our job.
     let job = Job::builder()
+        // Step 1: Start with an initial number `n`.
         .step(|_ctx, Start { n }| async move {
-            tracing::info!("Starting with: {n}");
+            tracing::info!("Starting computation with n = {n}");
+            // Proceed to the next step, passing the current state.
             StepState::to_next(Power { n })
         })
+        // Step 2: Compute the power of `n`.
         .step(|_ctx, Power { n }| async move {
-            tracing::info!("Squared: {n}");
-            let n = n % 10;
-
-            tracing::info!("The next step is delayed for five seconds");
-            StepState::delay_for(Modulo { n }, 5.seconds())
+            let squared = n.pow(2);
+            tracing::info!("Squared value: {n}^2 = {squared}");
+            // Proceed to the next step with the new state.
+            StepState::to_next(Modulo { n })
         })
+        // Step 3: Compute modulo of the result.
         .step(|_ctx, Modulo { n }| async move {
-            tracing::info!("Modulo 10 result: {n}");
+            let modulo_result = n % 10;
+            tracing::info!("Modulo 10 of {n} is {modulo_result}");
+            // Mark the job as done.
             StepState::done()
         })
         .name("example-step")
