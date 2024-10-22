@@ -471,7 +471,7 @@ where
     I: Serialize + Sync + Send + 'static,
     S: Clone + Send + Sync + 'static,
 {
-    fn job_input(&self, input: I) -> Result<JobState> {
+    fn first_job_input(&self, input: I) -> Result<JobState> {
         let step_input = serde_json::to_value(input)?;
         let step_index = self.current_index.load(Ordering::SeqCst);
         let job_id = Ulid::new().into();
@@ -539,8 +539,7 @@ where
     where
         E: PgExecutor<'a>,
     {
-        let job_input = self.job_input(input)?;
-
+        let job_input = self.first_job_input(input)?;
         let id = self
             .queue
             .enqueue_after(executor, self, job_input, delay)
@@ -568,7 +567,7 @@ where
     where
         E: PgExecutor<'a>,
     {
-        let job_input = self.job_input(input)?;
+        let job_input = self.first_job_input(input)?;
         self.queue
             .schedule(executor, zoned_schedule, job_input)
             .await?;
