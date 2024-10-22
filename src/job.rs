@@ -1,51 +1,52 @@
-//! Jobs are a higher-level abstraction over the [`Task`] trait.
+//! Jobs are one or more tasks, composed into a sequence.
 //!
-//! This interface is intended to make defining and operating jobs streamlined.
-//! While it's possible to implement the `Task` trait directly, it's generally
-//! not needed and instead `Job` can be used.
+//! Each task in a sequence is referred to as a step.
+//!
+//! Steps take input from the previous step, if there was one, and may either
+//! return a new step or a signifier of the terminal step.
+//!
+//! Notably, each step is executed independently, allowing for dependent state
+//! to be accumulated durably, without the need to repeat work after failure.
 //!
 //! # Defining jobs
 //!
 //! A builder is provided allowing applications to define the configuration of
-//! their jobs. Minimally an execute method must be provided. Reasonable
-//! defaults are provided for other configuration and these may be defined with
-//! their respective builder methods.
+//! their jobs. Minimally one step must be provided.
 //!
 //! ```rust
 //! # use sqlx::PgPool;
 //! # use underway::Queue;
 //! use serde::{Deserialize, Serialize};
-//! use underway::Job;
+//! use underway::{job::StepState, Job};
 //!
 //! # use tokio::runtime::Runtime;
 //! # fn main() {
 //! # let rt = Runtime::new().unwrap();
 //! # rt.block_on(async {
 //! # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
-//! # let queue = Queue::builder()
-//! #    .name("example_queue")
-//! #    .pool(pool)
-//! #    .build()
-//! #    .await?;
 //! # /*
-//! let queue = { /* The queue we've defined for our job */ };
+//! let pool = { /* A PgPool */ };
 //! # */
 //! #
 //!
-//! // The execute input type.
-//! #[derive(Clone, Serialize, Deserialize)]
+//! // The step input type.
+//! #[derive(Serialize, Deserialize)]
 //! struct Message {
 //!     content: String,
 //! }
 //!
 //! // Define the job.
 //! let job = Job::builder()
-//!     .execute(|Message { content }| async move {
+//!     .step(|_ctx, Message { content }| async move {
 //!         println!("Received: {content}");
-//!         Ok(())
+//!
+//!         // No more steps, so we're done
+//!         StepState::done()
 //!     })
-//!     .queue(queue)
-//!     .build();
+//!     .name("example")
+//!     .pool(pool)
+//!     .build()
+//!     .await?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! # });
 //! # }
@@ -56,40 +57,35 @@
 //! Of course the point of creating a job is to use it to do something useful
 //! for us. In order to do so, we need to enqueue some input onto the job's
 //! queue. [`Job::enqueue`] does exactly this:
-//!
 //! ```rust
 //! # use sqlx::PgPool;
-//! # use underway::Queue;
 //! use serde::{Deserialize, Serialize};
-//! use underway::Job;
+//! use underway::{job::StepState, Job};
 //!
 //! # use tokio::runtime::Runtime;
 //! # fn main() {
 //! # let rt = Runtime::new().unwrap();
 //! # rt.block_on(async {
 //! # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
-//! # let queue = Queue::builder()
-//! #    .name("example_queue")
-//! #    .pool(pool)
-//! #    .build()
-//! #    .await?;
 //! # /*
-//! let queue = { /* The queue we've defined for our job */ };
+//! let pool = { /* A `PgPool`. */ };
 //! # */
 //! #
 //!
-//! #[derive(Clone, Serialize, Deserialize)]
+//! #[derive(Serialize, Deserialize)]
 //! struct Order {
 //!     id: usize,
 //! }
 //!
 //! let job = Job::builder()
-//!     .execute(|Order { id }| async move {
+//!     .step(|_ctx, Order { id }| async move {
 //!         println!("Order ID: {id}");
-//!         Ok(())
+//!         StepState::done()
 //!     })
-//!     .queue(queue)
-//!     .build();
+//!     .name("example")
+//!     .pool(pool)
+//!     .build()
+//!     .await?;
 //!
 //! // Enqueue a new message.
 //! job.enqueue(Order { id: 42 }).await?;
@@ -98,7 +94,7 @@
 //! # }
 //! ```
 //!
-//! ## Transactional enqueue
+//! ## Atomicity
 //!
 //! Sometimes a job should only be enqueued when other conditions are met.
 //!
@@ -112,10 +108,9 @@
 //! transaction be rolled back, then our job won't be enqueued. (An ID will
 //! still be returned by this method, so it's up to our application to recognize
 //! when a failure has occurred and ignore any such IDs.)
-//!
 //! ```rust
 //! # use sqlx::PgPool;
-//! # use underway::Queue;
+//! # use underway::{Queue, job::StepState};
 //! # use serde::{Deserialize, Serialize};
 //! # use underway::Job;
 //! # use tokio::runtime::Runtime;
@@ -129,14 +124,14 @@
 //! #    .build()
 //! #    .await?;
 //! #
-//! # #[derive(Clone, Serialize, Deserialize)]
+//! # #[derive(Serialize, Deserialize)]
 //! # struct Order {
 //! #     id: usize,
 //! # }
 //! # let job = Job::builder()
-//! #     .execute(|Order { id }| async move {
+//! #     .step(|_ctx, Order { id }| async move {
 //! #         println!("Order ID: {id}");
-//! #         Ok(())
+//! #         StepState::done()
 //! #     })
 //! #     .queue(queue)
 //! #     .build();
@@ -166,11 +161,10 @@
 //! Once a job has been enqueued, a worker must be run in order to process it.
 //! Workers can be consructed from tasks, such as jobs. Jobs also provide a
 //! convenience method, [`Job::run`], for constructing and running a worker:
-//!
 //! ```rust
 //! # use sqlx::PgPool;
 //! # use underway::Queue;
-//! # use underway::Job;
+//! # use underway::{Job, job::StepState};
 //! # use tokio::runtime::Runtime;
 //! # fn main() {
 //! # let rt = Runtime::new().unwrap();
@@ -182,7 +176,7 @@
 //! #    .build()
 //! #    .await?;
 //! # let job = Job::builder()
-//! #    .steo(|_, _: ()| async move { Ok(()) })
+//! #    .step(|_, _: ()| async move { StepState::done() })
 //! #    .queue(queue)
 //! #    .build();
 //! // Run the worker directly from the job.
@@ -203,11 +197,11 @@
 //! that daylight saving time (DST) arithmetic is performed correctly. DST can
 //! introduce subtle scheduling errors, so by explicitly running schedules in
 //! the provided time zone we ensure to account for it.
-//!
 //! ```rust
 //! # use sqlx::PgPool;
 //! # use underway::Queue;
 //! # use underway::Job;
+//! # use underway::job::StepState;
 //! # use tokio::runtime::Runtime;
 //! # use serde::{Serialize, Deserialize};
 //! # fn main() {
@@ -225,7 +219,7 @@
 //!     report_title: String,
 //! }
 //! # let job = Job::builder()
-//! #     .execute(|_: JobConfig| async move { Ok(()) })
+//! #     .step(|_, _: JobConfig| async move { StepState::done() })
 //! #     .queue(queue)
 //! #     .build();
 //! #
@@ -258,12 +252,11 @@
 //!
 //! Note that when a state is provided, the execute function must take first the
 //! input and then the state.
-//!
 //! ```rust
 //! # use sqlx::PgPool;
 //! # use underway::Queue;
 //! use serde::{Deserialize, Serialize};
-//! use underway::Job;
+//! use underway::{job::StepState, Job};
 //!
 //! # use tokio::runtime::Runtime;
 //! # fn main() {
@@ -319,29 +312,23 @@
 //! is what you want and should be preferred.
 //! ```rust
 //! # use sqlx::PgPool;
-//! # use underway::Queue;
 //! use std::sync::{Arc, Mutex};
 //!
 //! use serde::{Deserialize, Serialize};
-//! use underway::Job;
+//! use underway::{job::StepState, Job};
 //!
 //! # use tokio::runtime::Runtime;
 //! # fn main() {
 //! # let rt = Runtime::new().unwrap();
 //! # rt.block_on(async {
 //! # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
-//! # let queue = Queue::builder()
-//! #    .name("example_queue")
-//! #    .pool(pool)
-//! #    .build()
-//! #    .await?;
 //! # /*
-//! let queue = { /* The queue we've defined for our job */ };
+//! let pool = { /* A `PgPool`. */ };
 //! # */
 //! #
 //!
 //! // The execute input type.
-//! #[derive(Clone, Serialize, Deserialize)]
+//! #[derive(Serialize, Deserialize)]
 //! struct Message {
 //!     content: String,
 //! }
@@ -357,13 +344,18 @@
 //!     .state(State {
 //!         data: Arc::new(Mutex::new("foo".to_string())),
 //!     })
-//!     .step(ctx, |_: Message| async move {
-//!         let mut data = ctx.state.data.lock().expect("Mutex should not be poisoned");
+//!     .step(|ctx, _: Message| async move {
+//!         let mut data = ctx.state.data.lock().expect(
+//!             "Mutex should not be
+//! poisoned",
+//!         );
 //!         *data = "bar".to_string();
-//!         Ok(())
+//!         StepState::done()
 //!     })
-//!     .queue(queue)
-//!     .build();
+//!     .name("example")
+//!     .pool(pool)
+//!     .build()
+//!     .await?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! # });
 //! # }
