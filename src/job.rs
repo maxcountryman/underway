@@ -377,6 +377,9 @@ use jiff::Span;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sqlx::{PgExecutor, PgPool, Postgres, Transaction};
 use tokio::task::JoinHandle;
+use tracing::instrument;
+use ulid::Ulid;
+use uuid::Uuid;
 
 use crate::{
     queue::{Error as QueueError, Queue},
@@ -429,16 +432,8 @@ type JobQueue<T, S> = Queue<Job<T, S>>;
 pub struct JobState {
     step_index: usize,
     step_input: serde_json::Value,
+    job_id: Uuid,
 } // TODO: Versioning?
-
-impl JobState {
-    fn new(step_input: serde_json::Value) -> Self {
-        Self {
-            step_index: 0,
-            step_input,
-        }
-    }
-}
 
 /// Context passed in to each step.
 pub struct JobContext<S> {
@@ -456,6 +451,8 @@ pub struct JobContext<S> {
     pub tx: Transaction<'static, Postgres>,
 }
 
+type StepConfig<S> = (Box<dyn StepExecutor<S>>, RetryPolicy);
+
 /// Ergnomic implementation of the `Task` trait.
 pub struct Job<I, S>
 where
@@ -463,7 +460,7 @@ where
     S: Clone + Sync + Send + 'static,
 {
     pub(crate) queue: JobQueue<I, S>,
-    steps: Arc<Vec<(Box<dyn StepExecutor<S>>, RetryPolicy)>>,
+    steps: Arc<Vec<StepConfig<S>>>,
     state: S,
     current_index: Arc<AtomicUsize>,
     _marker: PhantomData<I>,
@@ -474,6 +471,17 @@ where
     I: Serialize + Sync + Send + 'static,
     S: Clone + Send + Sync + 'static,
 {
+    fn job_input(&self, input: I) -> Result<JobState> {
+        let step_input = serde_json::to_value(input)?;
+        let step_index = self.current_index.load(Ordering::SeqCst);
+        let job_id = Ulid::new().into();
+        Ok(JobState {
+            step_input,
+            step_index,
+            job_id,
+        })
+    }
+
     /// Create a new job builder.
     pub fn builder() -> Builder<I, I, S, Initial> {
         Builder::new()
@@ -531,12 +539,11 @@ where
     where
         E: PgExecutor<'a>,
     {
-        let step_input = serde_json::to_value(input)?;
-        let input = JobState::new(step_input);
+        let job_input = self.job_input(input)?;
 
         let id = self
             .queue
-            .enqueue_after(executor, self, input, delay)
+            .enqueue_after(executor, self, job_input, delay)
             .await?;
 
         Ok(id)
@@ -561,9 +568,10 @@ where
     where
         E: PgExecutor<'a>,
     {
-        let step_input = serde_json::to_value(input)?;
-        let input = JobState::new(step_input);
-        self.queue.schedule(executor, zoned_schedule, input).await?;
+        let job_input = self.job_input(input)?;
+        self.queue
+            .schedule(executor, zoned_schedule, job_input)
+            .await?;
 
         Ok(())
     }
@@ -629,6 +637,7 @@ where
     type Input = JobState;
     type Output = ();
 
+    #[instrument(skip_all, fields(job.id = %input.job_id.as_hyphenated()), err)]
     async fn execute(
         &self,
         mut tx: Transaction<'_, Postgres>,
@@ -637,6 +646,7 @@ where
         let JobState {
             step_index,
             step_input,
+            job_id,
         } = input;
 
         if step_index >= self.steps.len() {
@@ -675,24 +685,16 @@ where
         if let Some((next_input, delay)) = step.execute_step(ctx, step_input).await? {
             // Advance current index after executing the step.
             let next_index = step_index + 1;
-
             self.current_index.store(next_index, Ordering::SeqCst);
-
-            let next_job = Job {
-                queue: self.queue.clone(),
-                steps: Arc::clone(&self.steps),
-                state: self.state.clone(),
-                current_index: self.current_index.clone(),
-                _marker: PhantomData,
-            };
 
             let next_job_input = JobState {
                 step_input: next_input,
                 step_index: next_index,
+                job_id,
             };
 
             self.queue
-                .enqueue_after(&mut *tx, &next_job, next_job_input, delay)
+                .enqueue_after(&mut *tx, self, next_job_input, delay)
                 .await
                 .map_err(|err| TaskError::Retryable(err.to_string()))?;
 
@@ -745,8 +747,8 @@ impl StepState<()> {
     }
 }
 
-/// A concrete implementation of a step using a closure.
-pub struct StepFn<I, O, S, F>
+// A concrete implementation of a step using a closure.
+struct StepFn<I, O, S, F>
 where
     F: Fn(JobContext<S>, I) -> Pin<Box<dyn Future<Output = TaskResult<StepState<O>>> + Send>>
         + Send
@@ -772,10 +774,10 @@ where
     }
 }
 
-/// A trait object wrapper for steps to allow heterogeneous step types in a
-/// vector.
-pub trait StepExecutor<S>: Send + Sync {
-    /// Execute the step with the given input serialized as JSON.
+// A trait object wrapper for steps to allow heterogeneous step types in a
+// vector.
+trait StepExecutor<S>: Send + Sync {
+    // Execute the step with the given input serialized as JSON.
     fn execute_step(
         &self,
         ctx: JobContext<S>,
@@ -1261,12 +1263,15 @@ mod tests {
         };
 
         assert_eq!(task_id, dequeued_task.id);
+
+        let job_state: JobState = serde_json::from_value(dequeued_task.input).unwrap();
         assert_eq!(
             JobState {
                 step_index: 0,
-                step_input: serde_json::to_value(input).unwrap()
+                step_input: serde_json::to_value(input).unwrap(),
+                job_id: job_state.job_id
             },
-            serde_json::from_value(dequeued_task.input).unwrap()
+            job_state
         );
 
         Ok(())
@@ -1509,12 +1514,15 @@ mod tests {
         };
 
         assert_eq!(task_id, dequeued_task.id);
+
+        let job_state: JobState = serde_json::from_value(dequeued_task.input).unwrap();
         assert_eq!(
             JobState {
                 step_index: 0,
-                step_input: serde_json::to_value(input).unwrap()
+                step_input: serde_json::to_value(input).unwrap(),
+                job_id: job_state.job_id
             },
-            serde_json::from_value(dequeued_task.input).unwrap()
+            job_state
         );
 
         // TODO: This really should be a method on `Queue`.
@@ -1543,12 +1551,14 @@ mod tests {
         let step2_input = Step2 {
             data: "Hello, world!".to_string().as_bytes().into(),
         };
+        let job_state: JobState = serde_json::from_value(dequeued_task.input).unwrap();
         assert_eq!(
             JobState {
                 step_index: 1,
-                step_input: serde_json::to_value(step2_input).unwrap()
+                step_input: serde_json::to_value(step2_input).unwrap(),
+                job_id: job_state.job_id
             },
-            serde_json::from_value(dequeued_task.input).unwrap()
+            job_state
         );
 
         Ok(())
