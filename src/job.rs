@@ -384,6 +384,7 @@ use builder_states::{Initial, PoolSet, QueueNameSet, QueueSet, StateSet, StepSet
 use jiff::Span;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sqlx::{PgExecutor, PgPool, Postgres, Transaction};
+use tokio::task::JoinHandle;
 
 use crate::{
     queue::{Error as QueueError, Queue},
@@ -503,7 +504,6 @@ where
     pub async fn enqueue_using<'a, E>(&self, executor: E, input: I) -> Result<TaskId>
     where
         E: PgExecutor<'a>,
-        I: Serialize,
     {
         self.enqueue_after_using(executor, input, Span::new()).await
     }
@@ -621,6 +621,12 @@ where
 
         Ok(())
     }
+
+    /// Same as [`run`](Job::run) but spawns the future and returns the
+    /// [`JoinHandle`].
+    pub fn start(self) -> JoinHandle<Result> {
+        tokio::spawn(async move { self.run().await })
+    }
 }
 
 impl<I, S> Task for Job<I, S>
@@ -667,9 +673,9 @@ where
 
         // Enqueue the next step if one is given.
         if let Some((next_input, delay)) = step.execute_step(ctx, step_input).await? {
+            // Advance current index after executing the step.
             let next_index = step_index + 1;
 
-            // Advance current index after executing the step.
             self.current_index.store(next_index, Ordering::SeqCst);
 
             let next_job = Job {

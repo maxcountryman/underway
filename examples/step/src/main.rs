@@ -68,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     job.enqueue(Start { n: 42 }).await?;
 
     // Run the job worker.
-    job.run().await?;
+    job.start().await??;
 
     Ok(())
 }
