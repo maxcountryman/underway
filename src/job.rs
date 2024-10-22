@@ -655,15 +655,23 @@ where
 
         // SAFETY:
         //
-        // We are given a savepoint as `tx`, provided by the worker processing this
-        // task. The transaction this savepoint belongs to is static. Our task completes
-        // before that transaction and this savepoint would go out of scope. Therefore
-        // we can safely cast this lifetime to static.
+        // We are extending the lifetime of `tx` to `'static` to satisfy the trait
+        // object requirements in `StepExecutor`. This is sound because:
         //
-        // It's also important to point out that this is solely a workaround for the
-        // fact that trait objects and Higher-Rank Trait Bounds don't seem to play nice
-        // in this specific situation. (Where we're leveraging trait objects for dynamic
-        // dispatch.)
+        // 1. The `execute` method awaits the future returned by `execute_step`
+        //    immediately, ensuring that `tx` remains valid during the entire operation.
+        // 2. `step_tx` does not escape the scope of the `execute` method; it is not
+        //    stored or moved elsewhere.
+        // 3. The `JobContext` and any data derived from `step_tx` are used only within
+        //    the `execute_step` method and its returned future.
+        //
+        // As a result, even though we are claiming a `'static` lifetime for `tx`, we
+        // ensure that it does not actually outlive its true lifetime, maintaining
+        // soundness.
+        //
+        // Note: This is a workaround due to limitations with trait objects and
+        // lifetimes in async contexts. Be cautious with any changes that might
+        // allow `step_tx` to outlive `tx`.
         let step_tx: Transaction<'static, Postgres> = unsafe { mem::transmute_copy(&tx) };
 
         let ctx = JobContext {
