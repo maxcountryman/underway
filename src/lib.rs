@@ -4,20 +4,18 @@
 //!
 //! Key Features:
 //!
-//! - **PostgreSQL-Backed** Built on PostgreSQL for robust task storage and
-//!   coordination, ensuring consistency and safe concurrency across all
-//!   operations.
-//! - **Transactional Task Management** Supports enqueuing tasks within existing
-//!   database transactions, guaranteeing that tasks are only added if the
-//!   transaction commits successfully—perfect for operations like user
-//!   registration.
-//! - **Automatic Retries** Offers customizable retry strategies for failed
-//!   executions, ensuring tasks are reliably completed even after transient
-//!   failures.
-//! - **Cron-Like Scheduling** Supports scheduling recurring tasks with
-//!   cron-like expressions, enabling automated, time-based job execution.
-//! - **Scalable and Flexible** Scales from a single worker to multiple workers
-//!   with minimal configuration, allowing seamless background job processing.
+//! - **PostgreSQL-Backed** Leverages PostgreSQL with `FOR UPDATE SKIP LOCKED`
+//!   for reliable task storage and coordination, ensuring efficient, safe
+//!   concurrency.
+//! - **Atomic Task Management**: Enqueue tasks within your transactions and use
+//!   the worker's transaction within your tasks for atomic database
+//!   queries—ensuring consistent workflows.
+//! - **Automatic Retries**: Configurable retry strategies ensure tasks are
+//!   reliably completed, even after transient failures.
+//! - **Cron-Like Scheduling**: Schedule recurring tasks with cron-like
+//!   expressions for automated, time-based job execution.
+//! - **Scalable and Flexible**: Easily scales from a single worker to many,
+//!   enabling seamless background job processing with minimal setup.
 //!
 //! # Overview
 //!
@@ -41,11 +39,9 @@
 //!
 //! use serde::{Deserialize, Serialize};
 //! use sqlx::PgPool;
-//! use underway::{Job, Queue, StepState};
+//! use underway::{Job, To};
 //!
-//! const QUEUE_NAME: &str = "email";
-//!
-//! #[derive(Debug, Clone, Deserialize, Serialize)]
+//! #[derive(Deserialize, Serialize)]
 //! struct WelcomeEmail {
 //!     user_id: i32,
 //!     email: String,
@@ -61,9 +57,6 @@
 //!     // Run migrations.
 //!     underway::MIGRATOR.run(&pool).await?;
 //!
-//!     // Create the task queue.
-//!     let queue = Queue::builder().name(QUEUE_NAME).pool(pool).build().await?;
-//!
 //!     // Build the job.
 //!     let job = Job::builder()
 //!         .step(
@@ -75,11 +68,13 @@
 //!              }| async move {
 //!                 // Simulate sending an email.
 //!                 println!("Sending welcome email to {name} <{email}> (user_id: {user_id})");
-//!                 StepState::done()
+//!                 To::done()
 //!             },
 //!         )
-//!         .queue(queue)
-//!         .build();
+//!         .name("welcome-email")
+//!         .pool(pool)
+//!         .build()
+//!         .await?;
 //!
 //!     // Enqueue a task.
 //!     let task_id = job
@@ -92,12 +87,80 @@
 //!
 //!     println!("Enqueued task with ID: {}", task_id);
 //!
-//!     // Start the worker to process tasks.
-//!     job.run().await?;
+//!     // Start processing enqueued tasks.
+//!     job.start().await??;
 //!
 //!     Ok(())
 //! }
 //! ```
+//!
+//! Another common use case is doing something after some expensive bit of work
+//! has been done with that output. For instance, we might generate PDF receipts
+//!  of orders and then send these via email to our customers. Because jobs are
+//! a series of sequential steps, we can write a job that handles PDF generation
+//! and then sends a receipt email.
+//!
+//! ```rust,no_run
+//! use std::env;
+//!
+//! use serde::{Deserialize, Serialize};
+//! use sqlx::PgPool;
+//! use underway::{Job, To};
+//!
+//! #[derive(Deserialize, Serialize)]
+//! struct GenerateReceipt {
+//!     // The order we want to generate a receipt for.
+//!     order_id: i32,
+//! }
+//!
+//! #[derive(Deserialize, Serialize)]
+//! struct EmailReceipt {
+//!     // The object store key to our receipt PDF.
+//!     receipt_key: String,
+//! }
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     // Set up the database connection pool.
+//!     let database_url = &env::var("DATABASE_URL").expect("DATABASE_URL should be set");
+//!     let pool = PgPool::connect(database_url).await?;
+//!
+//!     // Run migrations.
+//!     underway::MIGRATOR.run(&pool).await?;
+//!
+//!     // Build the job.
+//!     let job = Job::builder()
+//!         .step(|_ctx, GenerateReceipt { order_id }| async move {
+//!             // Use the order ID to build a receipt PDF...
+//!             // ...store the PDF in an object store.
+//!             let receipt_key = format!("receipts_bucket/{order_id}-receipt.pdf");
+//!             To::next(EmailReceipt { receipt_key })
+//!         })
+//!         .step(|_ctx, EmailReceipt { receipt_key }| async move {
+//!             // Retrieve the PDF from the object store, and send the email.
+//!             println!("Emailing receipt for {receipt_key}");
+//!             To::done()
+//!         })
+//!         .name("email-receipt")
+//!         .pool(pool)
+//!         .build()
+//!         .await?;
+//!
+//!     // Enqueue a task.
+//!     let task_id = job.enqueue(GenerateReceipt { order_id: 42 }).await?;
+//!
+//!     println!("Enqueued task with ID: {}", task_id);
+//!
+//!     // Start processing enqueued tasks.
+//!     job.start().await??;
+//!
+//!     Ok(())
+//! }
+//! ```
+//!
+//! If the email sending service is down, our email receipt step might fail. But
+//! because the receipt PDF has already been built, when we retry we'll only
+//! retry the email receipt step, without redoing the PDF generation step.
 //!
 //! # Concepts
 //!
@@ -105,7 +168,8 @@
 //! another to deliver a robust background-job framework:
 //!
 //! - [Tasks](#tasks) represent a well-structure unit of work.
-//! - [Jobs](#jobs) are a higher-level abstraction over the [`Task`] trait.
+//! - [Jobs](#jobs) are a series of sequential steps, where each step is a
+//!   [`Task`].
 //! - [Queues](#queues) provide an interface for managing task execution.
 //! - [Workers](#workers) interface with queues to execute tasks.
 //!
@@ -121,8 +185,8 @@
 //!
 //! ## Jobs
 //!
-//! Jobs are a specialized task which provide a higher-level API for defining
-//! and operating tasks.
+//! Jobs are a series of sequential steps. Each step provides input to the next
+//! step in the series.
 //!
 //! In most cases, applications will use jobs to define tasks instead of using
 //! the `Task` trait directly.
@@ -148,7 +212,7 @@
 use sqlx::migrate::Migrator;
 
 pub use crate::{
-    job::{Job, StepState},
+    job::{Job, To},
     queue::Queue,
     scheduler::{Scheduler, ZonedSchedule},
     task::{Task, ToTaskResult},
@@ -170,7 +234,7 @@ pub mod worker;
 ///
 /// # Example
 ///
-///```rust
+///```rust,no_run
 /// # use tokio::runtime::Runtime;
 /// use std::env;
 ///

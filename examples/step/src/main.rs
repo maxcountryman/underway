@@ -3,7 +3,7 @@ use std::env;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use underway::{job::StepState, Job};
+use underway::{Job, To};
 
 #[derive(Serialize, Deserialize)]
 struct Start {
@@ -43,21 +43,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .step(|_ctx, Start { n }| async move {
             tracing::info!("Starting computation with n = {n}");
             // Proceed to the next step, passing the current state.
-            StepState::to_next(Power { n })
+            To::next(Power { n })
         })
         // Step 2: Compute the power of `n`.
         .step(|_ctx, Power { n }| async move {
             let squared = n.pow(2);
             tracing::info!("Squared value: {n}^2 = {squared}");
             // Proceed to the next step with the new state.
-            StepState::to_next(Modulo { n })
+            To::next(Modulo { n })
         })
         // Step 3: Compute modulo of the result.
         .step(|_ctx, Modulo { n }| async move {
             let modulo_result = n % 10;
             tracing::info!("Modulo 10 of {n} is {modulo_result}");
             // Mark the job as done.
-            StepState::done()
+            To::done()
         })
         .name("example-step")
         .pool(pool)
@@ -68,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     job.enqueue(Start { n: 42 }).await?;
 
     // Run the job worker.
-    job.start().await??;
+    job.run().await?;
 
     Ok(())
 }

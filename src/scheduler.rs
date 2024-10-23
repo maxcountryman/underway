@@ -3,8 +3,12 @@ use std::{result::Result as StdResult, str::FromStr, sync::Arc, time::Duration a
 use jiff::{tz::TimeZone, Span, ToSpan, Zoned};
 use jiff_cron::Schedule;
 use sqlx::postgres::PgAdvisoryLock;
+use tracing::instrument;
 
-use crate::{queue::Error as QueueError, Queue, Task};
+use crate::{
+    queue::{try_acquire_advisory_lock, Error as QueueError},
+    Queue, Task,
+};
 
 pub(crate) type Result<T = ()> = std::result::Result<T, Error>;
 
@@ -58,11 +62,8 @@ impl<T: Task> Scheduler<T> {
 
     /// Runs the scheduler in a loop, sleeping for the given span per iteration.
     pub async fn run_every(&self, span: Span) -> Result {
-        let Some(_guard) = self
-            .queue
-            .try_acquire_advisory_lock(&self.queue_lock)
-            .await?
-        else {
+        let conn = self.queue.pool.acquire().await.map_err(QueueError::from)?;
+        let Some(_guard) = try_acquire_advisory_lock(conn, &self.queue_lock).await? else {
             tracing::warn!("Scheduler lock could not be acquired, scheduler exiting");
             return Ok(());
         };
@@ -75,15 +76,27 @@ impl<T: Task> Scheduler<T> {
         }
     }
 
+    #[instrument( skip(self),
+        fields(
+            queue.name = self.queue.name,
+            task.id = tracing::field::Empty,
+        ),
+        err
+    )]
     async fn process_next_schedule(&self) -> Result {
         if let Some((zoned_schedule, input)) = self.queue.task_schedule(&self.queue.pool).await? {
             if let Some(until_next) = zoned_schedule.duration_until_next() {
+                tracing::debug!(?until_next, "Waiting until the next schedule");
+
                 // Wait until the next schedule would fire.
                 tokio::time::sleep(until_next).await;
 
-                self.queue
+                let task_id = self
+                    .queue
                     .enqueue(&self.queue.pool, &self.task, input)
                     .await?;
+
+                tracing::Span::current().record("task.id", task_id.as_hyphenated().to_string());
             }
         }
 

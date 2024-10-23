@@ -224,9 +224,8 @@ use std::{marker::PhantomData, time::Duration as StdDuration};
 use builder_states::{Initial, NameSet, PoolSet};
 use jiff::{Span, ToSpan};
 use sqlx::{
-    pool::PoolConnection,
     postgres::{PgAdvisoryLock, PgAdvisoryLockGuard},
-    Acquire, PgExecutor, PgPool, Postgres,
+    Acquire, PgConnection, PgExecutor, PgPool, Postgres,
 };
 use tracing::instrument;
 use ulid::Ulid;
@@ -359,7 +358,12 @@ impl<T: Task> Queue<T> {
 
     // Explicitly provide for a delay so that we can also facilitate calculated
     // retries, i.e. `enqueue_after`.
-    #[instrument(name = "enqueue", skip(self, executor, task, input), fields(task.id = tracing::field::Empty), err)]
+    #[instrument(
+        name = "enqueue",
+        skip(self, executor, task, input),
+        fields(queue.name = self.name, task.id = tracing::field::Empty),
+        err
+    )]
     async fn enqueue_with_delay<'a, E>(
         &self,
         executor: E,
@@ -445,7 +449,11 @@ impl<T: Task> Queue<T> {
     ///
     /// - The database operation fails during select.
     /// - The database operation fails during update.
-    #[instrument(skip(self, conn), fields(task.id = tracing::field::Empty), err)]
+    #[instrument(
+        skip(self, conn),
+        fields(queue.name = self.name, task.id = tracing::field::Empty),
+        err
+    )]
     pub async fn dequeue<'a, A>(&self, conn: A) -> Result<Option<DequeuedTask>>
     where
         A: Acquire<'a, Database = Postgres>,
@@ -502,7 +510,11 @@ impl<T: Task> Queue<T> {
     ///
     /// - The input value cannot be serialized.
     /// - The database operation fails during insert.
-    #[instrument(skip(self, executor, zoned_schedule, input), err)]
+    #[instrument(
+        skip(self, executor, zoned_schedule, input),
+        fields(queue.name = self.name),
+        err
+    )]
     pub async fn schedule<'a, E>(
         &self,
         executor: E,
@@ -567,7 +579,8 @@ impl<T: Task> Queue<T> {
         Ok(Some((zoned_schedule, input)))
     }
 
-    pub(crate) async fn create<'a, E>(executor: E, name: impl Into<String>) -> Result
+    #[instrument(skip(executor, name), fields(queue.name = name), err)]
+    pub(crate) async fn create<'a, E>(executor: E, name: &str) -> Result
     where
         E: PgExecutor<'a>,
     {
@@ -576,7 +589,7 @@ impl<T: Task> Queue<T> {
             insert into underway.task_queue (name) values ($1)
             on conflict do nothing
             "#,
-            name.into()
+            name
         )
         .execute(executor)
         .await?;
@@ -659,6 +672,11 @@ impl<T: Task> Queue<T> {
         Ok(())
     }
 
+    #[instrument(
+        skip(self, executor, task_id),
+        fields(queue.name = self.name, task.id = %task_id.as_hyphenated()),
+        err
+    )]
     pub(crate) async fn reschedule_task_for_retry<'a, E>(
         &self,
         executor: E,
@@ -777,32 +795,34 @@ impl<T: Task> Queue<T> {
 
         Ok(())
     }
+}
 
-    #[instrument(skip(self, executor), err)]
-    pub(crate) async fn lock_task<'a, E>(&self, executor: E, key: &str) -> Result
-    where
-        E: PgExecutor<'a>,
-    {
-        sqlx::query!("select pg_advisory_xact_lock(hashtext($1))", key)
-            .execute(executor)
-            .await?;
+#[instrument(skip(executor), err)]
+pub(crate) async fn acquire_advisory_xact_lock<'a, E>(executor: E, key: &str) -> Result
+where
+    E: PgExecutor<'a>,
+{
+    sqlx::query!("select pg_advisory_xact_lock(hashtext($1))", key)
+        .execute(executor)
+        .await?;
 
-        Ok(())
-    }
+    Ok(())
+}
 
-    #[instrument(skip(self), err)]
-    pub(crate) async fn try_acquire_advisory_lock<'a>(
-        &self,
-        lock: &'a PgAdvisoryLock,
-    ) -> Result<Option<PgAdvisoryLockGuard<'a, PoolConnection<Postgres>>>> {
-        let conn = self.pool.acquire().await?;
-        let guard = match lock.try_acquire(conn).await? {
-            sqlx::Either::Left(guard) => Some(guard),
-            sqlx::Either::Right(_) => None,
-        };
+#[instrument(skip(conn, lock), err)]
+pub(crate) async fn try_acquire_advisory_lock<'lock, C>(
+    conn: C,
+    lock: &'lock PgAdvisoryLock,
+) -> Result<Option<PgAdvisoryLockGuard<'lock, C>>>
+where
+    C: AsMut<PgConnection>,
+{
+    let guard = match lock.try_acquire(conn).await? {
+        sqlx::Either::Left(guard) => Some(guard),
+        sqlx::Either::Right(_) => None,
+    };
 
-        Ok(guard)
-    }
+    Ok(guard)
 }
 
 /// Runs deletion clean up of expired tasks in a loop, sleeping between
@@ -874,7 +894,7 @@ mod builder_states {
     }
 }
 
-/// A builder for [`Queue`].
+/// Builds a [`Queue`].
 #[derive(Debug)]
 pub struct Builder<T: Task, S> {
     state: S,
@@ -939,7 +959,7 @@ impl<T: Task> Builder<T, PoolSet> {
         Queue::<T>::create(&mut *tx, &state.name).await?;
 
         // Create the DLQ in the database if specified
-        if let Some(ref dlq_name) = state.dlq_name {
+        if let Some(dlq_name) = &state.dlq_name {
             Queue::<T>::create(&mut *tx, dlq_name).await?;
         }
 

@@ -1,55 +1,318 @@
-//! Jobs are one or more tasks, composed into a sequence.
+//! Jobs are a series of sequential steps, where each step is a [`Task`].
 //!
-//! Each task in a sequence is referred to as a step.
+//! Each step is given the output of the previous step as input. In other words,
+//! steps form a chain, where one step is linked to the next, until the last
+//! step is reached.
 //!
-//! Steps take input from the previous step, if there was one, and may either
-//! return a new step or a signifier of the terminal step.
-//!
-//! Notably, each step is executed independently, allowing for dependent state
-//! to be accumulated durably, without the need to repeat work after failure.
+//! Because each step is treated as its own task, steps are executed and then
+//! persisted, before the next task is enqueued. This means that when a step,
+//! the job will be resumed from where it was.
 //!
 //! # Defining jobs
 //!
-//! A builder is provided allowing applications to define the configuration of
-//! their jobs. Minimally one step must be provided.
+//! Jobs are formed from at least one step function.
 //!
-//! ```rust,no_run
-//! # use sqlx::PgPool;
-//! # use underway::Queue;
-//! use serde::{Deserialize, Serialize};
-//! use underway::{job::StepState, Job};
+//! ```rust
+//! use underway::{Job, To};
 //!
-//! # use tokio::runtime::Runtime;
-//! # fn main() {
-//! # let rt = Runtime::new().unwrap();
-//! # rt.block_on(async {
-//! # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
-//! # /*
-//! let pool = { /* A PgPool */ };
-//! # */
-//! #
+//! let job_builder = Job::<(), ()>::builder().step(|_ctx, _| async move { To::done() });
+//! ```
 //!
-//! // The step input type.
-//! #[derive(Serialize, Deserialize)]
-//! struct Message {
-//!     content: String,
+//! Instead of a closure, we could also use a named function.
+//!
+//! ```rust
+//! use underway::{job::Context, task::Result as TaskResult, Job, To};
+//!
+//! async fn named_step(_ctx: Context<()>, _: ()) -> TaskResult<To<()>> {
+//!     To::done()
 //! }
 //!
-//! // Define the job.
-//! let job = Job::builder()
-//!     .step(|_ctx, Message { content }| async move {
-//!         println!("Received: {content}");
+//! let job_builder = Job::<_, ()>::builder().step(named_step);
+//! ```
 //!
-//!         // No more steps, so we're done
-//!         StepState::done()
+//! Notice that the first argument to our function is [a context
+//! binding](crate::job::Context). This provides access to fields like
+//! [`state`](crate::job::Context::state) and
+//! [`tx`](crate::job::Context::tx).
+//!
+//! The second argument is a type we provide as input to the step. In our
+//! example it's the unit type. But if we were to specify another type it would
+//! be that.
+//!
+//! To give a step input, we need a type that's `Serialize` and `Deserialize`.
+//! This is because this input will be persisted by the database.
+//!
+//! ```rust
+//! use serde::{Deserialize, Serialize};
+//! use underway::{Job, To};
+//!
+//! // Our very own input type.
+//! #[derive(Serialize, Deserialize)]
+//! struct MyArgs {
+//!     name: String,
+//! };
+//!
+//! let job_builder =
+//!     Job::<_, ()>::builder().step(|_ctx, MyArgs { name }| async move { To::done() });
+//! ```
+//!
+//! Besides input, it's also important to point out that we return a specific
+//! type that indicates what to do next. So far, we've only had a single step
+//! and so we've returned [`To::done`].
+//!
+//! But jobs may be composed of any number of sequential steps. Each step is
+//! structured to take the output of the last step. By returning [`To::next`]
+//! with the input of the next step, we move on to that step.
+//!
+//! ```rust
+//! use serde::{Deserialize, Serialize};
+//! use underway::{Job, To};
+//!
+//! // Here's the input for our first step.
+//! #[derive(Serialize, Deserialize)]
+//! struct Step1 {
+//!     n: usize,
+//! };
+//!
+//! // And this is the input for our second step.
+//! #[derive(Serialize, Deserialize)]
+//! struct Step2 {
+//!     original: usize,
+//!     new: usize,
+//! };
+//!
+//! let job_builder = Job::<_, ()>::builder()
+//!     .step(|_ctx, Step1 { n }| async move {
+//!         println!("Got {n}");
+//!
+//!         // Go to the next step with step 2's input.
+//!         To::next(Step2 {
+//!             original: n,
+//!             new: n + 2,
+//!         })
 //!     })
-//!     .name("example")
-//!     .pool(pool)
-//!     .build()
-//!     .await?;
-//! # Ok::<(), Box<dyn std::error::Error>>(())
-//! # });
-//! # }
+//!     .step(|_ctx, Step2 { original, new }| async move {
+//!         println!("Was {original} now is {new}");
+//!
+//!         // No more steps, so we're done.
+//!         To::done()
+//!     });
+//! ```
+//!
+//! Inputs to steps are strongly typed and so the compiler will complain if we
+//! try to return a type that the next step isn't expecting.
+//!
+//! In the following example, we've made a mistake and tried to use `Step1` as
+//! the output of our first step. This will not compile.
+//!
+//! ```rust,compile_fail
+//! use serde::{Deserialize, Serialize};
+//! use underway::{Job, To};
+//!
+//! #[derive(Serialize, Deserialize)]
+//! struct Step1 {
+//!     n: usize,
+//! };
+//!
+//! #[derive(Serialize, Deserialize)]
+//! struct Step2 {
+//!     original: usize,
+//!     new: usize,
+//! };
+//!
+//! let job_builder = Job::<_, ()>::builder()
+//!     .step(|_ctx, Step1 { n }| async move {
+//!         println!("Got {n}");
+//!
+//!         // This is does not compile!
+//!         To::next(Step1 { n })
+//!     })
+//!     .step(|_ctx, Step2 { original, new }| async move {
+//!         println!("Was {original} now is {new}");
+//!         To::done()
+//!     });
+//! ```
+//!
+//! Often we want to immediately transition to the next step. However, there may
+//! be cases were we want to wait some time beforehand. We can return
+//! [`To::delay_for`] to express this.
+//!
+//! Like transitioning to the next step, we give the input still but also supply
+//! a delay as the second argument.
+//!
+//! ```rust
+//! use jiff::ToSpan;
+//! use serde::{Deserialize, Serialize};
+//! use underway::{Job, To};
+//!
+//! #[derive(Serialize, Deserialize)]
+//! struct Step1 {
+//!     n: usize,
+//! };
+//!
+//! #[derive(Serialize, Deserialize)]
+//! struct Step2 {
+//!     original: usize,
+//!     new: usize,
+//! };
+//!
+//! let job_builder = Job::<_, ()>::builder()
+//!     .step(|_ctx, Step1 { n }| async move {
+//!         println!("Got {n}");
+//!
+//!         // We aren't quite ready for the next step so we wait one hour.
+//!         To::delay_for(
+//!             Step2 {
+//!                 original: n,
+//!                 new: n + 2,
+//!             },
+//!             1.hour(),
+//!         )
+//!     })
+//!     .step(|_ctx, Step2 { original, new }| async move {
+//!         println!("Was {original} now is {new}");
+//!         To::done()
+//!     });
+//! ```
+//!
+//! A common use case is delaying a step until a specific time, whenever that
+//! might be from now. We can create a span from now until the desired future
+//! point.
+//!
+//! ```rust
+//! use jiff::Timestamp;
+//!
+//! let now = Timestamp::now().intz("America/Los_Angeles").unwrap();
+//! let until_tomorrow_morning = now
+//!     .tomorrow()
+//!     // Tomorrow morning at 9:30 AM in Los Angeles.
+//!     .and_then(|tomorrow| tomorrow.date().at(9, 30, 0, 0).intz("America/Los_Angeles"))
+//!     .and_then(|tomorrow_morning| now.until(&tomorrow_morning))
+//!     .unwrap();
+//! # assert!(until_tomorrow_morning.is_positive());
+//! ```
+//!
+//! Then this span may be used as our delay given to `To::delay`.
+//!
+//! # Stateful jobs
+//!
+//! So far, we've ignored the context binding. One reason we need it is to
+//! access shared state we've set on the job.
+//!
+//! State like this can be useful when there may be resources or configuration
+//! that all steps should have access to. The only requirement is that the state
+//! type be `Clone`, as it will be cloned into each step.
+//! ```rust
+//! use underway::{job::Context, Job, To};
+//!
+//! // A simple state that'll be provided to our steps.
+//! #[derive(Clone)]
+//! struct State {
+//!     data: String,
+//! }
+//!
+//! let state = State {
+//!     data: "data".to_string(),
+//! };
+//!
+//! let job_builder = Job::<(), _>::builder()
+//!     .state(state) // Here we've set the state.
+//!     .step(|Context { state, .. }, _| async move {
+//!         println!("State data is: {}", state.data);
+//!         To::done()
+//!     });
+//! ```
+//!
+//! For simplicity, we only have a single step. But in practice, state may be
+//! accessed by any step in a sequence.
+//!
+//! Note that state is not serialized to the database and therefore not
+//! persisted between process restarts. **State should not be used for durable
+//! data.**
+//!
+//! ## Shared mutable state
+//!
+//! It's possible to use state in shared mutable fashion via patterns for
+//! interior mutability like `Arc<Mutex<..>>`.
+//!
+//! However, **please use caution**: state is maintained between job executions
+//! and is not reset. This means that independent step executions, **including
+//! those that may have originated from different enqueues of the job**,
+//! will have access to the same state. For this reason, this pattern is
+//! discouraged.
+//!
+//! # Atomicity
+//!
+//! Apart from state, context also provides another useful field: a transaction
+//! that's shared wtih the worker. Access to this transaction means we can make
+//! updates to the database that are only visible if the execution itself
+//! succeeds and is the transaction is committed by the worker.
+//! ```rust
+//! use serde::{Deserialize, Serialize};
+//! use underway::{job::Context, Job, To};
+//!
+//! #[derive(Serialize, Deserialize)]
+//! struct UserSub {
+//!     user_id: i64,
+//! }
+//!
+//! let job_builder =
+//!     Job::<_, ()>::builder().step(|Context { mut tx, .. }, UserSub { user_id }| async move {
+//!         sqlx::query(
+//!             r#"
+//!             update user_id
+//!             set subscribed_at = now()
+//!             where id = $1
+//!             "#,
+//!         )
+//!         .bind(user_id)
+//!         .fetch_one(&mut *tx)
+//!         .await?;
+//!
+//!         tx.commit().await?;
+//!
+//!         To::done()
+//!     });
+//! ```
+//!
+//! The special thing about this code is that we've leveraged the transaction
+//! provided by the context to make an update to the user table. What this means
+//! is the execution either succeeds and this update becomes visible or it
+//! doesn't and it's like nothing ever happened.
+//!
+//! # Retry policies
+//!
+//! Steps being tasks also have associated retry policies. This policy inherits
+//! the default but can be providied for each step.
+//! ```rust
+//! use serde::{Deserialize, Serialize};
+//! use underway::{task::RetryPolicy, Job, To};
+//!
+//! #[derive(Serialize, Deserialize)]
+//! struct Step1 {
+//!     n: usize,
+//! };
+//!
+//! #[derive(Serialize, Deserialize)]
+//! struct Step2 {
+//!     original: usize,
+//!     new: usize,
+//! };
+//!
+//! let job_builder = Job::<_, ()>::builder()
+//!     .step(|_ctx, Step1 { n }| async move {
+//!         println!("Got {n}");
+//!         To::next(Step2 {
+//!             original: n,
+//!             new: n + 2,
+//!         })
+//!     })
+//!     .retry_policy(RetryPolicy::builder().max_attempts(1).build())
+//!     .step(|_ctx, Step2 { original, new }| async move {
+//!         println!("Was {original} now is {new}");
+//!         To::done()
+//!     })
+//!     .retry_policy(RetryPolicy::builder().max_interval_ms(15_000).build());
 //! ```
 //!
 //! # Getting work done
@@ -57,11 +320,10 @@
 //! Of course the point of creating a job is to use it to do something useful
 //! for us. In order to do so, we need to enqueue some input onto the job's
 //! queue. [`Job::enqueue`] does exactly this:
-//!
 //! ```rust,no_run
 //! # use sqlx::PgPool;
 //! use serde::{Deserialize, Serialize};
-//! use underway::{job::StepState, Job};
+//! use underway::{Job, To};
 //!
 //! # use tokio::runtime::Runtime;
 //! # fn main() {
@@ -81,7 +343,7 @@
 //! let job = Job::builder()
 //!     .step(|_ctx, Order { id }| async move {
 //!         println!("Order ID: {id}");
-//!         StepState::done()
+//!         To::done()
 //!     })
 //!     .name("example")
 //!     .pool(pool)
@@ -109,10 +371,9 @@
 //! transaction be rolled back, then our job won't be enqueued. (An ID will
 //! still be returned by this method, so it's up to our application to recognize
 //! when a failure has occurred and ignore any such IDs.)
-//!
 //! ```rust,no_run
 //! # use sqlx::PgPool;
-//! # use underway::{Queue, job::StepState};
+//! # use underway::{Queue, To};
 //! # use serde::{Deserialize, Serialize};
 //! # use underway::Job;
 //! # use tokio::runtime::Runtime;
@@ -133,7 +394,7 @@
 //! # let job = Job::builder()
 //! #     .step(|_ctx, Order { id }| async move {
 //! #         println!("Order ID: {id}");
-//! #         StepState::done()
+//! #         To::done()
 //! #     })
 //! #     .queue(queue)
 //! #     .build();
@@ -158,16 +419,24 @@
 //! # }
 //! ```
 //!
+//! ### Worker transaction
+//!
+//! All tasks are provided with a context that includes a handle to the
+//! transaction in which the worker is executing the task:
+//! [`Context.tx`](crate::job::Context::tx). This allows queries within the
+//! scope of your step functions to maintain full atomic visibility guarantees.
+//! In other words, if the worker's transaction fails, none of the updates made
+//! through this handle will be committed, and the database will revert to its
+//! original state.
+//!
 //! # Running jobs
 //!
 //! Once a job has been enqueued, a worker must be run in order to process it.
 //! Workers can be consructed from tasks, such as jobs. Jobs also provide a
 //! convenience method, [`Job::run`], for constructing and running a worker:
-//!
 //! ```rust,no_run
 //! # use sqlx::PgPool;
-//! # use underway::Queue;
-//! # use underway::{Job, job::StepState};
+//! # use underway::{Queue, Job, To};
 //! # use tokio::runtime::Runtime;
 //! # fn main() {
 //! # let rt = Runtime::new().unwrap();
@@ -179,7 +448,7 @@
 //! #    .build()
 //! #    .await?;
 //! # let job = Job::builder()
-//! #    .step(|_, _: ()| async move { StepState::done() })
+//! #    .step(|_, _: ()| async move { To::done() })
 //! #    .queue(queue)
 //! #    .build();
 //! // Run the worker directly from the job.
@@ -200,12 +469,9 @@
 //! that daylight saving time (DST) arithmetic is performed correctly. DST can
 //! introduce subtle scheduling errors, so by explicitly running schedules in
 //! the provided time zone we ensure to account for it.
-//!
 //! ```rust,no_run
 //! # use sqlx::PgPool;
-//! # use underway::Queue;
-//! # use underway::Job;
-//! # use underway::job::StepState;
+//! # use underway::{Queue, Job, To};
 //! # use tokio::runtime::Runtime;
 //! # use serde::{Serialize, Deserialize};
 //! # fn main() {
@@ -223,7 +489,7 @@
 //!     report_title: String,
 //! }
 //! # let job = Job::builder()
-//! #     .step(|_, _: JobConfig| async move { StepState::done() })
+//! #     .step(|_, _: JobConfig| async move { To::done() })
 //! #     .queue(queue)
 //! #     .build();
 //! #
@@ -256,12 +522,11 @@
 //!
 //! Note that when a state is provided, the execute function must take first the
 //! input and then the state.
-//!
 //! ```rust,no_run
 //! # use sqlx::PgPool;
 //! # use underway::Queue;
 //! use serde::{Deserialize, Serialize};
-//! use underway::{job::StepState, Job};
+//! use underway::{Job, To};
 //!
 //! # use tokio::runtime::Runtime;
 //! # fn main() {
@@ -298,7 +563,7 @@
 //!     .step(|ctx, _: Message| async move {
 //!         // Use the state data in some way...
 //!         // ctx.state.data
-//!         StepState::done()
+//!         To::done()
 //!     })
 //!     .queue(queue)
 //!     .build();
@@ -315,13 +580,12 @@
 //! If the mutex is held across await points then an async-aware lock (such as
 //! [`tokio::sync::Mutex`]) is needed. That said, generally a synchronous lock
 //! is what you want and should be preferred.
-//!
 //! ```rust,no_run
 //! # use sqlx::PgPool;
 //! use std::sync::{Arc, Mutex};
 //!
 //! use serde::{Deserialize, Serialize};
-//! use underway::{job::StepState, Job};
+//! use underway::{Job, To};
 //!
 //! # use tokio::runtime::Runtime;
 //! # fn main() {
@@ -356,7 +620,7 @@
 //! poisoned",
 //!         );
 //!         *data = "bar".to_string();
-//!         StepState::done()
+//!         To::done()
 //!     })
 //!     .name("example")
 //!     .pool(pool)
@@ -380,12 +644,12 @@ use std::{
 
 use builder_states::{Initial, PoolSet, QueueNameSet, QueueSet, StateSet, StepSet};
 use jiff::Span;
+use sealed::JobState;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sqlx::{PgExecutor, PgPool, Postgres, Transaction};
 use tokio::task::JoinHandle;
 use tracing::instrument;
 use ulid::Ulid;
-use uuid::Uuid;
 
 use crate::{
     queue::{Error as QueueError, Queue},
@@ -430,20 +694,11 @@ pub enum Error {
 
 type JobQueue<T, S> = Queue<Job<T, S>>;
 
-/// Represents the serialized state of the job.
-///
-/// Step index is used to select the step to execute and step input is provide
-/// to the selected function.
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
-pub struct JobState {
-    step_index: usize,
-    step_input: serde_json::Value,
-    job_id: Uuid,
-} // TODO: Versioning?
-
 /// Context passed in to each step.
-pub struct JobContext<S> {
+pub struct Context<S> {
     /// Shared step state.
+    ///
+    /// This value is set via [`state`](Builder::state).
     ///
     /// **Note:** State is not persisted and therefore should not be
     /// relied on when durability is needed.
@@ -454,10 +709,25 @@ pub struct JobContext<S> {
     /// This is useful for ensuring atomicity: writes made to the database with
     /// this handle are only realized if the worker succeeds in processing
     /// the task.
+    ///
+    /// Put another way, this savepoint is derived from the same transaction
+    /// that holds the lock on the underlying task row.
     pub tx: Transaction<'static, Postgres>,
 }
 
 type StepConfig<S> = (Box<dyn StepExecutor<S>>, RetryPolicy);
+
+mod sealed {
+    use serde::{Deserialize, Serialize};
+    use uuid::Uuid;
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    pub struct JobState {
+        pub step_index: usize,
+        pub step_input: serde_json::Value,
+        pub job_id: Uuid,
+    } // TODO: Versioning?
+}
 
 /// Sequential set of functions, where the output of the last is the input to
 /// the next.
@@ -466,7 +736,7 @@ where
     I: Sync + Send + 'static,
     S: Clone + Sync + Send + 'static,
 {
-    pub(crate) queue: JobQueue<I, S>,
+    queue: JobQueue<I, S>,
     steps: Arc<Vec<StepConfig<S>>>,
     state: S,
     current_index: Arc<AtomicUsize>,
@@ -643,7 +913,15 @@ where
     type Input = JobState;
     type Output = ();
 
-    #[instrument(skip_all, fields(job.id = %input.job_id.as_hyphenated()), err)]
+    #[instrument(
+        skip_all,
+        fields(
+            job.id = %input.job_id.as_hyphenated(), 
+            step = input.step_index + 1,
+            steps = self.steps.len()
+        ),
+        err
+    )]
     async fn execute(
         &self,
         mut tx: Transaction<'_, Postgres>,
@@ -682,7 +960,7 @@ where
         // allow `step_tx` to outlive `tx`.
         let step_tx: Transaction<'static, Postgres> = unsafe { mem::transmute_copy(&tx) };
 
-        let ctx = JobContext {
+        let ctx = Context {
             state: self.state.clone(),
             tx: step_tx,
         };
@@ -735,20 +1013,26 @@ where
 
 /// Represents the state after executing a step.
 #[derive(Deserialize, Serialize)]
-pub enum StepState<N> {
+pub enum To<N> {
     /// The next step to transition to.
     Next(N),
 
-    /// The next step to transition to, after the delay.
-    Delay((N, Span)),
+    /// The next step to transition to after the delay.
+    Delay {
+        /// The step itself.
+        next: N,
+
+        /// The delay before which the step will not be run.
+        delay: Span,
+    },
 
     /// The terminal state.
     Done,
 }
 
-impl<S> StepState<S> {
+impl<S> To<S> {
     /// Transitions from the current step to the next step.
-    pub fn to_next(step: S) -> TaskResult<Self> {
+    pub fn next(step: S) -> TaskResult<Self> {
         Ok(Self::Next(step))
     }
 
@@ -758,21 +1042,21 @@ impl<S> StepState<S> {
     /// The next step will be enqueued immediately, but won't be dequeued until
     /// the span has elapsed.
     pub fn delay_for(step: S, delay: Span) -> TaskResult<Self> {
-        Ok(Self::Delay((step, delay)))
+        Ok(Self::Delay { next: step, delay })
     }
 }
 
-impl StepState<()> {
+impl To<()> {
     /// Signals that this is the final step and no more steps will follow.
-    pub fn done() -> TaskResult<StepState<()>> {
-        Ok(StepState::Done)
+    pub fn done() -> TaskResult<To<()>> {
+        Ok(To::Done)
     }
 }
 
 // A concrete implementation of a step using a closure.
 struct StepFn<I, O, S, F>
 where
-    F: Fn(JobContext<S>, I) -> Pin<Box<dyn Future<Output = TaskResult<StepState<O>>> + Send>>
+    F: Fn(Context<S>, I) -> Pin<Box<dyn Future<Output = TaskResult<To<O>>> + Send>>
         + Send
         + Sync
         + 'static,
@@ -783,7 +1067,7 @@ where
 
 impl<I, O, S, F> StepFn<I, O, S, F>
 where
-    F: Fn(JobContext<S>, I) -> Pin<Box<dyn Future<Output = TaskResult<StepState<O>>> + Send>>
+    F: Fn(Context<S>, I) -> Pin<Box<dyn Future<Output = TaskResult<To<O>>> + Send>>
         + Send
         + Sync
         + 'static,
@@ -802,7 +1086,7 @@ trait StepExecutor<S>: Send + Sync {
     // Execute the step with the given input serialized as JSON.
     fn execute_step(
         &self,
-        ctx: JobContext<S>,
+        ctx: Context<S>,
         input: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = TaskResult<Option<(serde_json::Value, Span)>>> + Send>>;
 }
@@ -812,14 +1096,14 @@ where
     I: DeserializeOwned + Serialize + Send + Sync + 'static,
     O: Serialize + Send + Sync + 'static,
     S: Send + Sync + 'static,
-    F: Fn(JobContext<S>, I) -> Pin<Box<dyn Future<Output = TaskResult<StepState<O>>> + Send>>
+    F: Fn(Context<S>, I) -> Pin<Box<dyn Future<Output = TaskResult<To<O>>> + Send>>
         + Send
         + Sync
         + 'static,
 {
     fn execute_step(
         &self,
-        ctx: JobContext<S>,
+        ctx: Context<S>,
         input: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = TaskResult<Option<(serde_json::Value, Span)>>> + Send>> {
         let deserialized_input: I = match serde_json::from_value(input) {
@@ -830,19 +1114,22 @@ where
 
         Box::pin(async move {
             match fut.await {
-                Ok(StepState::Next(output)) => {
+                Ok(To::Next(output)) => {
                     let serialized_output = serde_json::to_value(output)
                         .map_err(|e| TaskError::Fatal(e.to_string()))?;
                     Ok(Some((serialized_output, Span::new())))
                 }
 
-                Ok(StepState::Delay((output, span))) => {
+                Ok(To::Delay {
+                    next: output,
+                    delay,
+                }) => {
                     let serialized_output = serde_json::to_value(output)
                         .map_err(|e| TaskError::Fatal(e.to_string()))?;
-                    Ok(Some((serialized_output, span)))
+                    Ok(Some((serialized_output, delay)))
                 }
 
-                Ok(StepState::Done) => Ok(None),
+                Ok(To::Done) => Ok(None),
 
                 Err(e) => Err(e),
             }
@@ -933,8 +1220,8 @@ impl<I, S> Builder<I, I, S, Initial> {
         I: DeserializeOwned + Serialize + Send + Sync + 'static,
         O: Serialize + Send + Sync + 'static,
         S: Send + Sync + 'static,
-        F: Fn(JobContext<S>, I) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = TaskResult<StepState<O>>> + Send + 'static,
+        F: Fn(Context<S>, I) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = TaskResult<To<O>>> + Send + 'static,
     {
         let step_fn = StepFn::new(move |ctx, input| Box::pin(func(ctx, input)));
         self.steps.push((Box::new(step_fn), RetryPolicy::default()));
@@ -961,8 +1248,8 @@ impl<I, S> Builder<I, I, S, StateSet<S>> {
         I: DeserializeOwned + Serialize + Send + Sync + 'static,
         O: Serialize + Send + Sync + 'static,
         S: Send + Sync + 'static,
-        F: Fn(JobContext<S>, I) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = TaskResult<StepState<O>>> + Send + 'static,
+        F: Fn(Context<S>, I) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = TaskResult<To<O>>> + Send + 'static,
     {
         let step_fn = StepFn::new(move |ctx, input| Box::pin(func(ctx, input)));
         self.steps.push((Box::new(step_fn), RetryPolicy::default()));
@@ -989,8 +1276,8 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
         Current: DeserializeOwned + Serialize + Send + Sync + 'static,
         New: Serialize + Send + Sync + 'static,
         S: Send + Sync + 'static,
-        F: Fn(JobContext<S>, Current) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = TaskResult<StepState<New>>> + Send + 'static,
+        F: Fn(Context<S>, Current) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = TaskResult<To<New>>> + Send + 'static,
     {
         let step_fn = StepFn::new(move |ctx, input| Box::pin(func(ctx, input)));
         self.steps.push((Box::new(step_fn), RetryPolicy::default()));
@@ -1143,7 +1430,7 @@ mod tests {
         let job = Job::builder()
             .step(|_ctx, Input { message }| async move {
                 println!("Executing job with message: {message}");
-                StepState::done()
+                To::done()
             })
             .name("one_step")
             .pool(pool)
@@ -1162,9 +1449,9 @@ mod tests {
             message: String,
         }
 
-        async fn step(_ctx: JobContext<()>, Input { message }: Input) -> TaskResult<StepState<()>> {
+        async fn step(_ctx: Context<()>, Input { message }: Input) -> TaskResult<To<()>> {
             println!("Executing job with message: {message}");
-            StepState::done()
+            To::done()
         }
 
         let job = Job::builder()
@@ -1200,7 +1487,7 @@ mod tests {
                     "Executing job with message: {message} and state: {state}",
                     state = ctx.state.data
                 );
-                StepState::done()
+                To::done()
             })
             .name("one_step_with_state")
             .pool(pool)
@@ -1228,7 +1515,7 @@ mod tests {
             .step(|ctx, _| async move {
                 let mut data = ctx.state.data.lock().expect("Mutex should not be poisoned");
                 *data = "bar".to_string();
-                StepState::done()
+                To::done()
             })
             .name("one_step_with_mutable_state")
             .pool(pool.clone())
@@ -1255,6 +1542,43 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn one_step_with_state_named(pool: PgPool) -> sqlx::Result<(), Error> {
+        #[derive(Clone)]
+        struct State {
+            data: String,
+        }
+
+        #[derive(Serialize, Deserialize)]
+        struct Input {
+            message: String,
+        }
+
+        async fn step(ctx: Context<State>, Input { message }: Input) -> TaskResult<To<()>> {
+            println!(
+                "Executing job with message: {message} and state: {data}",
+                data = ctx.state.data
+            );
+            To::done()
+        }
+
+        let state = State {
+            data: "data".to_string(),
+        };
+
+        let job = Job::builder()
+            .state(state)
+            .step(step)
+            .name("one_step_named")
+            .pool(pool)
+            .build()
+            .await?;
+
+        assert_eq!(job.retry_policy(), RetryPolicy::default());
+
+        Ok(())
+    }
+
+    #[sqlx::test]
     async fn one_step_enqueue(pool: PgPool) -> sqlx::Result<(), Error> {
         #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
         struct Input {
@@ -1270,7 +1594,7 @@ mod tests {
         let job = Job::builder()
             .step(|_ctx, Input { message }| async move {
                 println!("Executing job with message: {message}");
-                StepState::done()
+                To::done()
             })
             .queue(queue.clone())
             .build();
@@ -1308,7 +1632,7 @@ mod tests {
             .await?;
 
         let job = Job::builder()
-            .step(|_, _| async { StepState::done() })
+            .step(|_, _| async { To::done() })
             .queue(queue.clone())
             .build();
 
@@ -1347,13 +1671,13 @@ mod tests {
         let job = Job::builder()
             .step(|_ctx, Step1 { message }| async move {
                 println!("Executing job with message: {message}");
-                StepState::to_next(Step2 {
+                To::next(Step2 {
                     data: message.as_bytes().into(),
                 })
             })
             .step(|_ctx, Step2 { data }| async move {
                 println!("Executing job with data: {data:?}");
-                StepState::done()
+                To::done()
             })
             .name("multi_step")
             .pool(pool)
@@ -1390,14 +1714,14 @@ mod tests {
         let job = Job::builder()
             .step(|_ctx, Step1 { message }| async move {
                 println!("Executing job with message: {message}");
-                StepState::to_next(Step2 {
+                To::next(Step2 {
                     data: message.as_bytes().into(),
                 })
             })
             .retry_policy(step1_policy)
             .step(|_ctx, Step2 { data }| async move {
                 println!("Executing job with data: {data:?}");
-                StepState::done()
+                To::done()
             })
             .retry_policy(step2_policy)
             .queue(queue.clone())
@@ -1472,7 +1796,7 @@ mod tests {
                     "Executing job with message: {message} and state: {state}",
                     state = ctx.state.data
                 );
-                StepState::to_next(Step2 {
+                To::next(Step2 {
                     data: message.as_bytes().into(),
                 })
             })
@@ -1481,7 +1805,7 @@ mod tests {
                     "Executing job with data: {data:?} and state: {state}",
                     state = ctx.state.data
                 );
-                StepState::done()
+                To::done()
             })
             .name("multi_step_with_state")
             .pool(pool)
@@ -1514,13 +1838,13 @@ mod tests {
         let job = Job::builder()
             .step(|_ctx, Step1 { message }| async move {
                 println!("Executing job with message: {message}",);
-                StepState::to_next(Step2 {
+                To::next(Step2 {
                     data: message.as_bytes().into(),
                 })
             })
             .step(|_ctx, Step2 { data }| async move {
                 println!("Executing job with data: {data:?}");
-                StepState::done()
+                To::done()
             })
             .queue(queue.clone())
             .build();

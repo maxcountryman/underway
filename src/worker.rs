@@ -131,7 +131,7 @@ use tokio::{sync::Semaphore, task::JoinSet};
 use tracing::instrument;
 
 use crate::{
-    queue::{Error as QueueError, Queue, SHUTDOWN_CHANNEL},
+    queue::{acquire_advisory_xact_lock, Error as QueueError, Queue, SHUTDOWN_CHANNEL},
     task::{DequeuedTask, Error as TaskError, Id as TaskId, RetryCount, RetryPolicy, Task},
 };
 pub(crate) type Result = std::result::Result<(), Error>;
@@ -305,7 +305,14 @@ impl<T: Task + Sync> Worker<T> {
     /// is [explicitly fatal](crate::task::Error::Fatal) or no more retries are
     /// left, then the task will be re-queued in a
     /// [`Pending`](crate::task::State::Pending) state.
-    #[instrument(skip(self), fields(task.id = tracing::field::Empty), err)]
+    #[instrument(
+        skip(self), 
+        fields(
+            queue.name = self.queue.name,
+            task.id = tracing::field::Empty,
+        ),
+        err
+    )]
     pub async fn process_next_task(&self) -> Result {
         let mut tx = self.queue.pool.begin().await?;
 
@@ -316,7 +323,7 @@ impl<T: Task + Sync> Worker<T> {
             // Ensure that only one worker may process a task of a given concurrency key at
             // a time.
             if let Some(concurrency_key) = &task_row.concurrency_key {
-                self.queue.lock_task(&mut *tx, concurrency_key).await?;
+                acquire_advisory_xact_lock(&mut *tx, concurrency_key).await?;
             }
 
             let input: T::Input = serde_json::from_value(task_row.input.clone())?;
@@ -334,7 +341,7 @@ impl<T: Task + Sync> Worker<T> {
                         }
 
                         Err(err) => {
-                            self.handle_task_error(err, &mut tx, task_id, task_row)
+                            self.handle_task_error(&mut tx, task_id, task_row, err)
                                 .await?;
                         }
                     }
@@ -354,10 +361,10 @@ impl<T: Task + Sync> Worker<T> {
 
     async fn handle_task_error(
         &self,
-        err: TaskError,
         conn: &mut PgConnection,
         task_id: TaskId,
         dequeued_task: DequeuedTask,
+        err: TaskError,
     ) -> Result {
         tracing::error!(err = %err, "Task execution encountered an error");
 
