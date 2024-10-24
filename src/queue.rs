@@ -622,6 +622,7 @@ impl<T: Task> Queue<T> {
         Ok(())
     }
 
+    #[allow(dead_code)] // TODO: Revisit cancellation re jobs.
     pub(crate) async fn mark_task_cancelled<'a, E>(&self, executor: E, task_id: TaskId) -> Result
     where
         E: PgExecutor<'a>,
