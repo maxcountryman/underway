@@ -3,7 +3,7 @@ use std::env;
 use sqlx::PgPool;
 use tokio::signal;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use underway::{Job, StepState};
+use underway::{Job, To};
 
 const QUEUE_NAME: &str = "graceful-shutdown";
 
@@ -60,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Artificial delay to simulate a long-running job.
             tokio::time::sleep(sleep_duration).await;
 
-            StepState::done()
+            To::done()
         })
         .name(QUEUE_NAME)
         .pool(pool.clone())

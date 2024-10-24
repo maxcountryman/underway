@@ -1,7 +1,7 @@
 use std::env;
 
 use sqlx::PgPool;
-use underway::{Job, StepState};
+use underway::{Job, To};
 
 const QUEUE_NAME: &str = "example-scheduled";
 
@@ -18,7 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let job = Job::builder()
         .step(|_ctx, _input| async move {
             println!("Hello, World!");
-            StepState::done()
+            To::done()
         })
         .name(QUEUE_NAME)
         .pool(pool)

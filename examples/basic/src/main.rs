@@ -2,7 +2,7 @@ use std::env;
 
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use underway::{Job, StepState};
+use underway::{Job, To};
 
 const QUEUE_NAME: &str = "example-basic";
 
@@ -33,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              }| async move {
                 // Simulate sending an email.
                 println!("Sending welcome email to {name} <{email}> (user_id: {user_id})");
-                StepState::done()
+                To::done()
             },
         )
         .name(QUEUE_NAME)
