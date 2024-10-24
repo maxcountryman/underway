@@ -1,5 +1,12 @@
 # Unreleased
 
+# 0.0.5
+
+- Breaking: Tasks require an associated type Output
+- Breaking: Tasks require a transaction as their first execute argument
+- Breaking: Database locking methods are now free functions
+- Breaking: Job interface rewritten for step functions #24
+
 # 0.0.4
 
 - Breaking: Renamed builders to `Builder` #15
