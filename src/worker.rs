@@ -117,14 +117,12 @@
 //! For cases where it's unimportant to wait for tasks to complete, this routine
 //! can be ignored.
 
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::sync::Arc;
 
 use jiff::{Span, ToSpan};
+use serde::Deserialize;
 use sqlx::{
-    postgres::{types::PgInterval, PgListener},
+    postgres::{types::PgInterval, PgListener, PgNotification},
     Acquire, PgConnection,
 };
 use tokio::{sync::Semaphore, task::JoinSet};
@@ -135,30 +133,6 @@ use crate::{
     task::{DequeuedTask, Error as TaskError, Id as TaskId, RetryCount, RetryPolicy, Task},
 };
 pub(crate) type Result = std::result::Result<(), Error>;
-
-/// A worker that's generic over the task it processes.
-#[derive(Debug)]
-pub struct Worker<T: Task> {
-    queue: Queue<T>,
-    task: Arc<T>,
-
-    // Limits the number of concurrent `Task::execute` invocations this worker will be allowed.
-    concurrency_limit: usize,
-
-    // Indicates the underlying queue has received a shutdown signal.
-    queue_shutdown: Arc<AtomicBool>,
-}
-
-impl<T: Task> Clone for Worker<T> {
-    fn clone(&self) -> Self {
-        Self {
-            queue: self.queue.clone(),
-            task: self.task.clone(),
-            concurrency_limit: self.concurrency_limit,
-            queue_shutdown: self.queue_shutdown.clone(),
-        }
-    }
-}
 
 /// Worker errors.
 #[derive(Debug, thiserror::Error)]
@@ -185,6 +159,26 @@ pub enum Error {
     Jiff(#[from] jiff::Error),
 }
 
+/// A worker that's generic over the task it processes.
+#[derive(Debug)]
+pub struct Worker<T: Task> {
+    queue: Queue<T>,
+    task: Arc<T>,
+
+    // Limits the number of concurrent `Task::execute` invocations this worker will be allowed.
+    concurrency_limit: usize,
+}
+
+impl<T: Task> Clone for Worker<T> {
+    fn clone(&self) -> Self {
+        Self {
+            queue: self.queue.clone(),
+            task: self.task.clone(),
+            concurrency_limit: self.concurrency_limit,
+        }
+    }
+}
+
 impl<T: Task + Sync> Worker<T> {
     /// Creates a new worker with the given queue and task.
     pub fn new(queue: Queue<T>, task: T) -> Self {
@@ -192,7 +186,6 @@ impl<T: Task + Sync> Worker<T> {
             queue,
             task: Arc::new(task),
             concurrency_limit: num_cpus::get(),
-            queue_shutdown: Arc::new(false.into()),
         }
     }
 
@@ -206,20 +199,24 @@ impl<T: Task + Sync> Worker<T> {
 
     /// Runs the worker, processing tasks as they become available.
     ///
-    /// Tasks are processed via polling in a loop. A one-second sleep occurs
-    /// between polls.
+    /// Tasks are processed via a subscription to a Postgres channel and polling
+    /// in a loop. A one-minute sleep occurs between polls.
     pub async fn run(&self) -> Result {
-        self.run_every(1.second()).await
+        self.run_every(1.minute()).await
     }
 
-    /// Same as `run` but allows for the configuration of the span between
+    /// Same as `run` but allows for the configuration of the delay between
     /// polls.
-    pub async fn run_every(&self, span: Span) -> Result {
-        let mut interval = tokio::time::interval(span.try_into()?);
+    pub async fn run_every(&self, period: Span) -> Result {
+        let mut interval = tokio::time::interval(period.try_into()?);
 
         // Set up a listener for shutdown notifications
         let mut shutdown_listener = PgListener::connect_with(&self.queue.pool).await?;
         shutdown_listener.listen(SHUTDOWN_CHANNEL).await?;
+
+        // Set up a listener for task change notifications
+        let mut task_change_listener = PgListener::connect_with(&self.queue.pool).await?;
+        task_change_listener.listen("task_change").await?;
 
         let concurrency_limit = Arc::new(Semaphore::new(self.concurrency_limit));
         let mut processing_tasks = JoinSet::new();
@@ -227,69 +224,117 @@ impl<T: Task + Sync> Worker<T> {
         loop {
             tokio::select! {
                 notify_shutdown = shutdown_listener.recv() => {
-                    if let Err(err) = notify_shutdown {
-                        tracing::error!(%err, "Postgres notification error");
-                        continue;
-                    }
-
-                    self.queue_shutdown.store(true, Ordering::SeqCst);
-
-                    let task_timeout = self.task.timeout();
-
-                    tracing::info!(
-                        task.timeout = ?task_timeout,
-                        "Waiting for all processing tasks or timeout"
-                    );
-
-                    // Try to join all the processing tasks before the task timeout.
-                    let shutdown_result = tokio::time::timeout(
-                        task_timeout.try_into()?,
-                        async {
-                            while let Some(res) = processing_tasks.join_next().await {
-                                if let Err(err) = res {
-                                    tracing::error!(%err, "A processing task failed during shutdown");
-                                }
-                            }
-                        }
-                    ).await;
-
-                    match shutdown_result {
+                    match notify_shutdown {
                         Ok(_) => {
-                            tracing::debug!("All processing tasks completed gracefully");
+                            self.handle_shutdown(&mut processing_tasks).await?;
+                            break
                         },
-                        Err(_) => {
-                            let remaining_tasks = processing_tasks.len();
-                            tracing::warn!(remaining_tasks, "Reached task timeout before all tasks completed");
-                        },
-                    }
 
-                    break;
+                        Err(err) => {
+                            tracing::error!(%err, "Postgres shutdown notification error");
+                            continue
+                        }
+                    }
                 },
 
-                _ = interval.tick() => {
-                    if self.queue_shutdown.load(Ordering::SeqCst) {
-                        tracing::info!("Queue is shutdown so no new tasks will be processed");
-                        break;
-                    }
+                notify_task_change = task_change_listener.recv() => {
+                    match notify_task_change {
+                        Ok(task_change) => self.handle_task_change(task_change, concurrency_limit.clone(), &mut processing_tasks).await?,
 
-                    let permit = concurrency_limit.clone().acquire_owned().await.expect("Concurrency limit semaphore should be open");
-                    processing_tasks.spawn({
-                        // TODO: Rather than clone the worker, we could have a separate type that
-                        // owns task processing.
-                        let worker = self.clone();
-
-                        async move {
-                            if let Err(err) = worker.process_next_task().await {
-                                tracing::error!(%err, "Error processing next task");
-                            }
-                            drop(permit);
+                        Err(err) => {
+                            tracing::error!(%err, "Postgres task change notification error");
+                            continue;
                         }
-                    });
+                    };
+
+                },
+
+                // Polling fallback.
+                _ = interval.tick() => {
+                    self.trigger_task_processing(
+                        concurrency_limit.clone(),
+                        &mut processing_tasks
+                    ).await;
                 }
             }
         }
 
         Ok(())
+    }
+
+    async fn handle_shutdown(&self, processing_tasks: &mut JoinSet<()>) -> Result {
+        let task_timeout = self.task.timeout();
+
+        tracing::info!(
+            task.timeout = ?task_timeout,
+            "Waiting for all processing tasks or timeout"
+        );
+
+        // Wait for processing tasks to complete or timeout
+        let shutdown_result = tokio::time::timeout(task_timeout.try_into()?, async {
+            while let Some(res) = processing_tasks.join_next().await {
+                if let Err(err) = res {
+                    tracing::error!(%err, "A processing task failed during shutdown");
+                }
+            }
+        })
+        .await;
+
+        match shutdown_result {
+            Ok(_) => {
+                tracing::debug!("All processing tasks completed gracefully");
+            }
+            Err(_) => {
+                let remaining_tasks = processing_tasks.len();
+                tracing::warn!(
+                    remaining_tasks,
+                    "Reached task timeout before all tasks completed"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_task_change(
+        &self,
+        task_change: PgNotification,
+        concurrency_limit: Arc<Semaphore>,
+        processing_tasks: &mut JoinSet<()>,
+    ) -> Result {
+        let payload = task_change.payload();
+        let decoded: TaskChange = serde_json::from_str(payload).map_err(|err| {
+            tracing::error!(%err, "Invalid task change payload; ignoring");
+            err
+        })?;
+
+        if decoded.queue_name == self.queue.name {
+            self.trigger_task_processing(concurrency_limit, processing_tasks)
+                .await;
+        }
+
+        Ok(())
+    }
+
+    async fn trigger_task_processing(
+        &self,
+        concurrency_limit: Arc<Semaphore>,
+        processing_tasks: &mut JoinSet<()>,
+    ) {
+        let Ok(permit) = concurrency_limit.clone().try_acquire_owned() else {
+            tracing::debug!("Concurrency limit reached");
+            return;
+        };
+
+        processing_tasks.spawn({
+            let worker = self.clone();
+            async move {
+                if let Err(err) = worker.process_next_task().await {
+                    tracing::error!(%err, "Error processing next task");
+                }
+                drop(permit);
+            }
+        });
     }
 
     /// Processes the next available task in the queue.
@@ -448,6 +493,12 @@ impl<T: Task + Sync> Worker<T> {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct TaskChange {
+    #[serde(rename = "task_queue_name")]
+    queue_name: String,
+}
+
 pub(crate) fn pg_interval_to_span(
     PgInterval {
         months,
@@ -582,14 +633,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_graceful_shutdown(pool: PgPool) -> sqlx::Result<(), Error> {
-        let queue = Queue::builder()
-            .name("test_queue")
-            .pool(pool.clone())
-            .build()
-            .await?;
-
-        #[derive(Debug, Clone)]
+    async fn gracefully_shutdown(pool: PgPool) -> sqlx::Result<(), Error> {
         struct LongRunningTask;
 
         impl Task for LongRunningTask {
@@ -606,40 +650,32 @@ mod tests {
             }
         }
 
-        let task = LongRunningTask;
+        let queue = Queue::builder()
+            .name("gracefully_shutdown")
+            .pool(pool.clone())
+            .build()
+            .await?;
 
-        // Enqueue some tasks
-        for _ in 0..5 {
-            queue.enqueue(&pool, &task, ()).await?;
-        }
-
-        // Start workers
-        let worker = Worker::new(queue.clone(), task);
+        // Start workers before queuing tasks
+        let worker = Worker::new(queue.clone(), LongRunningTask);
         for _ in 0..2 {
             let worker = worker.clone();
             tokio::spawn(async move { worker.run().await });
         }
 
-        let pending = sqlx::query_scalar!(
-            r#"
-            select count(*)
-            from underway.task
-            where state = $1
-            "#,
-            TaskState::Pending as _
-        )
-        .fetch_one(&pool)
-        .await?;
-        assert_eq!(pending, Some(5));
-
         // Wait briefly to ensure workers are listening
-        tokio::time::sleep(StdDuration::from_secs(2)).await;
+        tokio::time::sleep(StdDuration::from_secs(1)).await;
+
+        // Enqueue some tasks now that the worker is listening
+        for _ in 0..5 {
+            queue.enqueue(&pool, &LongRunningTask, ()).await?;
+        }
 
         // Initiate graceful shutdown
         graceful_shutdown(&pool).await?;
 
         // Wait for tasks to be done
-        tokio::time::sleep(StdDuration::from_secs(5)).await;
+        tokio::time::sleep(StdDuration::from_secs(2)).await;
 
         let succeeded = sqlx::query_scalar!(
             r#"
@@ -657,7 +693,7 @@ mod tests {
         queue.enqueue(&pool, &LongRunningTask, ()).await?;
 
         // Wait to ensure a worker would have seen the new task if one were processing
-        tokio::time::sleep(StdDuration::from_secs(5)).await;
+        tokio::time::sleep(StdDuration::from_secs(1)).await;
 
         let succeeded = sqlx::query_scalar!(
             r#"
