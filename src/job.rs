@@ -1072,6 +1072,8 @@ where
     }
 }
 
+type StepResult = TaskResult<Option<(serde_json::Value, Span)>>;
+
 // A trait object wrapper for steps to allow heterogeneous step types in a
 // vector.
 trait StepExecutor<S>: Send + Sync {
@@ -1080,7 +1082,7 @@ trait StepExecutor<S>: Send + Sync {
         &self,
         cx: Context<S>,
         input: serde_json::Value,
-    ) -> Pin<Box<dyn Future<Output = TaskResult<Option<(serde_json::Value, Span)>>> + Send>>;
+    ) -> Pin<Box<dyn Future<Output = StepResult> + Send>>;
 }
 
 impl<I, O, S, F> StepExecutor<S> for StepFn<I, O, S, F>
