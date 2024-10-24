@@ -18,17 +18,19 @@
 //! worker. However, workers can be manually constructed and only require a
 //! queue and task:
 //!
-//! ```rust
+//! ```rust,no_run
 //! # use tokio::runtime::Runtime;
 //! # use underway::Task;
 //! # use underway::task::Result as TaskResult;
-//! # use sqlx::PgPool;
+//! # use sqlx::{PgPool, Transaction, Postgres};
+//! # use std::sync::Arc;
 //! use underway::{Queue, Worker};
 //!
 //! # struct MyTask;
 //! # impl Task for MyTask {
 //! #    type Input = ();
-//! #    async fn execute(&self, input: Self::Input) -> TaskResult {
+//! #    type Output = ();
+//! #    async fn execute(&self, tx: Transaction<'_, Postgres>, input: Self::Input) -> TaskResult<Self::Output> {
 //! #        Ok(())
 //! #    }
 //! # }
@@ -38,7 +40,7 @@
 //! # /*
 //! let pool = { /* A `PgPool`. */ };
 //! # */
-//! # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
+//! # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
 //! let queue = Queue::builder()
 //!     .name("example_queue")
 //!     .pool(pool.clone())
@@ -46,7 +48,7 @@
 //!     .await?;
 //!
 //! # /*
-//! let task = { /* A type that implements `Task`. */ };
+//! let task = { /* An `Task`. */ };
 //! # */
 //! # let task = MyTask;
 //!
@@ -67,24 +69,24 @@
 //! manner. Also note that workers do not need to be run in-process, and can be
 //! run from a separate binary altogether.
 //!
-//! ```rust
+//! ```rust,no_run
 //! # use tokio::runtime::Runtime;
 //! # use underway::Task;
 //! # use underway::task::Result as TaskResult;
-//! # use sqlx::PgPool;
+//! # use sqlx::{Transaction, Postgres, PgPool};
 //! # use underway::{Queue, Worker};
-//! # #[derive(Clone)]
 //! # struct MyTask;
 //! # impl Task for MyTask {
 //! #    type Input = ();
-//! #    async fn execute(&self, input: Self::Input) -> TaskResult {
+//! #    type Output = ();
+//! #    async fn execute(&self, _tx: Transaction<'_, Postgres>, input: Self::Input) -> TaskResult<Self::Output> {
 //! #        Ok(())
 //! #    }
 //! # }
 //! # fn main() {
 //! # let rt = Runtime::new().unwrap();
 //! # rt.block_on(async {
-//! # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
+//! # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
 //! # let queue = Queue::builder()
 //! #    .name("example_queue")
 //! #    .pool(pool.clone())
@@ -121,17 +123,15 @@ use std::sync::{
 };
 
 use jiff::{Span, ToSpan};
-use serde::{de::DeserializeOwned, Serialize};
 use sqlx::{
     postgres::{types::PgInterval, PgListener},
-    PgConnection,
+    Acquire, PgConnection,
 };
 use tokio::{sync::Semaphore, task::JoinSet};
 use tracing::instrument;
 
 use crate::{
-    job::Job,
-    queue::{Error as QueueError, Queue, SHUTDOWN_CHANNEL},
+    queue::{acquire_advisory_xact_lock, Error as QueueError, Queue, SHUTDOWN_CHANNEL},
     task::{DequeuedTask, Error as TaskError, Id as TaskId, RetryCount, RetryPolicy, Task},
 };
 pub(crate) type Result = std::result::Result<(), Error>;
@@ -153,7 +153,7 @@ impl<T: Task> Clone for Worker<T> {
     fn clone(&self) -> Self {
         Self {
             queue: self.queue.clone(),
-            task: Arc::clone(&self.task),
+            task: self.task.clone(),
             concurrency_limit: self.concurrency_limit,
             queue_shutdown: self.queue_shutdown.clone(),
         }
@@ -185,36 +185,6 @@ pub enum Error {
     Jiff(#[from] jiff::Error),
 }
 
-impl<I, S> From<Job<I, S>> for Worker<Job<I, S>>
-where
-    I: Clone + DeserializeOwned + Serialize + Send + 'static,
-    S: Clone + Send + Sync + 'static,
-{
-    fn from(job: Job<I, S>) -> Self {
-        Self {
-            queue: job.queue.clone(),
-            task: Arc::new(job),
-            concurrency_limit: num_cpus::get(),
-            queue_shutdown: Arc::new(false.into()),
-        }
-    }
-}
-
-impl<I, S> From<&Job<I, S>> for Worker<Job<I, S>>
-where
-    I: Clone + DeserializeOwned + Serialize + Send + 'static,
-    S: Clone + Send + Sync + 'static,
-{
-    fn from(job: &Job<I, S>) -> Self {
-        Self {
-            queue: job.queue.clone(),
-            task: Arc::new(job.to_owned()),
-            concurrency_limit: num_cpus::get(),
-            queue_shutdown: Arc::new(false.into()),
-        }
-    }
-}
-
 impl<T: Task + Sync> Worker<T> {
     /// Creates a new worker with the given queue and task.
     pub fn new(queue: Queue<T>, task: T) -> Self {
@@ -227,6 +197,8 @@ impl<T: Task + Sync> Worker<T> {
     }
 
     /// Sets the concurrency limit for this worker.
+    ///
+    /// Defaults to CPU count as per [`num_cpus::get`].
     pub fn concurrency_limit(mut self, concurrency_limit: usize) -> Self {
         self.concurrency_limit = concurrency_limit;
         self
@@ -254,9 +226,9 @@ impl<T: Task + Sync> Worker<T> {
 
         loop {
             tokio::select! {
-                shutdown_notif = shutdown_listener.recv() => {
-                    if let Err(err) = shutdown_notif {
-                        tracing::error!(%err, "NOTIFY resulted in an error");
+                notify_shutdown = shutdown_listener.recv() => {
+                    if let Err(err) = notify_shutdown {
+                        tracing::error!(%err, "Postgres notification error");
                         continue;
                     }
 
@@ -333,7 +305,14 @@ impl<T: Task + Sync> Worker<T> {
     /// is [explicitly fatal](crate::task::Error::Fatal) or no more retries are
     /// left, then the task will be re-queued in a
     /// [`Pending`](crate::task::State::Pending) state.
-    #[instrument(skip(self), fields(task.id = tracing::field::Empty), err)]
+    #[instrument(
+        skip(self),
+        fields(
+            queue.name = self.queue.name,
+            task.id = tracing::field::Empty,
+        ),
+        err
+    )]
     pub async fn process_next_task(&self) -> Result {
         let mut tx = self.queue.pool.begin().await?;
 
@@ -344,7 +323,7 @@ impl<T: Task + Sync> Worker<T> {
             // Ensure that only one worker may process a task of a given concurrency key at
             // a time.
             if let Some(concurrency_key) = &task_row.concurrency_key {
-                self.queue.lock_task(&mut *tx, concurrency_key).await?;
+                acquire_advisory_xact_lock(&mut *tx, concurrency_key).await?;
             }
 
             let input: T::Input = serde_json::from_value(task_row.input.clone())?;
@@ -353,15 +332,16 @@ impl<T: Task + Sync> Worker<T> {
                 .try_into()
                 .expect("Task timeout should be compatible with std::time");
 
+            let execute_tx = tx.begin().await?;
             tokio::select! {
-                result = self.task.execute(input) => {
+                result = self.task.execute(execute_tx, input) => {
                     match result {
                         Ok(_) => {
                             self.queue.mark_task_succeeded(&mut *tx, task_id).await?;
                         }
 
                         Err(err) => {
-                            self.handle_task_error(err, &mut tx, task_id, task_row)
+                            self.handle_task_error(&mut tx, task_id, task_row, err)
                                 .await?;
                         }
                     }
@@ -381,10 +361,10 @@ impl<T: Task + Sync> Worker<T> {
 
     async fn handle_task_error(
         &self,
-        err: TaskError,
         conn: &mut PgConnection,
         task_id: TaskId,
         dequeued_task: DequeuedTask,
+        err: TaskError,
     ) -> Result {
         tracing::error!(err = %err, "Task execution encountered an error");
 
@@ -485,7 +465,7 @@ pub(crate) fn pg_interval_to_span(
 mod tests {
     use std::{sync::Arc, time::Duration as StdDuration};
 
-    use sqlx::PgPool;
+    use sqlx::{PgPool, Postgres, Transaction};
     use tokio::sync::Mutex;
 
     use super::*;
@@ -498,8 +478,13 @@ mod tests {
 
     impl Task for TestTask {
         type Input = ();
+        type Output = ();
 
-        async fn execute(&self, _: Self::Input) -> TaskResult {
+        async fn execute(
+            &self,
+            _: Transaction<'_, Postgres>,
+            _: Self::Input,
+        ) -> TaskResult<Self::Output> {
             Ok(())
         }
     }
@@ -511,8 +496,13 @@ mod tests {
 
     impl Task for FailingTask {
         type Input = ();
+        type Output = ();
 
-        async fn execute(&self, _: Self::Input) -> TaskResult {
+        async fn execute(
+            &self,
+            _: Transaction<'_, Postgres>,
+            _: Self::Input,
+        ) -> TaskResult<Self::Output> {
             let mut fail_times = self.fail_times.lock().await;
             if *fail_times > 0 {
                 *fail_times -= 1;
@@ -604,20 +594,27 @@ mod tests {
 
         impl Task for LongRunningTask {
             type Input = ();
+            type Output = ();
 
-            async fn execute(&self, _: Self::Input) -> TaskResult {
+            async fn execute(
+                &self,
+                _: Transaction<'_, Postgres>,
+                _: Self::Input,
+            ) -> TaskResult<Self::Output> {
                 tokio::time::sleep(StdDuration::from_secs(1)).await;
                 Ok(())
             }
         }
 
+        let task = LongRunningTask;
+
         // Enqueue some tasks
         for _ in 0..5 {
-            queue.enqueue(&pool, &LongRunningTask, ()).await?;
+            queue.enqueue(&pool, &task, ()).await?;
         }
 
         // Start workers
-        let worker = Worker::new(queue.clone(), LongRunningTask);
+        let worker = Worker::new(queue.clone(), task);
         for _ in 0..2 {
             let worker = worker.clone();
             tokio::spawn(async move { worker.run().await });

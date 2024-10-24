@@ -1,11 +1,14 @@
-use std::{result::Result as StdResult, str::FromStr, time::Duration as StdDuration};
+use std::{result::Result as StdResult, str::FromStr, sync::Arc, time::Duration as StdDuration};
 
 use jiff::{tz::TimeZone, Span, ToSpan, Zoned};
 use jiff_cron::Schedule;
-use serde::{de::DeserializeOwned, Serialize};
 use sqlx::postgres::PgAdvisoryLock;
+use tracing::instrument;
 
-use crate::{queue::Error as QueueError, Job, Queue, Task};
+use crate::{
+    queue::{try_acquire_advisory_lock, Error as QueueError},
+    Queue, Task,
+};
 
 pub(crate) type Result<T = ()> = std::result::Result<T, Error>;
 
@@ -38,7 +41,7 @@ pub enum Error {
 pub struct Scheduler<T: Task> {
     queue: Queue<T>,
     queue_lock: PgAdvisoryLock,
-    task: T,
+    task: Arc<T>,
 }
 
 impl<T: Task> Scheduler<T> {
@@ -48,7 +51,7 @@ impl<T: Task> Scheduler<T> {
         Self {
             queue,
             queue_lock,
-            task,
+            task: Arc::new(task),
         }
     }
 
@@ -59,11 +62,8 @@ impl<T: Task> Scheduler<T> {
 
     /// Runs the scheduler in a loop, sleeping for the given span per iteration.
     pub async fn run_every(&self, span: Span) -> Result {
-        let Some(_guard) = self
-            .queue
-            .try_acquire_advisory_lock(&self.queue_lock)
-            .await?
-        else {
+        let conn = self.queue.pool.acquire().await.map_err(QueueError::from)?;
+        let Some(_guard) = try_acquire_advisory_lock(conn, &self.queue_lock).await? else {
             tracing::warn!("Scheduler lock could not be acquired, scheduler exiting");
             return Ok(());
         };
@@ -76,45 +76,31 @@ impl<T: Task> Scheduler<T> {
         }
     }
 
+    #[instrument( skip(self),
+        fields(
+            queue.name = self.queue.name,
+            task.id = tracing::field::Empty,
+        ),
+        err
+    )]
     async fn process_next_schedule(&self) -> Result {
-        let (zoned_schedule, input) = self.queue.task_schedule(&self.queue.pool).await?;
+        if let Some((zoned_schedule, input)) = self.queue.task_schedule(&self.queue.pool).await? {
+            if let Some(until_next) = zoned_schedule.duration_until_next() {
+                tracing::debug!(?until_next, "Waiting until the next schedule");
 
-        if let Some(until_next) = zoned_schedule.duration_until_next() {
-            tokio::time::sleep(until_next).await;
-            self.queue
-                .enqueue(&self.queue.pool, &self.task, input)
-                .await?;
+                // Wait until the next schedule would fire.
+                tokio::time::sleep(until_next).await;
+
+                let task_id = self
+                    .queue
+                    .enqueue(&self.queue.pool, &self.task, input)
+                    .await?;
+
+                tracing::Span::current().record("task.id", task_id.as_hyphenated().to_string());
+            }
         }
 
         Ok(())
-    }
-}
-
-impl<I, S> From<Job<I, S>> for Scheduler<Job<I, S>>
-where
-    I: Clone + DeserializeOwned + Serialize + Send + 'static,
-    S: Clone + Send + Sync + 'static,
-{
-    fn from(job: Job<I, S>) -> Self {
-        Self {
-            queue: job.queue.clone(),
-            queue_lock: queue_scheduler_lock(&job.queue.name),
-            task: job,
-        }
-    }
-}
-
-impl<I, S> From<&Job<I, S>> for Scheduler<Job<I, S>>
-where
-    I: Clone + DeserializeOwned + Serialize + Send + 'static,
-    S: Clone + Send + Sync + 'static,
-{
-    fn from(job: &Job<I, S>) -> Self {
-        Self {
-            queue: job.queue.clone(),
-            queue_lock: queue_scheduler_lock(&job.queue.name),
-            task: job.clone(),
-        }
     }
 }
 

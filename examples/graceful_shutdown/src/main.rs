@@ -3,7 +3,7 @@ use std::env;
 use sqlx::PgPool;
 use tokio::signal;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use underway::{Job, Queue};
+use underway::{Job, To};
 
 const QUEUE_NAME: &str = "graceful-shutdown";
 
@@ -50,16 +50,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Run migrations.
     underway::MIGRATOR.run(&pool).await?;
 
-    // Create the task queue.
-    let queue = Queue::builder()
-        .name(QUEUE_NAME)
-        .pool(pool.clone())
-        .build()
-        .await?;
-
     // Build the job.
     let job = Job::builder()
-        .execute(|_| async move {
+        .step(|_ctx, _input| async move {
             let sleep_duration = std::time::Duration::from_secs(5);
 
             tracing::info!(?sleep_duration, "Hello from a long-running task");
@@ -67,10 +60,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Artificial delay to simulate a long-running job.
             tokio::time::sleep(sleep_duration).await;
 
-            Ok(())
+            To::done()
         })
-        .queue(queue)
-        .build();
+        .name(QUEUE_NAME)
+        .pool(pool.clone())
+        .build()
+        .await?;
 
     let every_second = "* * * * * *[America/Los_Angeles]".parse()?;
     job.schedule(every_second, ()).await?;

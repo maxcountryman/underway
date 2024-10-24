@@ -24,7 +24,9 @@
 //!
 //! ```
 //! use serde::{Deserialize, Serialize};
+//! use sqlx::{Postgres, Transaction};
 //! use underway::{task::Result as TaskResult, Task};
+//! # use sqlx::PgPool;
 //! # use tokio::runtime::Runtime;
 //! # fn main() {
 //! # let rt = Runtime::new().unwrap();
@@ -43,9 +45,14 @@
 //!
 //! impl Task for WelcomeEmailTask {
 //!     type Input = WelcomeEmail;
+//!     type Output = ();
 //!
 //!     /// Simulate sending a welcome email by printing a message to the console.
-//!     async fn execute(&self, input: Self::Input) -> TaskResult {
+//!     async fn execute(
+//!         &self,
+//!         _tx: Transaction<'_, Postgres>,
+//!         input: Self::Input,
+//!     ) -> TaskResult<Self::Output> {
 //!         println!(
 //!             "Sending welcome email to {} <{}> (user_id: {})",
 //!             input.name, input.email, input.user_id
@@ -56,13 +63,16 @@
 //!         Ok(())
 //!     }
 //! }
+//! # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+//! # let tx = pool.begin().await?;
 //! # let task = WelcomeEmailTask;
 //! # let input = WelcomeEmail {
 //! #     user_id: 1,
 //! #     email: "user@example.com".to_string(),
 //! #     name: "Alice".to_string(),
 //! # };
-//! # task.execute(input).await.unwrap();
+//! # task.execute(tx, input).await?;
+//! # Ok::<(), Box<dyn std::error::Error>>(())
 //! # });
 //! # }
 //! ```
@@ -70,7 +80,7 @@ use std::{future::Future, result::Result as StdResult};
 
 use jiff::{Span, ToSpan};
 use serde::{de::DeserializeOwned, Serialize};
-use sqlx::postgres::types::PgInterval;
+use sqlx::{postgres::types::PgInterval, Postgres, Transaction};
 use uuid::Uuid;
 
 pub(crate) use self::retry_policy::RetryCount;
@@ -86,7 +96,7 @@ mod retry_policy;
 pub type Id = Uuid;
 
 /// A type alias for task execution results.
-pub type Result = StdResult<(), Error>;
+pub type Result<T> = StdResult<T, Error>;
 
 /// Task errors.
 #[derive(Debug, thiserror::Error)]
@@ -121,13 +131,13 @@ pub enum Error {
 ///
 ///```rust
 /// use tokio::net;
-/// use underway::{Job, ToTaskResult};
+/// use underway::{Job, To, ToTaskResult};
 ///
-/// Job::<(), ()>::builder().execute(|_| async {
+/// Job::<(), ()>::builder().step(|_, _| async {
 ///     // If we can't resolve DNS the issue may be transient and recoverable.
 ///     net::lookup_host("example.com:80").await.retryable()?;
 ///
-///     Ok(())
+///     To::done()
 /// });
 /// ```
 ///
@@ -136,13 +146,13 @@ pub enum Error {
 /// ```rust
 /// use std::env;
 ///
-/// use underway::{Job, ToTaskResult};
+/// use underway::{Job, To, ToTaskResult};
 ///
-/// Job::<(), ()>::builder().execute(|_| async {
+/// Job::<(), ()>::builder().step(|_, _| async {
 ///     // If the API_KEY environment variable isn't set we can't recover.
 ///     let api_key = env::var("API_KEY").fatal()?;
 ///
-///     Ok(())
+///     To::done()
 /// });
 /// ```
 pub trait ToTaskResult<T> {
@@ -172,6 +182,9 @@ pub trait Task: Send + 'static {
     /// This type must be serialized to and deserialized from the database.
     type Input: DeserializeOwned + Serialize + Send + 'static;
 
+    /// The output type that the execute method will return upon success.
+    type Output: Serialize + Send + 'static;
+
     /// Executes the task with the provided input.
     ///
     /// The core of a task, this method is called when the task is picked up by
@@ -185,7 +198,8 @@ pub trait Task: Send + 'static {
     ///
     /// ```
     /// use serde::{Deserialize, Serialize};
-    /// use underway::{task::Error as TaskError, Task};
+    /// use sqlx::{Postgres, Transaction};
+    /// use underway::{task::Result as TaskResult, Task};
     ///
     /// // Task input representing the data needed to send a welcome email.
     /// #[derive(Debug, Deserialize, Serialize)]
@@ -200,9 +214,14 @@ pub trait Task: Send + 'static {
     ///
     /// impl Task for WelcomeEmailTask {
     ///     type Input = WelcomeEmail;
+    ///     type Output = ();
     ///
     ///     /// Simulate sending a welcome email by printing a message to the console.
-    ///     async fn execute(&self, input: Self::Input) -> Result<(), TaskError> {
+    ///     async fn execute(
+    ///         &self,
+    ///         tx: Transaction<'_, Postgres>,
+    ///         input: Self::Input,
+    ///     ) -> TaskResult<Self::Output> {
     ///         println!(
     ///             "Sending welcome email to {} <{}> (user_id: {})",
     ///             input.name, input.email, input.user_id
@@ -214,7 +233,11 @@ pub trait Task: Send + 'static {
     ///     }
     /// }
     /// ```
-    fn execute(&self, input: Self::Input) -> impl Future<Output = Result> + Send;
+    fn execute(
+        &self,
+        tx: Transaction<'_, Postgres>,
+        input: Self::Input,
+    ) -> impl Future<Output = Result<Self::Output>> + Send;
 
     /// Defines the retry policy of the task.
     ///
@@ -226,6 +249,7 @@ pub trait Task: Send + 'static {
     /// # Example
     ///
     /// ```rust
+    /// use sqlx::{Postgres, Transaction};
     /// use underway::{
     ///     task::{Result as TaskResult, RetryPolicy},
     ///     Task,
@@ -235,8 +259,13 @@ pub trait Task: Send + 'static {
     ///
     /// impl Task for MyCustomRetryTask {
     ///     type Input = ();
+    ///     type Output = ();
     ///
-    ///     async fn execute(&self, _input: Self::Input) -> TaskResult {
+    ///     async fn execute(
+    ///         &self,
+    ///         _tx: Transaction<'_, Postgres>,
+    ///         _input: Self::Input,
+    ///     ) -> TaskResult<Self::Output> {
     ///         Ok(())
     ///     }
     ///
@@ -264,14 +293,20 @@ pub trait Task: Send + 'static {
     ///
     /// ```rust
     /// use jiff::{Span, ToSpan};
+    /// use sqlx::{Postgres, Transaction};
     /// use underway::{task::Result as TaskResult, Task};
     ///
     /// struct MyImpatientTask;
     ///
     /// impl Task for MyImpatientTask {
     ///     type Input = ();
+    ///     type Output = ();
     ///
-    ///     async fn execute(&self, _input: Self::Input) -> TaskResult {
+    ///     async fn execute(
+    ///         &self,
+    ///         _tx: Transaction<'_, Postgres>,
+    ///         _input: Self::Input,
+    ///     ) -> TaskResult<Self::Output> {
     ///         Ok(())
     ///     }
     ///
@@ -299,14 +334,20 @@ pub trait Task: Send + 'static {
     ///
     /// ```rust
     /// use jiff::{Span, ToSpan};
+    /// use sqlx::{Postgres, Transaction};
     /// use underway::{task::Result as TaskResult, Task};
     ///
     /// struct MyLongLivedTask;
     ///
     /// impl Task for MyLongLivedTask {
     ///     type Input = ();
+    ///     type Output = ();
     ///
-    ///     async fn execute(&self, _input: Self::Input) -> TaskResult {
+    ///     async fn execute(
+    ///         &self,
+    ///         _tx: Transaction<'_, Postgres>,
+    ///         _input: Self::Input,
+    ///     ) -> TaskResult<Self::Output> {
     ///         Ok(())
     ///     }
     ///
@@ -331,14 +372,20 @@ pub trait Task: Send + 'static {
     ///
     /// ```rust
     /// use jiff::{Span, ToSpan};
+    /// use sqlx::{Postgres, Transaction};
     /// use underway::{task::Result as TaskResult, Task};
     ///
     /// struct MyDelayedTask;
     ///
     /// impl Task for MyDelayedTask {
     ///     type Input = ();
+    ///     type Output = ();
     ///
-    ///     async fn execute(&self, _input: Self::Input) -> TaskResult {
+    ///     async fn execute(
+    ///         &self,
+    ///         _tx: Transaction<'_, Postgres>,
+    ///         _input: Self::Input,
+    ///     ) -> TaskResult<Self::Output> {
     ///         Ok(())
     ///     }
     ///
@@ -371,14 +418,20 @@ pub trait Task: Send + 'static {
     /// ```rust
     /// use std::path::PathBuf;
     ///
+    /// use sqlx::{Postgres, Transaction};
     /// use underway::{task::Result as TaskResult, Task};
     ///
     /// struct MyUniqueTask(PathBuf);
     ///
     /// impl Task for MyUniqueTask {
     ///     type Input = ();
+    ///     type Output = ();
     ///
-    ///     async fn execute(&self, _input: Self::Input) -> TaskResult {
+    ///     async fn execute(
+    ///         &self,
+    ///         _tx: Transaction<'_, Postgres>,
+    ///         _input: Self::Input,
+    ///     ) -> TaskResult<Self::Output> {
     ///         Ok(())
     ///     }
     ///
@@ -404,14 +457,20 @@ pub trait Task: Send + 'static {
     /// # Example
     ///
     /// ```rust
+    /// use sqlx::{Postgres, Transaction};
     /// use underway::{task::Result as TaskResult, Task};
     ///
     /// struct HighPriorityTask;
     ///
     /// impl Task for HighPriorityTask {
     ///     type Input = ();
+    ///     type Output = ();
     ///
-    ///     async fn execute(&self, _input: Self::Input) -> TaskResult {
+    ///     async fn execute(
+    ///         &self,
+    ///         _tx: Transaction<'_, Postgres>,
+    ///         _input: Self::Input,
+    ///     ) -> TaskResult<Self::Output> {
     ///         Ok(())
     ///     }
     ///
@@ -480,6 +539,7 @@ pub enum State {
 #[cfg(test)]
 mod tests {
     use serde::{Deserialize, Serialize};
+    use sqlx::PgPool;
 
     use super::*;
 
@@ -492,8 +552,13 @@ mod tests {
 
     impl Task for TestTask {
         type Input = TestTaskInput;
+        type Output = ();
 
-        async fn execute(&self, input: Self::Input) -> Result {
+        async fn execute(
+            &self,
+            _tx: Transaction<'_, Postgres>,
+            input: Self::Input,
+        ) -> Result<Self::Output> {
             println!("Executing task with message: {}", input.message);
             if input.message == "fail" {
                 return Err(Error::Retryable("Task failed".to_string()));
@@ -502,25 +567,27 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn task_execution_success() {
+    #[sqlx::test]
+    async fn task_execution_success(pool: PgPool) {
         let task = TestTask;
         let input = TestTaskInput {
             message: "Hello, World!".to_string(),
         };
 
-        let result = task.execute(input).await;
+        let tx = pool.begin().await.unwrap();
+        let result = task.execute(tx, input).await;
         assert!(result.is_ok())
     }
 
-    #[tokio::test]
-    async fn task_execution_failure() {
+    #[sqlx::test]
+    async fn task_execution_failure(pool: PgPool) {
         let task = TestTask;
         let input = TestTaskInput {
             message: "fail".to_string(),
         };
 
-        let result = task.execute(input).await;
+        let tx = pool.begin().await.unwrap();
+        let result = task.execute(tx, input).await;
         assert!(result.is_err())
     }
 

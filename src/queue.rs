@@ -19,17 +19,19 @@
 //!
 //! To enable dead-letter queues, simply provide its name:
 //!
-//! ```rust
+//! ```rust,no_run
 //! # use tokio::runtime::Runtime;
 //! # use underway::Task;
 //! # use underway::task::Result as TaskResult;
 //! # use sqlx::PgPool;
+//! # use sqlx::{Transaction, Postgres};
 //! use underway::Queue;
 //!
 //! # struct MyTask;
 //! # impl Task for MyTask {
 //! #    type Input = ();
-//! #    async fn execute(&self, input: Self::Input) -> TaskResult {
+//! #    type Output = ();
+//! #    async fn execute(&self, _tx: Transaction<'_, Postgres>, input: Self::Input) -> TaskResult<Self::Output> {
 //! #        Ok(())
 //! #    }
 //! # }
@@ -39,7 +41,7 @@
 //! # /*
 //! let pool = { /* A `PgPool`. */ };
 //! # */
-//! # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
+//! # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
 //! let queue = Queue::builder()
 //!     .name("example_queue")
 //!     // Enable the dead-letter queue.
@@ -68,17 +70,18 @@
 //! With that said, a queue may be interfaced with directly and operated
 //! manually if desired:
 //!
-//! ```rust
+//! ```rust,no_run
 //! # use tokio::runtime::Runtime;
 //! # use underway::Task;
 //! # use underway::task::Result as TaskResult;
-//! # use sqlx::PgPool;
+//! # use sqlx::{Transaction, Postgres, PgPool};
 //! use underway::Queue;
 //!
 //! # struct MyTask;
 //! # impl Task for MyTask {
 //! #    type Input = ();
-//! #    async fn execute(&self, input: Self::Input) -> TaskResult {
+//! #    type Output = ();
+//! #    async fn execute(&self, _tx: Transaction<'_, Postgres>, input: Self::Input) -> TaskResult<Self::Output> {
 //! #        Ok(())
 //! #    }
 //! # }
@@ -88,7 +91,7 @@
 //! # /*
 //! let pool = { /* A `PgPool`. */ };
 //! # */
-//! # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
+//! # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
 //! let queue = Queue::builder()
 //!     .name("example_queue")
 //!     .pool(pool.clone())
@@ -127,17 +130,18 @@
 //! used to run the schedule via the [`Scheduler::run`](crate::Scheduler::run)
 //! method:
 //!
-//! ```rust
+//! ```rust,no_run
 //! # use tokio::runtime::Runtime;
 //! # use underway::Task;
 //! # use underway::task::Result as TaskResult;
-//! # use sqlx::PgPool;
+//! # use sqlx::{Transaction, Postgres, PgPool};
 //! use underway::{Queue, Scheduler};
 //!
 //! # struct MyTask;
 //! # impl Task for MyTask {
 //! #    type Input = ();
-//! #    async fn execute(&self, input: Self::Input) -> TaskResult {
+//! #    type Output = ();
+//! #    async fn execute(&self, _tx: Transaction<'_, Postgres>, input: Self::Input) -> TaskResult<Self::Output> {
 //! #        Ok(())
 //! #    }
 //! # }
@@ -147,7 +151,7 @@
 //! # /*
 //! let pool = { /* A `PgPool`. */ };
 //! # */
-//! # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
+//! # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
 //! let queue = Queue::builder()
 //!     .name("example_queue")
 //!     .pool(pool.clone())
@@ -184,17 +188,18 @@
 //! **Note**: Tasks will not be deleted from the queue if this routine is not
 //! running!
 //!
-//! ```rust
+//! ```rust,no_run
 //! # use tokio::runtime::Runtime;
 //! # use underway::Task;
 //! # use underway::task::Result as TaskResult;
-//! # use sqlx::PgPool;
+//! # use sqlx::{Postgres, PgPool, Transaction};
 //! use underway::queue;
 //!
 //! # struct MyTask;
 //! # impl Task for MyTask {
 //! #    type Input = ();
-//! #    async fn execute(&self, input: Self::Input) -> TaskResult {
+//! #    type Output = ();
+//! #    async fn execute(&self, _tx: Transaction<'_, Postgres>, input: Self::Input) -> TaskResult<Self::Output> {
 //! #        Ok(())
 //! #    }
 //! # }
@@ -204,7 +209,7 @@
 //! # /*
 //! let pool = { /* A `PgPool`. */ };
 //! # */
-//! # let pool = PgPool::connect("postgres://user:password@localhost/database").await?;
+//! # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
 //!
 //! // Ensure we remove tasks that have an expired TTL.
 //! queue::run_deletion(&pool).await?;
@@ -219,9 +224,8 @@ use std::{marker::PhantomData, time::Duration as StdDuration};
 use builder_states::{Initial, NameSet, PoolSet};
 use jiff::{Span, ToSpan};
 use sqlx::{
-    pool::PoolConnection,
     postgres::{PgAdvisoryLock, PgAdvisoryLockGuard},
-    Acquire, PgExecutor, PgPool, Postgres,
+    Acquire, PgConnection, PgExecutor, PgPool, Postgres,
 };
 use tracing::instrument;
 use ulid::Ulid;
@@ -354,7 +358,12 @@ impl<T: Task> Queue<T> {
 
     // Explicitly provide for a delay so that we can also facilitate calculated
     // retries, i.e. `enqueue_after`.
-    #[instrument(name = "enqueue", skip(self, executor, task, input), fields(task.id = tracing::field::Empty), err)]
+    #[instrument(
+        name = "enqueue",
+        skip(self, executor, task, input),
+        fields(queue.name = self.name, task.id = tracing::field::Empty),
+        err
+    )]
     async fn enqueue_with_delay<'a, E>(
         &self,
         executor: E,
@@ -440,7 +449,11 @@ impl<T: Task> Queue<T> {
     ///
     /// - The database operation fails during select.
     /// - The database operation fails during update.
-    #[instrument(skip(self, conn), fields(task.id = tracing::field::Empty), err)]
+    #[instrument(
+        skip(self, conn),
+        fields(queue.name = self.name, task.id = tracing::field::Empty),
+        err
+    )]
     pub async fn dequeue<'a, A>(&self, conn: A) -> Result<Option<DequeuedTask>>
     where
         A: Acquire<'a, Database = Postgres>,
@@ -497,7 +510,11 @@ impl<T: Task> Queue<T> {
     ///
     /// - The input value cannot be serialized.
     /// - The database operation fails during insert.
-    #[instrument(skip(self, executor, zoned_schedule, input), err)]
+    #[instrument(
+        skip(self, executor, zoned_schedule, input),
+        fields(queue.name = self.name),
+        err
+    )]
     pub async fn schedule<'a, E>(
         &self,
         executor: E,
@@ -538,27 +555,32 @@ impl<T: Task> Queue<T> {
     pub(crate) async fn task_schedule<'a, E>(
         &self,
         executor: E,
-    ) -> Result<(ZonedSchedule, T::Input)>
+    ) -> Result<Option<(ZonedSchedule, T::Input)>>
     where
         E: PgExecutor<'a>,
     {
-        let schedule_row = sqlx::query!(
+        let Some(schedule_row) = sqlx::query!(
             r#"
             select schedule, timezone, input from underway.task_schedule where name = $1
+            limit 1
             "#,
             self.name,
         )
-        .fetch_one(executor)
-        .await?;
+        .fetch_optional(executor)
+        .await?
+        else {
+            return Ok(None);
+        };
 
         let zoned_schedule = ZonedSchedule::new(&schedule_row.schedule, &schedule_row.timezone)
             .map_err(|_| Error::MalformedSchedule)?;
         let input = serde_json::from_value(schedule_row.input)?;
 
-        Ok((zoned_schedule, input))
+        Ok(Some((zoned_schedule, input)))
     }
 
-    pub(crate) async fn create<'a, E>(executor: E, name: impl Into<String>) -> Result
+    #[instrument(skip(executor, name), fields(queue.name = name), err)]
+    pub(crate) async fn create<'a, E>(executor: E, name: &str) -> Result
     where
         E: PgExecutor<'a>,
     {
@@ -567,7 +589,7 @@ impl<T: Task> Queue<T> {
             insert into underway.task_queue (name) values ($1)
             on conflict do nothing
             "#,
-            name.into()
+            name
         )
         .execute(executor)
         .await?;
@@ -600,6 +622,7 @@ impl<T: Task> Queue<T> {
         Ok(())
     }
 
+    #[allow(dead_code)] // TODO: Revisit cancellation re jobs.
     pub(crate) async fn mark_task_cancelled<'a, E>(&self, executor: E, task_id: TaskId) -> Result
     where
         E: PgExecutor<'a>,
@@ -650,6 +673,11 @@ impl<T: Task> Queue<T> {
         Ok(())
     }
 
+    #[instrument(
+        skip(self, executor, task_id),
+        fields(queue.name = self.name, task.id = %task_id.as_hyphenated()),
+        err
+    )]
     pub(crate) async fn reschedule_task_for_retry<'a, E>(
         &self,
         executor: E,
@@ -768,32 +796,34 @@ impl<T: Task> Queue<T> {
 
         Ok(())
     }
+}
 
-    #[instrument(skip(self, executor), err)]
-    pub(crate) async fn lock_task<'a, E>(&self, executor: E, key: &str) -> Result
-    where
-        E: PgExecutor<'a>,
-    {
-        sqlx::query!("select pg_advisory_xact_lock(hashtext($1))", key)
-            .execute(executor)
-            .await?;
+#[instrument(skip(executor), err)]
+pub(crate) async fn acquire_advisory_xact_lock<'a, E>(executor: E, key: &str) -> Result
+where
+    E: PgExecutor<'a>,
+{
+    sqlx::query!("select pg_advisory_xact_lock(hashtext($1))", key)
+        .execute(executor)
+        .await?;
 
-        Ok(())
-    }
+    Ok(())
+}
 
-    #[instrument(skip(self), err)]
-    pub(crate) async fn try_acquire_advisory_lock<'a>(
-        &self,
-        lock: &'a PgAdvisoryLock,
-    ) -> Result<Option<PgAdvisoryLockGuard<'a, PoolConnection<Postgres>>>> {
-        let conn = self.pool.acquire().await?;
-        let guard = match lock.try_acquire(conn).await? {
-            sqlx::Either::Left(guard) => Some(guard),
-            sqlx::Either::Right(_) => None,
-        };
+#[instrument(skip(conn, lock), err)]
+pub(crate) async fn try_acquire_advisory_lock<'lock, C>(
+    conn: C,
+    lock: &'lock PgAdvisoryLock,
+) -> Result<Option<PgAdvisoryLockGuard<'lock, C>>>
+where
+    C: AsMut<PgConnection>,
+{
+    let guard = match lock.try_acquire(conn).await? {
+        sqlx::Either::Left(guard) => Some(guard),
+        sqlx::Either::Right(_) => None,
+    };
 
-        Ok(guard)
-    }
+    Ok(guard)
 }
 
 /// Runs deletion clean up of expired tasks in a loop, sleeping between
@@ -865,7 +895,7 @@ mod builder_states {
     }
 }
 
-/// A builder for [`Queue`].
+/// Builds a [`Queue`].
 #[derive(Debug)]
 pub struct Builder<T: Task, S> {
     state: S,
@@ -930,7 +960,7 @@ impl<T: Task> Builder<T, PoolSet> {
         Queue::<T>::create(&mut *tx, &state.name).await?;
 
         // Create the DLQ in the database if specified
-        if let Some(ref dlq_name) = state.dlq_name {
+        if let Some(dlq_name) = &state.dlq_name {
             Queue::<T>::create(&mut *tx, dlq_name).await?;
         }
 
@@ -971,6 +1001,8 @@ where
 mod tests {
     use std::collections::HashSet;
 
+    use sqlx::Transaction;
+
     use super::*;
     use crate::{task::Result as TaskResult, worker::pg_interval_to_span};
 
@@ -978,8 +1010,13 @@ mod tests {
 
     impl Task for TestTask {
         type Input = serde_json::Value;
+        type Output = ();
 
-        async fn execute(&self, _: Self::Input) -> TaskResult {
+        async fn execute(
+            &self,
+            _: Transaction<'_, Postgres>,
+            _: Self::Input,
+        ) -> TaskResult<Self::Output> {
             Ok(())
         }
     }
