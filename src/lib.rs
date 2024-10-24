@@ -188,7 +188,7 @@
 //! use underway::{Job, To};
 //!
 //! #[derive(Deserialize, Serialize)]
-//! struct GenerateReport;
+//! struct DailyReport;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -212,7 +212,7 @@
 //!
 //!     // Set a daily schedule with the given input.
 //!     let daily = "@daily[America/Los_Angeles]".parse()?;
-//!     job.schedule(daily, GenerateReport).await?;
+//!     job.schedule(daily, DailyReport).await?;
 //!
 //!     // Start processing enqueued jobs.
 //!     job.start().await??;

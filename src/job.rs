@@ -578,6 +578,48 @@
 //! # });
 //! # }
 //! ```
+//!
+//! # Scheduling jobs
+//!
+//! Jobs may also be run on a schedule that follows the form of a cron-like
+//! expression.
+//!
+//! ```rust,no_run
+//! # use sqlx::PgPool;
+//! use underway::{Job, To};
+//!
+//! # use tokio::runtime::Runtime;
+//! # fn main() {
+//! # let rt = Runtime::new().unwrap();
+//! # rt.block_on(async {
+//! # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+//! # /*
+//! let pool = { /* A `PgPool`. */ };
+//! # */
+//! #
+//!
+//! let job = Job::builder()
+//!     .step(|_cx, _: ()| async move { To::done() })
+//!     .name("scheduled-job")
+//!     .pool(pool)
+//!     .build()
+//!     .await?;
+//!
+//! // Sets a weekly schedule with the given input.
+//! let weekly = "@weekly[America/Los_Angeles]".parse()?;
+//! job.schedule(weekly, ()).await?;
+//!
+//! job.start();
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! # });
+//! # }
+//! ```
+//!
+//! Often input to a scheduled job would consist of static configuration or
+//! other fields that are shared for scheduled runs.
+//!
+//! Also note that jobs with schedules may still be enqueued manually when
+//! desired.
 
 use std::{
     future::Future,
@@ -1126,7 +1168,7 @@ mod builder_states {
     }
 }
 
-/// A builder for constructing a `Job` with a sequence of steps.
+/// Builder for constructing a `Job` with a sequence of steps.
 pub struct Builder<I, O, S, B> {
     builder_state: B,
     steps: Vec<(Box<dyn StepExecutor<S>>, RetryPolicy)>,
