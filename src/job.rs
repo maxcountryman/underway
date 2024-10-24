@@ -908,7 +908,7 @@ where
     #[instrument(
         skip_all,
         fields(
-            job.id = %input.job_id.as_hyphenated(), 
+            job.id = %input.job_id.as_hyphenated(),
             step = input.step_index + 1,
             steps = self.steps.len()
         ),

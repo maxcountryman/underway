@@ -306,7 +306,7 @@ impl<T: Task + Sync> Worker<T> {
     /// left, then the task will be re-queued in a
     /// [`Pending`](crate::task::State::Pending) state.
     #[instrument(
-        skip(self), 
+        skip(self),
         fields(
             queue.name = self.queue.name,
             task.id = tracing::field::Empty,
