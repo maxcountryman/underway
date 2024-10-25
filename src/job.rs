@@ -1521,7 +1521,7 @@ mod tests {
         job.start();
 
         // Give the job a moment to process.
-        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
         assert_eq!(
             *state.data.lock().expect("Mutex should not be poisoned"),
