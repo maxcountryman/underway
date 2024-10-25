@@ -1,4 +1,6 @@
-use std::{result::Result as StdResult, str::FromStr, sync::Arc, time::Duration as StdDuration};
+use std::{
+    future, result::Result as StdResult, str::FromStr, sync::Arc, time::Duration as StdDuration,
+};
 
 use jiff::{tz::TimeZone, Span, ToSpan, Zoned};
 use jiff_cron::Schedule;
@@ -60,45 +62,53 @@ impl<T: Task> Scheduler<T> {
         self.run_every(1.second()).await
     }
 
-    /// Runs the scheduler in a loop, sleeping for the given span per iteration.
-    pub async fn run_every(&self, span: Span) -> Result {
+    /// Runs the scheduler in a loop, sleeping for the given period per
+    /// iteration.
+    pub async fn run_every(&self, period: Span) -> Result {
         let conn = self.queue.pool.acquire().await.map_err(QueueError::from)?;
         let Some(_guard) = try_acquire_advisory_lock(conn, &self.queue_lock).await? else {
-            tracing::warn!("Scheduler lock could not be acquired, scheduler exiting");
-            return Ok(());
+            // We can't acquire the lock, so we'll return a future that waits forever.
+            return future::pending().await;
         };
 
-        let mut interval = tokio::time::interval(span.try_into()?);
+        let mut interval = tokio::time::interval(period.try_into()?);
         interval.tick().await;
         loop {
-            self.process_next_schedule().await?;
+            // TODO: It would be preferrable to not check the schedule every second and wait
+            // for a NOTIFY instead.
+            if let Some((zoned_schedule, input)) =
+                self.queue.task_schedule(&self.queue.pool).await?
+            {
+                // TODO: If we were waiting for a NOTIFY or timeout, we could keep processing
+                // the same schedule without fetching from the database.
+                if let Some(until_next) = zoned_schedule.into_iter().next() {
+                    self.process_next_schedule(until_next, input).await?
+                }
+            }
+
             interval.tick().await;
         }
     }
 
-    #[instrument( skip(self),
+    #[instrument(
+        skip_all,
         fields(
             queue.name = self.queue.name,
             task.id = tracing::field::Empty,
+            until_next
         ),
         err
     )]
-    async fn process_next_schedule(&self) -> Result {
-        if let Some((zoned_schedule, input)) = self.queue.task_schedule(&self.queue.pool).await? {
-            if let Some(until_next) = zoned_schedule.duration_until_next() {
-                tracing::debug!(?until_next, "Waiting until the next schedule");
+    async fn process_next_schedule(&self, until_next: StdDuration, input: T::Input) -> Result {
+        tracing::debug!(?until_next, "Sleeping until the next scheduled enqueue");
+        tokio::time::sleep(until_next).await;
 
-                // Wait until the next schedule would fire.
-                tokio::time::sleep(until_next).await;
+        let task_id = self
+            .queue
+            .enqueue(&self.queue.pool, &self.task, input)
+            .await?;
 
-                let task_id = self
-                    .queue
-                    .enqueue(&self.queue.pool, &self.task, input)
-                    .await?;
-
-                tracing::Span::current().record("task.id", task_id.as_hyphenated().to_string());
-            }
-        }
+        tracing::Span::current().record("task.id", task_id.as_hyphenated().to_string());
 
         Ok(())
     }
@@ -146,8 +156,12 @@ impl ZonedSchedule {
     fn now_with_tz(&self) -> Zoned {
         Zoned::now().with_time_zone(self.tz())
     }
+}
 
-    pub(crate) fn duration_until_next(&self) -> Option<StdDuration> {
+impl Iterator for ZonedSchedule {
+    type Item = StdDuration;
+
+    fn next(&mut self) -> Option<Self::Item> {
         self.schedule.upcoming(self.tz()).next().map(|next_zoned| {
             self.now_with_tz()
                 .duration_until(&next_zoned)
