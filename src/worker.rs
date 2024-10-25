@@ -132,7 +132,7 @@ use crate::{
     queue::{acquire_advisory_xact_lock, Error as QueueError, Queue, SHUTDOWN_CHANNEL},
     task::{DequeuedTask, Error as TaskError, Id as TaskId, RetryCount, RetryPolicy, Task},
 };
-pub(crate) type Result = std::result::Result<(), Error>;
+pub(crate) type Result<T = ()> = std::result::Result<T, Error>;
 
 /// Worker errors.
 #[derive(Debug, thiserror::Error)]
@@ -329,8 +329,24 @@ impl<T: Task + Sync> Worker<T> {
         processing_tasks.spawn({
             let worker = self.clone();
             async move {
-                if let Err(err) = worker.process_next_task().await {
-                    tracing::error!(%err, "Error processing next task");
+                loop {
+                    match worker.process_next_task().await {
+                        Err(err) => {
+                            tracing::error!(err = %err, "Error processing next task");
+                            continue;
+                        }
+
+                        Ok(Some(_)) => {
+                            // Since we just processed a task, we'll try again in case there's
+                            // more.
+                            continue;
+                        }
+
+                        Ok(None) => {
+                            // We tried to process a task but found none so we'll stop trying.
+                            break;
+                        }
+                    }
                 }
                 drop(permit);
             }
@@ -358,50 +374,52 @@ impl<T: Task + Sync> Worker<T> {
         ),
         err
     )]
-    pub async fn process_next_task(&self) -> Result {
+    pub async fn process_next_task(&self) -> Result<Option<TaskId>> {
         let mut tx = self.queue.pool.begin().await?;
 
-        if let Some(task_row) = self.queue.dequeue(&mut tx).await? {
-            let task_id = task_row.id;
-            tracing::Span::current().record("task.id", task_id.as_hyphenated().to_string());
+        let Some(pending_task) = self.queue.dequeue(&mut tx).await? else {
+            return Ok(None);
+        };
 
-            // Ensure that only one worker may process a task of a given concurrency key at
-            // a time.
-            if let Some(concurrency_key) = &task_row.concurrency_key {
-                acquire_advisory_xact_lock(&mut *tx, concurrency_key).await?;
-            }
+        let task_id = pending_task.id;
+        tracing::Span::current().record("task.id", task_id.as_hyphenated().to_string());
 
-            let input: T::Input = serde_json::from_value(task_row.input.clone())?;
-
-            let timeout = pg_interval_to_span(&task_row.timeout)
-                .try_into()
-                .expect("Task timeout should be compatible with std::time");
-
-            let execute_tx = tx.begin().await?;
-            tokio::select! {
-                result = self.task.execute(execute_tx, input) => {
-                    match result {
-                        Ok(_) => {
-                            self.queue.mark_task_succeeded(&mut *tx, task_id).await?;
-                        }
-
-                        Err(err) => {
-                            self.handle_task_error(&mut tx, task_id, task_row, err)
-                                .await?;
-                        }
-                    }
-                }
-
-                _ = tokio::time::sleep(timeout) => {
-                    tracing::error!("Task execution timed out");
-                    self.handle_task_timeout(&mut tx, task_id, task_row).await?;
-                }
-            }
-
-            tx.commit().await?;
+        // Ensure that only one worker may process a task of a given concurrency key at
+        // a time.
+        if let Some(concurrency_key) = &pending_task.concurrency_key {
+            acquire_advisory_xact_lock(&mut *tx, concurrency_key).await?;
         }
 
-        Ok(())
+        let input: T::Input = serde_json::from_value(pending_task.input.clone())?;
+
+        let timeout = pg_interval_to_span(&pending_task.timeout)
+            .try_into()
+            .expect("Task timeout should be compatible with std::time");
+
+        let execute_tx = tx.begin().await?;
+        tokio::select! {
+            result = self.task.execute(execute_tx, input) => {
+                match result {
+                    Ok(_) => {
+                        self.queue.mark_task_succeeded(&mut *tx, task_id).await?;
+                    }
+
+                    Err(err) => {
+                        self.handle_task_error(&mut tx, task_id, pending_task, err)
+                            .await?;
+                    }
+                }
+            }
+
+            _ = tokio::time::sleep(timeout) => {
+                tracing::error!("Task execution timed out");
+                self.handle_task_timeout(&mut tx, task_id, pending_task).await?;
+            }
+        }
+
+        tx.commit().await?;
+
+        Ok(Some(task_id))
     }
 
     async fn handle_task_error(
