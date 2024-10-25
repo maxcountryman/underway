@@ -321,7 +321,7 @@ impl<T: Task + Sync> Worker<T> {
         concurrency_limit: Arc<Semaphore>,
         processing_tasks: &mut JoinSet<()>,
     ) {
-        let Ok(permit) = concurrency_limit.clone().try_acquire_owned() else {
+        let Ok(permit) = concurrency_limit.try_acquire_owned() else {
             tracing::debug!("Concurrency limit reached");
             return;
         };
