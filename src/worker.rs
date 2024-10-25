@@ -117,7 +117,10 @@
 //! For cases where it's unimportant to wait for tasks to complete, this routine
 //! can be ignored.
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use jiff::{Span, ToSpan};
 use serde::Deserialize;
@@ -167,6 +170,9 @@ pub struct Worker<T: Task> {
 
     // Limits the number of concurrent `Task::execute` invocations this worker will be allowed.
     concurrency_limit: usize,
+
+    // Indicates that a queue shutdown signal has been received.
+    queue_shutdown: Arc<AtomicBool>,
 }
 
 impl<T: Task> Clone for Worker<T> {
@@ -175,6 +181,7 @@ impl<T: Task> Clone for Worker<T> {
             queue: self.queue.clone(),
             task: self.task.clone(),
             concurrency_limit: self.concurrency_limit,
+            queue_shutdown: self.queue_shutdown.clone(),
         }
     }
 }
@@ -186,6 +193,7 @@ impl<T: Task + Sync> Worker<T> {
             queue,
             task: Arc::new(task),
             concurrency_limit: num_cpus::get(),
+            queue_shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -263,6 +271,8 @@ impl<T: Task + Sync> Worker<T> {
     }
 
     async fn handle_shutdown(&self, processing_tasks: &mut JoinSet<()>) -> Result {
+        self.queue_shutdown.store(true, Ordering::SeqCst);
+
         let task_timeout = self.task.timeout();
 
         tracing::info!(
@@ -329,7 +339,7 @@ impl<T: Task + Sync> Worker<T> {
         processing_tasks.spawn({
             let worker = self.clone();
             async move {
-                loop {
+                while !worker.queue_shutdown.load(Ordering::SeqCst) {
                     match worker.process_next_task().await {
                         Err(err) => {
                             tracing::error!(err = %err, "Error processing next task");
