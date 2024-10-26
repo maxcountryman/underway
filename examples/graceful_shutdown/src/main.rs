@@ -1,7 +1,7 @@
 use std::env;
 
-use sqlx::PgPool;
-use tokio::signal;
+use sqlx::{postgres::PgPoolOptions, PgPool};
+use tokio::{signal, task::JoinSet};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use underway::{Job, To};
 
@@ -45,7 +45,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Set up the database connection pool.
     let database_url = &env::var("DATABASE_URL").expect("DATABASE_URL should be set");
-    let pool = PgPool::connect(database_url).await?;
+    let pool = PgPoolOptions::new()
+        .max_connections(25)
+        .connect(database_url)
+        .await?;
 
     // Run migrations.
     underway::MIGRATOR.run(&pool).await?;
@@ -53,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build the job.
     let job = Job::builder()
         .step(|_ctx, _input| async move {
-            let sleep_duration = std::time::Duration::from_secs(5);
+            let sleep_duration = std::time::Duration::from_secs(10);
 
             tracing::info!(?sleep_duration, "Hello from a long-running task");
 
@@ -73,8 +76,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Await the shutdown signal handler in its own task.
     tokio::spawn(async move { shutdown_signal(&pool).await });
 
-    // The job will run until the queue signals a shutdown.
-    job.run().await?;
+    // All jobs will run until the queue signals shutdown.
+    let mut jobs = JoinSet::new();
+    for _ in 0..2 {
+        jobs.spawn({
+            let job = job.clone();
+            async move { job.run().await }
+        });
+    }
+    jobs.join_all().await;
 
     Ok(())
 }

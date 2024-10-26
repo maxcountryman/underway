@@ -117,10 +117,7 @@
 //! For cases where it's unimportant to wait for tasks to complete, this routine
 //! can be ignored.
 
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::sync::Arc;
 
 use jiff::{Span, ToSpan};
 use serde::Deserialize;
@@ -129,6 +126,7 @@ use sqlx::{
     Acquire, PgConnection,
 };
 use tokio::{sync::Semaphore, task::JoinSet};
+use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
 use crate::{
@@ -171,8 +169,8 @@ pub struct Worker<T: Task> {
     // Limits the number of concurrent `Task::execute` invocations this worker will be allowed.
     concurrency_limit: usize,
 
-    // Indicates that a queue shutdown signal has been received.
-    queue_shutdown: Arc<AtomicBool>,
+    // When this token is cancelled the queue has been shutdown.
+    shutdown_token: CancellationToken,
 }
 
 impl<T: Task> Clone for Worker<T> {
@@ -181,7 +179,7 @@ impl<T: Task> Clone for Worker<T> {
             queue: self.queue.clone(),
             task: self.task.clone(),
             concurrency_limit: self.concurrency_limit,
-            queue_shutdown: self.queue_shutdown.clone(),
+            shutdown_token: self.shutdown_token.clone(),
         }
     }
 }
@@ -193,7 +191,7 @@ impl<T: Task + Sync> Worker<T> {
             queue,
             task: Arc::new(task),
             concurrency_limit: num_cpus::get(),
-            queue_shutdown: Arc::new(AtomicBool::new(false)),
+            shutdown_token: CancellationToken::new(),
         }
     }
 
@@ -216,7 +214,7 @@ impl<T: Task + Sync> Worker<T> {
     /// Same as `run` but allows for the configuration of the delay between
     /// polls.
     pub async fn run_every(&self, period: Span) -> Result {
-        let mut interval = tokio::time::interval(period.try_into()?);
+        let mut polling_interval = tokio::time::interval(period.try_into()?);
 
         // Set up a listener for shutdown notifications
         let mut shutdown_listener = PgListener::connect_with(&self.queue.pool).await?;
@@ -234,35 +232,35 @@ impl<T: Task + Sync> Worker<T> {
                 notify_shutdown = shutdown_listener.recv() => {
                     match notify_shutdown {
                         Ok(_) => {
-                            self.handle_shutdown(&mut processing_tasks).await?;
-                            break
+                            self.shutdown_token.cancel();
                         },
 
                         Err(err) => {
                             tracing::error!(%err, "Postgres shutdown notification error");
-                            continue
                         }
                     }
-                },
+                }
 
+                _ = self.shutdown_token.cancelled() => {
+                    self.handle_shutdown(&mut processing_tasks).await?;
+                    break
+                }
+
+                // Listen for new pending tasks.
                 notify_task_change = task_change_listener.recv() => {
                     match notify_task_change {
                         Ok(task_change) => self.handle_task_change(task_change, concurrency_limit.clone(), &mut processing_tasks).await?,
 
                         Err(err) => {
                             tracing::error!(%err, "Postgres task change notification error");
-                            continue;
                         }
                     };
 
-                },
+                }
 
-                // Polling fallback.
-                _ = interval.tick() => {
-                    self.trigger_task_processing(
-                        concurrency_limit.clone(),
-                        &mut processing_tasks
-                    ).await;
+                // Pending task polling fallback.
+                _ = polling_interval.tick() => {
+                    self.trigger_task_processing(concurrency_limit.clone(), &mut processing_tasks).await;
                 }
             }
         }
@@ -271,8 +269,6 @@ impl<T: Task + Sync> Worker<T> {
     }
 
     async fn handle_shutdown(&self, processing_tasks: &mut JoinSet<()>) -> Result {
-        self.queue_shutdown.store(true, Ordering::SeqCst);
-
         let task_timeout = self.task.timeout();
 
         tracing::info!(
@@ -339,19 +335,16 @@ impl<T: Task + Sync> Worker<T> {
         processing_tasks.spawn({
             let worker = self.clone();
             async move {
-                while !worker.queue_shutdown.load(Ordering::SeqCst) {
+                while !worker.shutdown_token.is_cancelled() {
                     match worker.process_next_task().await {
                         Err(err) => {
                             tracing::error!(err = %err, "Error processing next task");
                             continue;
                         }
-
                         Ok(Some(_)) => {
-                            // Since we just processed a task, we'll try again in case there's
-                            // more.
+                            // Since we just processed a task, we'll try again in case there's more.
                             continue;
                         }
-
                         Ok(None) => {
                             // We tried to process a task but found none so we'll stop trying.
                             break;
