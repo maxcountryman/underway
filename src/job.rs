@@ -1574,7 +1574,6 @@ mod tests {
         let job = Job::builder()
             .state(state.clone())
             .step(|cx, _| async move {
-                dbg!("foo");
                 let mut data = cx.state.data.lock().expect("Mutex should not be poisoned");
                 *data = "bar".to_string();
                 To::done()
