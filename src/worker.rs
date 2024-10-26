@@ -203,6 +203,15 @@ impl<T: Task + Sync> Worker<T> {
         self
     }
 
+    /// Cancels the shutdown token and begins a graceful shutdown of in-progress
+    /// tasks.
+    ///
+    /// Note that tasks are given until their configured timeout to complete
+    /// before the worker will exit.
+    pub fn shutdown(&self) {
+        self.shutdown_token.cancel();
+    }
+
     /// Runs the worker, processing tasks as they become available.
     ///
     /// Tasks are processed via a subscription to a Postgres channel and polling
