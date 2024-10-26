@@ -43,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Enqueue a job task.
     let task_id = job
-        .enqueue(WelcomeEmail {
+        .enqueue(&WelcomeEmail {
             user_id: 42,
             email: "ferris@example.com".to_string(),
             name: "Ferris".to_string(),

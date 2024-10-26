@@ -346,7 +346,7 @@
 //!     .await?;
 //!
 //! // Enqueue a new job with the given input `()`.
-//! job.enqueue(()).await?;
+//! job.enqueue(&()).await?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! # });
 //! # }
@@ -381,7 +381,7 @@
 //!     .queue(queue)
 //!     .build();
 //!
-//! job.enqueue(()).await?;
+//! job.enqueue(&()).await?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! # });
 //! # }
@@ -419,7 +419,7 @@
 //!     .await?;
 //!
 //! // Enqueue a new job with a slightly more interesting value.
-//! job.enqueue(Input {
+//! job.enqueue(&Input {
 //!     bucket_name: "my_bucket".to_string(),
 //! })
 //! .await?;
@@ -470,7 +470,7 @@
 //! #
 //!
 //! // Enqueue using a transaction that we supply.
-//! job.enqueue_using(&mut *tx, ()).await?;
+//! job.enqueue_using(&mut *tx, &()).await?;
 //!
 //! # /*
 //! /* ...And more intervening logic involving `tx`. */
@@ -637,7 +637,7 @@ use jiff::Span;
 use sealed::JobState;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sqlx::{PgExecutor, PgPool, Postgres, Transaction};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::instrument;
 use ulid::Ulid;
 
@@ -744,7 +744,7 @@ where
     }
 
     /// Enqueue the job using a connection from the queue's pool.
-    pub async fn enqueue(&self, input: I) -> Result<TaskId> {
+    pub async fn enqueue(&self, input: &I) -> Result<TaskId> {
         let mut conn = self.queue.pool.acquire().await?;
         self.enqueue_using(&mut *conn, input).await
     }
@@ -757,7 +757,7 @@ where
     /// **Note:** If you pass a transactional executor and the transaction is
     /// rolled back, the returned task ID will not correspond to any persisted
     /// task.
-    pub async fn enqueue_using<'a, E>(&self, executor: E, input: I) -> Result<TaskId>
+    pub async fn enqueue_using<'a, E>(&self, executor: E, input: &I) -> Result<TaskId>
     where
         E: PgExecutor<'a>,
     {
@@ -768,7 +768,7 @@ where
     /// queue's pool
     ///
     /// The given delay is added to the task's configured delay, if one is set.
-    pub async fn enqueue_after<'a, E>(&self, input: I, delay: Span) -> Result<TaskId>
+    pub async fn enqueue_after<'a, E>(&self, input: &I, delay: Span) -> Result<TaskId>
     where
         E: PgExecutor<'a>,
     {
@@ -789,7 +789,7 @@ where
     pub async fn enqueue_after_using<'a, E>(
         &self,
         executor: E,
-        input: I,
+        input: &I,
         delay: Span,
     ) -> Result<TaskId>
     where
@@ -798,7 +798,7 @@ where
         let job_input = self.first_job_input(input)?;
         let id = self
             .queue
-            .enqueue_after(executor, self, job_input, delay)
+            .enqueue_after(executor, self, &job_input, delay)
             .await?;
 
         Ok(id)
@@ -823,7 +823,7 @@ where
     where
         E: PgExecutor<'a>,
     {
-        let job_input = self.first_job_input(input)?;
+        let job_input = self.first_job_input(&input)?;
         self.queue
             .schedule(executor, zoned_schedule, job_input)
             .await?;
@@ -855,23 +855,16 @@ where
         let worker = Worker::new(queue.clone(), job.clone());
         let scheduler = Scheduler::new(queue, job);
 
-        let worker_task = tokio::spawn(async move { worker.run().await });
-        let scheduler_task = tokio::spawn(async move { scheduler.run().await });
+        let mut workers = JoinSet::new();
+        workers.spawn(async move { worker.run().await.map_err(Error::from) });
+        workers.spawn(async move { scheduler.run().await.map_err(Error::from) });
 
-        tokio::select! {
-            res =  worker_task => {
-                match res {
-                    Ok(inner_res) => inner_res?,
-                    Err(join_err) => return Err(Error::from(join_err)),
-                }
-            },
-
-            res = scheduler_task => {
-                match res {
-                    Ok(inner_res) => inner_res?,
-                    Err(join_err) => return Err(Error::from(join_err)),
-                }
-            },
+        while let Some(ret) = workers.join_next().await {
+            match ret {
+                Ok(Err(err)) => return Err(err),
+                Err(err) => return Err(Error::from(err)),
+                _ => continue,
+            }
         }
 
         Ok(())
@@ -885,7 +878,7 @@ where
 
     // TODO: stop method
 
-    fn first_job_input(&self, input: I) -> Result<JobState> {
+    fn first_job_input(&self, input: &I) -> Result<JobState> {
         let step_input = serde_json::to_value(input)?;
         let step_index = self.current_index.load(Ordering::SeqCst);
         let job_id = Ulid::new().into();
@@ -970,7 +963,7 @@ where
             };
 
             self.queue
-                .enqueue_after(&mut *tx, self, next_job_input, delay)
+                .enqueue_after(&mut *tx, self, &next_job_input, delay)
                 .await
                 .map_err(|err| TaskError::Retryable(err.to_string()))?;
 
@@ -1516,7 +1509,7 @@ mod tests {
             .build()
             .await?;
 
-        job.enqueue(()).await?;
+        job.enqueue(&()).await?;
 
         job.start();
 
@@ -1596,7 +1589,7 @@ mod tests {
         let input = Input {
             message: "Hello, world!".to_string(),
         };
-        let task_id = job.enqueue(input.clone()).await?;
+        let task_id = job.enqueue(&input).await?;
 
         let Some(dequeued_task) = queue.dequeue(&pool).await? else {
             panic!("Task should exist");
@@ -1726,7 +1719,7 @@ mod tests {
         let input = Step1 {
             message: "Hello, world!".to_string(),
         };
-        let task_id = job.enqueue(input).await?;
+        let task_id = job.enqueue(&input).await?;
 
         // Dequeue the first task.
         let Some(dequeued_task) = queue.dequeue(&pool).await? else {
@@ -1846,7 +1839,7 @@ mod tests {
         let input = Step1 {
             message: "Hello, world!".to_string(),
         };
-        let task_id = job.enqueue(input.clone()).await?;
+        let task_id = job.enqueue(&input).await?;
 
         // Dequeue the first task.
         let Some(dequeued_task) = queue.dequeue(&pool).await? else {

@@ -595,7 +595,7 @@ mod tests {
 
         // Enqueue a task.
         let task = TestTask;
-        queue.enqueue(&pool, &task, ()).await?;
+        queue.enqueue(&pool, &task, &()).await?;
         assert!(queue.dequeue(&pool).await?.is_some());
 
         // Process the task.
@@ -623,7 +623,7 @@ mod tests {
         let worker = Worker::new(queue.clone(), task.clone());
 
         // Enqueue the task
-        let task_id = queue.enqueue(&pool, &worker.task, ()).await?;
+        let task_id = queue.enqueue(&pool, &worker.task, &()).await?;
 
         // Process the task multiple times to simulate retries
         for retries in 0..3 {
@@ -689,7 +689,7 @@ mod tests {
 
         // Enqueue some tasks now that the worker is listening
         for _ in 0..5 {
-            queue.enqueue(&pool, &LongRunningTask, ()).await?;
+            queue.enqueue(&pool, &LongRunningTask, &()).await?;
         }
 
         // Initiate graceful shutdown
@@ -711,7 +711,7 @@ mod tests {
         assert_eq!(succeeded, Some(5));
 
         // New tasks shouldn't be processed
-        queue.enqueue(&pool, &LongRunningTask, ()).await?;
+        queue.enqueue(&pool, &LongRunningTask, &()).await?;
 
         // Wait to ensure a worker would have seen the new task if one were processing
         tokio::time::sleep(StdDuration::from_secs(1)).await;
