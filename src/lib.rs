@@ -212,7 +212,7 @@
 //!
 //!     // Set a daily schedule with the given input.
 //!     let daily = "@daily[America/Los_Angeles]".parse()?;
-//!     job.schedule(daily, DailyReport).await?;
+//!     job.schedule(&daily, &DailyReport).await?;
 //!
 //!     // Start processing enqueued jobs.
 //!     job.start().await??;
