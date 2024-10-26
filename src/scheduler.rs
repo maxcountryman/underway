@@ -63,6 +63,12 @@ impl<T: Task> Scheduler<T> {
         }
     }
 
+    /// Sets the shutdown token.
+    pub fn shutdown_token(mut self, shutdown_token: CancellationToken) -> Self {
+        self.shutdown_token = shutdown_token;
+        self
+    }
+
     /// Cancels the shutdown token causing the scheduler to exit.
     pub fn shutdown(&self) {
         self.shutdown_token.cancel();
