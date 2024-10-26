@@ -27,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Schedule the job to run every minute in the given time zone.
     let every_minute = "0 * * * * *[America/Los_Angeles]".parse()?;
-    job.schedule(every_minute, ()).await?;
+    job.schedule(&every_minute, &()).await?;
 
     job.run().await?;
 

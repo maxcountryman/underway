@@ -607,7 +607,7 @@
 //!
 //! // Sets a weekly schedule with the given input.
 //! let weekly = "@weekly[America/Los_Angeles]".parse()?;
-//! job.schedule(weekly, ()).await?;
+//! job.schedule(&weekly, &()).await?;
 //!
 //! job.start();
 //! # Ok::<(), Box<dyn std::error::Error>>(())
@@ -805,7 +805,7 @@ where
     }
 
     /// Schedule the job using a connection from the queue's pool.
-    pub async fn schedule(&self, zoned_schedule: ZonedSchedule, input: I) -> Result {
+    pub async fn schedule(&self, zoned_schedule: &ZonedSchedule, input: &I) -> Result {
         let mut conn = self.queue.pool.acquire().await?;
         self.schedule_using(&mut *conn, zoned_schedule, input).await
     }
@@ -817,15 +817,15 @@ where
     pub async fn schedule_using<'a, E>(
         &self,
         executor: E,
-        zoned_schedule: ZonedSchedule,
-        input: I,
+        zoned_schedule: &ZonedSchedule,
+        input: &I,
     ) -> Result
     where
         E: PgExecutor<'a>,
     {
-        let job_input = self.first_job_input(&input)?;
+        let job_input = self.first_job_input(input)?;
         self.queue
-            .schedule(executor, zoned_schedule, job_input)
+            .schedule(executor, zoned_schedule, &job_input)
             .await?;
 
         Ok(())
@@ -1626,7 +1626,7 @@ mod tests {
         let monthly = "@monthly[America/Los_Angeles]"
             .parse()
             .expect("A valid zoned scheduled should be provided");
-        job.schedule(monthly, ()).await?;
+        job.schedule(&monthly, &()).await?;
 
         let (schedule, _) = queue
             .task_schedule(&pool)

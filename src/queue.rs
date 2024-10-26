@@ -160,7 +160,7 @@
 //!
 //! // Set a quarter-hour schedule; IANA timezones are mandatory.
 //! let quarter_hour = "0 */15 * * * *[America/Los_Angeles]".parse()?;
-//! queue.schedule(&pool, quarter_hour, ()).await?;
+//! queue.schedule(&pool, &quarter_hour, &()).await?;
 //!
 //! # /*
 //! let task = { /* A type that implements `Task`. */ };
@@ -518,13 +518,13 @@ impl<T: Task> Queue<T> {
     pub async fn schedule<'a, E>(
         &self,
         executor: E,
-        zoned_schedule: ZonedSchedule,
-        input: T::Input,
+        zoned_schedule: &ZonedSchedule,
+        input: &T::Input,
     ) -> Result
     where
         E: PgExecutor<'a>,
     {
-        let input_value = serde_json::to_value(&input)?;
+        let input_value = serde_json::to_value(input)?;
 
         sqlx::query!(
             r#"

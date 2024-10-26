@@ -71,7 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let every_second = "* * * * * *[America/Los_Angeles]".parse()?;
-    job.schedule(every_second, ()).await?;
+    job.schedule(&every_second, &()).await?;
 
     // Await the shutdown signal handler in its own task.
     tokio::spawn(async move { shutdown_signal(&pool).await });
