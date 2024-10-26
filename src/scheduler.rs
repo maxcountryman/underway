@@ -63,6 +63,11 @@ impl<T: Task> Scheduler<T> {
         }
     }
 
+    /// Cancels the shutdown token causing the scheduler to exit.
+    pub fn shutdown(&self) {
+        self.shutdown_token.cancel();
+    }
+
     /// Loops over the configured schedule, enqueuing tasks as the duration
     /// arrives.
     pub async fn run(&self) -> Result {
