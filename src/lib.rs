@@ -86,7 +86,7 @@
 //!         .await?;
 //!
 //!     // Here we enqueue a new job to be processed later.
-//!     job.enqueue(WelcomeEmail {
+//!     job.enqueue(&WelcomeEmail {
 //!         user_id: 42,
 //!         email: "ferris@example.com".to_string(),
 //!         name: "Ferris".to_string(),
@@ -161,7 +161,7 @@
 //!         .await?;
 //!
 //!     // Enqueue the job for the given order.
-//!     job.enqueue(GenerateReceipt { order_id: 42 }).await?;
+//!     job.enqueue(&GenerateReceipt { order_id: 42 }).await?;
 //!
 //!     // Start processing enqueued jobs.
 //!     job.start().await??;

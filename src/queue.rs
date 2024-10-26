@@ -49,7 +49,7 @@
 //!     .pool(pool.clone())
 //!     .build()
 //!     .await?;
-//! # queue.enqueue(&pool, &MyTask, ()).await?;
+//! # queue.enqueue(&pool, &MyTask, &()).await?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! # });
 //! # }
@@ -104,7 +104,7 @@
 //! # let task = MyTask;
 //!
 //! // Enqueue the task.
-//! queue.enqueue(&pool, &task, ()).await?;
+//! queue.enqueue(&pool, &task, &()).await?;
 //!
 //! if let Some(task) = queue.dequeue(&pool).await? {
 //!     // Process the task here
@@ -326,7 +326,7 @@ impl<T: Task> Queue<T> {
     ///   `std::time::Duration`.
     ///
     /// [ULID]: https://github.com/ulid/spec?tab=readme-ov-file#specification
-    pub async fn enqueue<'a, E>(&self, executor: E, task: &T, input: T::Input) -> Result<TaskId>
+    pub async fn enqueue<'a, E>(&self, executor: E, task: &T, input: &T::Input) -> Result<TaskId>
     where
         E: PgExecutor<'a>,
     {
@@ -345,7 +345,7 @@ impl<T: Task> Queue<T> {
         &self,
         executor: E,
         task: &T,
-        input: T::Input,
+        input: &T::Input,
         delay: Span,
     ) -> Result<TaskId>
     where
@@ -368,7 +368,7 @@ impl<T: Task> Queue<T> {
         &self,
         executor: E,
         task: &T,
-        input: T::Input,
+        input: &T::Input,
         delay: Span,
     ) -> Result<TaskId>
     where
@@ -376,7 +376,7 @@ impl<T: Task> Queue<T> {
     {
         let id: TaskId = Ulid::new().into();
 
-        let input_value = serde_json::to_value(&input)?;
+        let input_value = serde_json::to_value(input)?;
 
         let retry_policy = task.retry_policy();
         let timeout = task.timeout();
@@ -1061,7 +1061,7 @@ mod tests {
         let input = serde_json::json!({ "key": "value" });
         let task = TestTask;
 
-        let task_id = queue.enqueue(&pool, &task, input.clone()).await?;
+        let task_id = queue.enqueue(&pool, &task, &input).await?;
 
         // Query the database to verify the task was enqueued
         let dequeued_task = sqlx::query!(
@@ -1115,7 +1115,7 @@ mod tests {
         let task = TestTask;
 
         let task_id = queue
-            .enqueue_after(&pool, &task, input.clone(), 5.minutes())
+            .enqueue_after(&pool, &task, &input, 5.minutes())
             .await?;
 
         // Check the delay
@@ -1149,7 +1149,7 @@ mod tests {
         let task = TestTask;
 
         // Enqueue a task
-        let task_id = queue.enqueue(&pool, &task, input.clone()).await?;
+        let task_id = queue.enqueue(&pool, &task, &input).await?;
 
         // Dequeue the task
         let dequeued_task = queue.dequeue(&pool).await?;
@@ -1210,7 +1210,7 @@ mod tests {
 
         // Enqueue multiple tasks
         for _ in 0..5 {
-            queue.enqueue(&pool, &task, input.clone()).await?;
+            queue.enqueue(&pool, &task, &input).await?;
         }
 
         // Simulate concurrent dequeues
@@ -1267,7 +1267,7 @@ mod tests {
         let task = TestTask;
 
         // Enqueue a task
-        let task_id = queue.enqueue(&pool, &task, input).await?;
+        let task_id = queue.enqueue(&pool, &task, &input).await?;
 
         // Mark the task as in progress
         queue.mark_task_in_progress(&pool, task_id).await?;
@@ -1299,7 +1299,7 @@ mod tests {
         let task = TestTask;
 
         // Enqueue a task
-        let task_id = queue.enqueue(&pool, &task, input).await?;
+        let task_id = queue.enqueue(&pool, &task, &input).await?;
 
         // Reschedule the task for retry
         let retry_count = 1;
@@ -1348,7 +1348,7 @@ mod tests {
         let task = TestTask;
 
         // Enqueue a task
-        let task_id = queue.enqueue(&pool, &task, input).await?;
+        let task_id = queue.enqueue(&pool, &task, &input).await?;
 
         // Cancel the task
         queue.mark_task_cancelled(&pool, task_id).await?;
@@ -1380,7 +1380,7 @@ mod tests {
         let task = TestTask;
 
         // Enqueue a task
-        let task_id = queue.enqueue(&pool, &task, input).await?;
+        let task_id = queue.enqueue(&pool, &task, &input).await?;
 
         // Mark the task as succeeded
         queue.mark_task_succeeded(&pool, task_id).await?;
@@ -1466,7 +1466,7 @@ mod tests {
         let task = TestTask;
 
         // Enqueue a task
-        let task_id = queue.enqueue(&pool, &task, input).await?;
+        let task_id = queue.enqueue(&pool, &task, &input).await?;
 
         // Mark the task as failed
         queue.mark_task_failed(&pool, task_id).await?;
@@ -1499,7 +1499,7 @@ mod tests {
         let task = TestTask;
 
         // Enqueue a task
-        let task_id = queue.enqueue(&pool, &task, input).await?;
+        let task_id = queue.enqueue(&pool, &task, &input).await?;
 
         // Update task failure details
         let retry_count = 2;
@@ -1540,7 +1540,7 @@ mod tests {
         let task = TestTask;
 
         // Enqueue a task
-        let task_id = queue.enqueue(&pool, &task, input).await?;
+        let task_id = queue.enqueue(&pool, &task, &input).await?;
 
         // Move the task to DLQ
         queue.move_task_to_dlq(&pool, task_id, "test_dlq").await?;

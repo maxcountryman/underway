@@ -30,7 +30,7 @@ impl WelcomeEmailTask {
         // This ensures our task-specific configuration is applied.
         let welcome_email_task = self.into();
         queue
-            .enqueue(pool, &welcome_email_task, TaskInput::WelcomeEmail(input))
+            .enqueue(pool, &welcome_email_task, &TaskInput::WelcomeEmail(input))
             .await
     }
 }
@@ -63,7 +63,7 @@ impl OrderTask {
         // This ensures our task-specific configuration is applied.
         let order_task = self.into();
         queue
-            .enqueue(pool, &order_task, TaskInput::Order(input))
+            .enqueue(pool, &order_task, &TaskInput::Order(input))
             .await
     }
 }

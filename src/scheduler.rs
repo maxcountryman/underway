@@ -1,14 +1,13 @@
-use std::{
-    future, result::Result as StdResult, str::FromStr, sync::Arc, time::Duration as StdDuration,
-};
+use std::{result::Result as StdResult, str::FromStr, sync::Arc, time::Duration as StdDuration};
 
 use jiff::{tz::TimeZone, Span, ToSpan, Zoned};
 use jiff_cron::Schedule;
-use sqlx::postgres::PgAdvisoryLock;
+use sqlx::postgres::{PgAdvisoryLock, PgListener};
+use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
 use crate::{
-    queue::{try_acquire_advisory_lock, Error as QueueError},
+    queue::{try_acquire_advisory_lock, Error as QueueError, SHUTDOWN_CHANNEL},
     Queue, Task,
 };
 
@@ -18,6 +17,9 @@ pub(crate) type Result<T = ()> = std::result::Result<T, Error>;
 pub enum Error {
     #[error(transparent)]
     Queue(#[from] QueueError),
+
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
 
     #[error(transparent)]
     Jiff(#[from] jiff::Error),
@@ -44,6 +46,9 @@ pub struct Scheduler<T: Task> {
     queue: Queue<T>,
     queue_lock: PgAdvisoryLock,
     task: Arc<T>,
+
+    // When this token is cancelled the queue has been shutdown.
+    shutdown_token: CancellationToken,
 }
 
 impl<T: Task> Scheduler<T> {
@@ -54,6 +59,7 @@ impl<T: Task> Scheduler<T> {
             queue,
             queue_lock,
             task: Arc::new(task),
+            shutdown_token: CancellationToken::new(),
         }
     }
 
@@ -65,29 +71,60 @@ impl<T: Task> Scheduler<T> {
     /// Runs the scheduler in a loop, sleeping for the given period per
     /// iteration.
     pub async fn run_every(&self, period: Span) -> Result {
-        let conn = self.queue.pool.acquire().await.map_err(QueueError::from)?;
+        let conn = self.queue.pool.acquire().await?;
         let Some(_guard) = try_acquire_advisory_lock(conn, &self.queue_lock).await? else {
-            // We can't acquire the lock, so we'll return a future that waits forever.
-            return future::pending().await;
+            tracing::debug!("Scheduler could not acquire lock, exiting");
+            return Ok(());
         };
 
-        let mut interval = tokio::time::interval(period.try_into()?);
-        interval.tick().await;
+        let Some((mut zoned_schedule, input)) = self.queue.task_schedule(&self.queue.pool).await?
+        else {
+            // No schedule configured, so we'll exit.
+            return Ok(());
+        };
+
+        // Set up a listener for shutdown notifications
+        let mut shutdown_listener = PgListener::connect_with(&self.queue.pool).await?;
+        shutdown_listener.listen(SHUTDOWN_CHANNEL).await?;
+
+        let mut polling_interval = tokio::time::interval(period.try_into()?);
         loop {
-            // TODO: It would be preferrable to not check the schedule every second and wait
-            // for a NOTIFY instead.
-            if let Some((zoned_schedule, input)) =
-                self.queue.task_schedule(&self.queue.pool).await?
-            {
-                // TODO: If we were waiting for a NOTIFY or timeout, we could keep processing
-                // the same schedule without fetching from the database.
-                if let Some(until_next) = zoned_schedule.into_iter().next() {
-                    self.process_next_schedule(until_next, input).await?
+            tokio::select! {
+                notify_shutdown = shutdown_listener.recv() => {
+                    match notify_shutdown {
+                        Ok(_) => {
+                            self.shutdown_token.cancel();
+                        },
+
+                        Err(err) => {
+                            tracing::error!(%err, "Postgres shutdown notification error");
+                        }
+                    }
+                }
+
+                _ = self.shutdown_token.cancelled() => {
+                    break
+                }
+
+                _ = polling_interval.tick() => {
+                    self.trigger_schedule_processing(&mut zoned_schedule, &input).await?
                 }
             }
-
-            interval.tick().await;
         }
+
+        Ok(())
+    }
+
+    async fn trigger_schedule_processing(
+        &self,
+        zoned_schedule: &mut ZonedSchedule,
+        input: &T::Input,
+    ) -> Result {
+        if let Some(until_next) = zoned_schedule.into_iter().next() {
+            self.process_next_schedule(until_next, input).await?;
+        }
+
+        Ok(())
     }
 
     #[instrument(
@@ -99,7 +136,7 @@ impl<T: Task> Scheduler<T> {
         ),
         err
     )]
-    async fn process_next_schedule(&self, until_next: StdDuration, input: T::Input) -> Result {
+    async fn process_next_schedule(&self, until_next: StdDuration, input: &T::Input) -> Result {
         tracing::debug!(?until_next, "Sleeping until the next scheduled enqueue");
         tokio::time::sleep(until_next).await;
 
