@@ -370,8 +370,7 @@ impl<T: Task> Queue<T> {
     /// ```rust,no_run
     /// # use sqlx::{PgPool, Transaction, Postgres};
     /// # use underway::{Task, task::Result as TaskResult};
-    /// use underway::Queue;
-    ///
+    /// # use underway::Queue;
     /// # struct ExampleTask;
     /// # impl Task for ExampleTask {
     /// #     type Input = ();
@@ -392,17 +391,22 @@ impl<T: Task> Queue<T> {
     /// # /*
     /// let pool = { /* A `PgPool`. */ };
     /// # */
-    /// let queue = Queue::builder()
-    ///     .name("example")
-    ///     .pool(pool.clone())
-    ///     .build()
-    ///     .await?;
-    ///
-    /// // Enqueue a new task with input.
+    /// #
+    /// # let queue = Queue::builder()
+    /// #     .name("example")
+    /// #     .pool(pool.clone())
+    /// #     .build()
+    /// #     .await?;
+    /// # /*
+    /// let queue = { /* A `Queue`. */ };
+    /// # */
     /// # let task = ExampleTask;
     /// # /*
     /// let task = { /* An implementer of `Task`. */ };
     /// # */
+    /// #
+    ///
+    /// // Enqueue a new task with input.
     /// let task_id = queue.enqueue(&pool, &task, &()).await?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
@@ -429,8 +433,8 @@ impl<T: Task> Queue<T> {
     /// ```rust,no_run
     /// # use sqlx::{PgPool, Transaction, Postgres};
     /// # use underway::{Task, task::Result as TaskResult};
+    /// # use underway::Queue;
     /// use jiff::ToSpan;
-    /// use underway::Queue;
     ///
     /// # struct ExampleTask;
     /// # impl Task for ExampleTask {
@@ -452,17 +456,21 @@ impl<T: Task> Queue<T> {
     /// # /*
     /// let pool = { /* A `PgPool`. */ };
     /// # */
-    /// let queue = Queue::builder()
-    ///     .name("example")
-    ///     .pool(pool.clone())
-    ///     .build()
-    ///     .await?;
-    ///
-    /// // Enqueue a new task with input.
+    /// # let queue = Queue::builder()
+    /// #     .name("example")
+    /// #     .pool(pool.clone())
+    /// #     .build()
+    /// #     .await?;
+    /// # /*
+    /// let queue = { /* A `Queue`. */ };
+    /// # */
     /// # let task = ExampleTask;
     /// # /*
     /// let task = { /* An implementer of `Task`. */ };
     /// # */
+    /// #
+    ///
+    /// // Enqueue a new task with input after five minutes.
     /// let task_id = queue.enqueue_after(&pool, &task, &(), 5.minutes()).await?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
@@ -582,8 +590,7 @@ impl<T: Task> Queue<T> {
     /// ```rust,no_run
     /// # use sqlx::{PgPool, Transaction, Postgres};
     /// # use underway::{Task, task::Result as TaskResult};
-    /// use underway::Queue;
-    ///
+    /// # use underway::Queue;
     /// # struct ExampleTask;
     /// # impl Task for ExampleTask {
     /// #     type Input = ();
@@ -604,25 +611,28 @@ impl<T: Task> Queue<T> {
     /// # /*
     /// let pool = { /* A `PgPool`. */ };
     /// # */
-    /// let queue = Queue::builder()
-    ///     .name("example")
-    ///     .pool(pool.clone())
-    ///     .build()
-    ///     .await?;
-    ///
-    /// // Enqueue a new task.
+    /// # let queue = Queue::builder()
+    /// #     .name("example")
+    /// #     .pool(pool.clone())
+    /// #     .build()
+    /// #     .await?;
+    /// # /*
+    /// let queue = { /* A `Queue`. */ };
+    /// # */
     /// # let task = ExampleTask;
     /// # /*
     /// let task = { /* An implementer of `Task`. */ };
     /// # */
-    /// let task_id = queue.enqueue(&pool, &task, &()).await?;
+    /// #
+    ///
+    /// // Enqueue a new task.
+    /// queue.enqueue(&pool, &task, &()).await?;
     ///
     /// // Dequeue the enqueued task.
     /// let pending_task = queue
     ///     .dequeue(&pool)
     ///     .await?
     ///     .expect("There should be a pending task.");
-    /// # assert_eq!(pending_task.id, task_id);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
     /// # }
@@ -698,8 +708,7 @@ impl<T: Task> Queue<T> {
     /// ```rust,no_run
     /// # use sqlx::{PgPool, Transaction, Postgres};
     /// # use underway::{Task, task::Result as TaskResult};
-    /// use underway::Queue;
-    ///
+    /// # use underway::Queue;
     /// # struct ExampleTask;
     /// # impl Task for ExampleTask {
     /// #     type Input = ();
@@ -721,11 +730,14 @@ impl<T: Task> Queue<T> {
     /// let pool = { /* A `PgPool`. */ };
     /// # */
     /// # let task = ExampleTask;
-    /// let queue = Queue::builder()
-    ///     .name("example")
-    ///     .pool(pool.clone())
-    ///     .build()
-    ///     .await?;
+    /// # let queue = Queue::builder()
+    /// #     .name("example")
+    /// #     .pool(pool.clone())
+    /// #     .build()
+    /// #     .await?;
+    /// # /*
+    /// let queue = { /* A `Queue`. */ };
+    /// # */
     /// # queue.enqueue(&pool, &task, &()).await?;
     ///
     /// // Set a schedule on the queue with the given input.
@@ -789,8 +801,7 @@ impl<T: Task> Queue<T> {
     /// ```rust,no_run
     /// # use sqlx::{PgPool, Transaction, Postgres};
     /// # use underway::{Task, task::Result as TaskResult};
-    /// use underway::Queue;
-    ///
+    /// # use underway::Queue;
     /// # struct ExampleTask;
     /// # impl Task for ExampleTask {
     /// #     type Input = ();
@@ -812,11 +823,14 @@ impl<T: Task> Queue<T> {
     /// let pool = { /* A `PgPool`. */ };
     /// # */
     /// # let task = ExampleTask;
-    /// let queue = Queue::builder()
-    ///     .name("example")
-    ///     .pool(pool.clone())
-    ///     .build()
-    ///     .await?;
+    /// # let queue = Queue::builder()
+    /// #     .name("example")
+    /// #     .pool(pool.clone())
+    /// #     .build()
+    /// #     .await?;
+    /// # /*
+    /// let queue = { /* A `Queue`. */ };
+    /// # */
     /// # queue.enqueue(&pool, &task, &()).await?;
     ///
     /// // Unset the schedule if one was set.
