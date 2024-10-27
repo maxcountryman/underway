@@ -186,6 +186,50 @@ impl<T: Task> Clone for Worker<T> {
 
 impl<T: Task + Sync> Worker<T> {
     /// Creates a new worker with the given queue and task.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::{PgPool, Transaction, Postgres};
+    /// # use underway::{Task, task::Result as TaskResult, Queue};
+    /// use underway::Worker;
+    ///
+    /// # struct ExampleTask;
+    /// # impl Task for ExampleTask {
+    /// #     type Input = ();
+    /// #     type Output = ();
+    /// #     async fn execute(
+    /// #         &self,
+    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: Self::Input,
+    /// #     ) -> TaskResult<Self::Output> {
+    /// #         Ok(())
+    /// #     }
+    /// # }
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # let queue = Queue::builder()
+    /// #    .name("example")
+    /// #    .pool(pool.clone())
+    /// #    .build()
+    /// #    .await?;
+    /// # /*
+    /// let queue = { /* A `Queue`. */ };
+    /// # */
+    /// # let task = ExampleTask;
+    /// # /*
+    /// let task = { /* An implementer of `Task`. */ };
+    /// # */
+    /// #
+    ///
+    /// Worker::new(queue, task);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     pub fn new(queue: Queue<T>, task: T) -> Self {
         Self {
             queue,
@@ -198,12 +242,97 @@ impl<T: Task + Sync> Worker<T> {
     /// Sets the concurrency limit for this worker.
     ///
     /// Defaults to CPU count as per [`num_cpus::get`].
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::{PgPool, Transaction, Postgres};
+    /// # use underway::{Task, task::Result as TaskResult, Queue, Worker};
+    /// # struct ExampleTask;
+    /// # impl Task for ExampleTask {
+    /// #     type Input = ();
+    /// #     type Output = ();
+    /// #     async fn execute(
+    /// #         &self,
+    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: Self::Input,
+    /// #     ) -> TaskResult<Self::Output> {
+    /// #         Ok(())
+    /// #     }
+    /// # }
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # let queue = Queue::builder()
+    /// #    .name("example")
+    /// #    .pool(pool.clone())
+    /// #    .build()
+    /// #    .await?;
+    /// # let task = ExampleTask;
+    /// # let worker = Worker::new(queue, task);
+    /// # /*
+    /// let worker = { /* A `Worker`. */ };
+    /// # */
+    /// #
+    ///
+    /// // Set a fixed concurrency limit.
+    /// worker.concurrency_limit(32);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     pub fn concurrency_limit(mut self, concurrency_limit: usize) -> Self {
         self.concurrency_limit = concurrency_limit;
         self
     }
 
     /// Sets the shutdown token.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::{PgPool, Transaction, Postgres};
+    /// # use underway::{Task, task::Result as TaskResult, Queue, Worker};
+    /// use tokio_util::sync::CancellationToken;
+    ///
+    /// # struct ExampleTask;
+    /// # impl Task for ExampleTask {
+    /// #     type Input = ();
+    /// #     type Output = ();
+    /// #     async fn execute(
+    /// #         &self,
+    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: Self::Input,
+    /// #     ) -> TaskResult<Self::Output> {
+    /// #         Ok(())
+    /// #     }
+    /// # }
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # let queue = Queue::builder()
+    /// #    .name("example")
+    /// #    .pool(pool.clone())
+    /// #    .build()
+    /// #    .await?;
+    /// # let task = ExampleTask;
+    /// # let worker = Worker::new(queue, task);
+    /// # /*
+    /// let worker = { /* A `Worker`. */ };
+    /// # */
+    /// #
+    ///
+    /// // Set a custom cancellation token.
+    /// let token = CancellationToken::new();
+    /// worker.shutdown_token(token);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     pub fn shutdown_token(mut self, shutdown_token: CancellationToken) -> Self {
         self.shutdown_token = shutdown_token;
         self
@@ -214,6 +343,47 @@ impl<T: Task + Sync> Worker<T> {
     ///
     /// Note that tasks are given until their configured timeout to complete
     /// before the worker will exit.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::{PgPool, Transaction, Postgres};
+    /// # use underway::{Task, task::Result as TaskResult, Queue, Worker};
+    /// # struct ExampleTask;
+    /// # impl Task for ExampleTask {
+    /// #     type Input = ();
+    /// #     type Output = ();
+    /// #     async fn execute(
+    /// #         &self,
+    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: Self::Input,
+    /// #     ) -> TaskResult<Self::Output> {
+    /// #         Ok(())
+    /// #     }
+    /// # }
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # let queue = Queue::builder()
+    /// #    .name("example")
+    /// #    .pool(pool.clone())
+    /// #    .build()
+    /// #    .await?;
+    /// # let task = ExampleTask;
+    /// # let worker = Worker::new(queue, task);
+    /// # /*
+    /// let worker = { /* A `Worker`. */ };
+    /// # */
+    /// #
+    ///
+    /// // Begin graceful shutdown.
+    /// worker.shutdown();
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     pub fn shutdown(&self) {
         self.shutdown_token.cancel();
     }
@@ -222,12 +392,110 @@ impl<T: Task + Sync> Worker<T> {
     ///
     /// Tasks are processed via a subscription to a Postgres channel and polling
     /// in a loop. A one-minute sleep occurs between polls.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if:
+    /// - It fails to listen on either the shutdown channel or the task change
+    ///   channel.
+    /// - Task timeouts fails to be converted to std::time::Duration.
+    ///
+    /// It also has the same error conditions as [`Queue::dequeue`], as this is
+    /// used internally.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::{PgPool, Transaction, Postgres};
+    /// # use underway::{Task, task::Result as TaskResult, Queue, Worker};
+    /// # struct ExampleTask;
+    /// # impl Task for ExampleTask {
+    /// #     type Input = ();
+    /// #     type Output = ();
+    /// #     async fn execute(
+    /// #         &self,
+    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: Self::Input,
+    /// #     ) -> TaskResult<Self::Output> {
+    /// #         Ok(())
+    /// #     }
+    /// # }
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # let queue = Queue::builder()
+    /// #    .name("example")
+    /// #    .pool(pool)
+    /// #    .build()
+    /// #    .await?;
+    /// # let task = ExampleTask;
+    /// # let worker = Worker::new(queue, task);
+    /// # /*
+    /// let worker = { /* A `Worker`. */ };
+    /// # */
+    /// #
+    ///
+    /// // Run the worker in a separate task.
+    /// tokio::spawn(async move { worker.run().await });
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     pub async fn run(&self) -> Result {
         self.run_every(1.minute()).await
     }
 
     /// Same as `run` but allows for the configuration of the delay between
     /// polls.
+    ///
+    /// # Errors
+    ///
+    /// This has the same error conditions as [`Worker::run`].
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::{PgPool, Transaction, Postgres};
+    /// # use underway::{Task, task::Result as TaskResult, Queue, Worker};
+    /// use jiff::ToSpan;
+    ///
+    /// # struct ExampleTask;
+    /// # impl Task for ExampleTask {
+    /// #     type Input = ();
+    /// #     type Output = ();
+    /// #     async fn execute(
+    /// #         &self,
+    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: Self::Input,
+    /// #     ) -> TaskResult<Self::Output> {
+    /// #         Ok(())
+    /// #     }
+    /// # }
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # let queue = Queue::builder()
+    /// #    .name("example")
+    /// #    .pool(pool)
+    /// #    .build()
+    /// #    .await?;
+    /// # let task = ExampleTask;
+    /// # let worker = Worker::new(queue, task);
+    /// # /*
+    /// let worker = { /* A `Worker`. */ };
+    /// # */
+    /// #
+    ///
+    /// // Increase the polling interval to every ten seconds.
+    /// tokio::spawn(async move { worker.run_every(10.seconds()).await });
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     pub async fn run_every(&self, period: Span) -> Result {
         let mut polling_interval = tokio::time::interval(period.try_into()?);
 
@@ -384,6 +652,54 @@ impl<T: Task + Sync> Worker<T> {
     /// is [explicitly fatal](crate::task::Error::Fatal) or no more retries are
     /// left, then the task will be re-queued in a
     /// [`Pending`](crate::task::State::Pending) state.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if a new transaction cannot be
+    /// acquired from the queue pool.
+    ///
+    /// It also has the same error conditions as [`Queue::dequeue`] as this is
+    /// used internally.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::{PgPool, Transaction, Postgres};
+    /// # use underway::{Task, task::Result as TaskResult, Queue, Worker};
+    /// # struct ExampleTask;
+    /// # impl Task for ExampleTask {
+    /// #     type Input = ();
+    /// #     type Output = ();
+    /// #     async fn execute(
+    /// #         &self,
+    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: Self::Input,
+    /// #     ) -> TaskResult<Self::Output> {
+    /// #         Ok(())
+    /// #     }
+    /// # }
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # let queue = Queue::builder()
+    /// #    .name("example")
+    /// #    .pool(pool.clone())
+    /// #    .build()
+    /// #    .await?;
+    /// # let task = ExampleTask;
+    /// # let worker = Worker::new(queue, task);
+    /// # /*
+    /// let worker = { /* A `Worker`. */ };
+    /// # */
+    /// #
+    ///
+    /// worker.process_next_task().await?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     #[instrument(
         skip(self),
         fields(

@@ -52,7 +52,51 @@ pub struct Scheduler<T: Task> {
 }
 
 impl<T: Task> Scheduler<T> {
-    /// Creates a new scheduler.
+    /// Creates a new scheduler with the given queue and task.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::{PgPool, Transaction, Postgres};
+    /// # use underway::{Task, task::Result as TaskResult, Queue};
+    /// use underway::Scheduler;
+    ///
+    /// # struct ExampleTask;
+    /// # impl Task for ExampleTask {
+    /// #     type Input = ();
+    /// #     type Output = ();
+    /// #     async fn execute(
+    /// #         &self,
+    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: Self::Input,
+    /// #     ) -> TaskResult<Self::Output> {
+    /// #         Ok(())
+    /// #     }
+    /// # }
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # let queue = Queue::builder()
+    /// #    .name("example")
+    /// #    .pool(pool.clone())
+    /// #    .build()
+    /// #    .await?;
+    /// # /*
+    /// let queue = { /* A `Queue`. */ };
+    /// # */
+    /// # let task = ExampleTask;
+    /// # /*
+    /// let task = { /* An implementer of `Task`. */ };
+    /// # */
+    /// #
+    ///
+    /// Scheduler::new(queue, task);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     pub fn new(queue: Queue<T>, task: T) -> Self {
         let queue_lock = queue_scheduler_lock(&queue.name);
         Self {
@@ -64,18 +108,154 @@ impl<T: Task> Scheduler<T> {
     }
 
     /// Sets the shutdown token.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::{PgPool, Transaction, Postgres};
+    /// # use underway::{Task, task::Result as TaskResult, Queue, Scheduler};
+    /// use tokio_util::sync::CancellationToken;
+    ///
+    /// # struct ExampleTask;
+    /// # impl Task for ExampleTask {
+    /// #     type Input = ();
+    /// #     type Output = ();
+    /// #     async fn execute(
+    /// #         &self,
+    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: Self::Input,
+    /// #     ) -> TaskResult<Self::Output> {
+    /// #         Ok(())
+    /// #     }
+    /// # }
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # let queue = Queue::builder()
+    /// #    .name("example")
+    /// #    .pool(pool.clone())
+    /// #    .build()
+    /// #    .await?;
+    /// # let task = ExampleTask;
+    /// # let scheduler = Scheduler::new(queue, task);
+    /// # /*
+    /// let scheduler = { /* A `Scheduler`. */ };
+    /// # */
+    /// #
+    ///
+    /// // Set a custom cancellation token.
+    /// let token = CancellationToken::new();
+    /// scheduler.shutdown_token(token);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     pub fn shutdown_token(mut self, shutdown_token: CancellationToken) -> Self {
         self.shutdown_token = shutdown_token;
         self
     }
 
     /// Cancels the shutdown token causing the scheduler to exit.
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::{PgPool, Transaction, Postgres};
+    /// # use underway::{Task, task::Result as TaskResult, Queue, Scheduler};
+    /// use tokio_util::sync::CancellationToken;
+    ///
+    /// # struct ExampleTask;
+    /// # impl Task for ExampleTask {
+    /// #     type Input = ();
+    /// #     type Output = ();
+    /// #     async fn execute(
+    /// #         &self,
+    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: Self::Input,
+    /// #     ) -> TaskResult<Self::Output> {
+    /// #         Ok(())
+    /// #     }
+    /// # }
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # let queue = Queue::builder()
+    /// #    .name("example")
+    /// #    .pool(pool.clone())
+    /// #    .build()
+    /// #    .await?;
+    /// # let task = ExampleTask;
+    /// # let scheduler = Scheduler::new(queue, task);
+    /// # /*
+    /// let scheduler = { /* A `Scheduler`. */ };
+    /// # */
+    /// #
+    ///
+    /// // Stop the scheduler.
+    /// scheduler.shutdown();
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     pub fn shutdown(&self) {
         self.shutdown_token.cancel();
     }
 
     /// Loops over the configured schedule, enqueuing tasks as the duration
     /// arrives.
+    ///
+    /// # Errors
+    ///
+    /// This function returns an error if:
+    ///
+    /// - It cannot acquire a new connection from the queue's pool.
+    /// - It fails to listen on either the shutdown channel.
+    ///
+    /// It also has the same error conditions as [`Queue::task_schedule`] as
+    /// this is used internally.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::{PgPool, Transaction, Postgres};
+    /// # use underway::{Task, task::Result as TaskResult, Queue, Scheduler};
+    /// # struct ExampleTask;
+    /// # impl Task for ExampleTask {
+    /// #     type Input = ();
+    /// #     type Output = ();
+    /// #     async fn execute(
+    /// #         &self,
+    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: Self::Input,
+    /// #     ) -> TaskResult<Self::Output> {
+    /// #         Ok(())
+    /// #     }
+    /// # }
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # let queue = Queue::builder()
+    /// #    .name("example")
+    /// #    .pool(pool)
+    /// #    .build()
+    /// #    .await?;
+    /// # let task = ExampleTask;
+    /// # let scheduler = Scheduler::new(queue, task);
+    /// # /*
+    /// let scheduler = { /* A `Scheduler`. */ };
+    /// # */
+    /// #
+    ///
+    /// // Run the scheduler in separate task.
+    /// tokio::spawn(async move { scheduler.run().await });
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     pub async fn run(&self) -> Result {
         let conn = self.queue.pool.acquire().await?;
         let Some(_guard) = try_acquire_advisory_lock(conn, &self.queue_lock).await? else {

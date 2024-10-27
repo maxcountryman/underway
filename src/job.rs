@@ -1214,6 +1214,40 @@ where
     }
 
     /// Constructs a worker which then immediately runs task processing.
+    ///
+    /// # Errors
+    ///
+    /// This has the same error conditions as [`Worker::run`].
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::PgPool;
+    /// use jiff::ToSpan;
+    /// use underway::{Job, To};
+    ///
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # /*
+    /// let pool = { /* A `PgPool`. */ };
+    /// # */
+    /// #
+    ///
+    /// let job = Job::<(), _>::builder()
+    ///     .step(|_cx, _| async move { To::done() })
+    ///     .name("example")
+    ///     .pool(pool)
+    ///     .build()
+    ///     .await?;
+    ///
+    /// job.run_worker().await?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     pub async fn run_worker(self) -> WorkerResult {
         let queue = self.queue.clone();
         let job = self.clone();
@@ -1222,6 +1256,40 @@ where
     }
 
     /// Contructs a worker which then immediately runs schedule processing.
+    ///
+    /// # Errors
+    ///
+    /// This has the same error conditions as [`Scheduler::run`].
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::PgPool;
+    /// use jiff::ToSpan;
+    /// use underway::{Job, To};
+    ///
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # /*
+    /// let pool = { /* A `PgPool`. */ };
+    /// # */
+    /// #
+    ///
+    /// let job = Job::<(), _>::builder()
+    ///     .step(|_cx, _| async move { To::done() })
+    ///     .name("example")
+    ///     .pool(pool)
+    ///     .build()
+    ///     .await?;
+    ///
+    /// job.run_scheduler().await?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     pub async fn run_scheduler(self) -> SchedulerResult {
         let queue = self.queue.clone();
         let job = self.clone();
@@ -1230,6 +1298,42 @@ where
     }
 
     /// Runs both a worker and scheduler for the job.
+    ///
+    /// # Errors
+    ///
+    /// This has the same error conditions as [`Worker::run`] and
+    /// [`Scheduler::run`]. It will also return an error if either of the
+    /// spawned worker or scheduler cannot be joined.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::PgPool;
+    /// use jiff::ToSpan;
+    /// use underway::{Job, To};
+    ///
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # /*
+    /// let pool = { /* A `PgPool`. */ };
+    /// # */
+    /// #
+    ///
+    /// let job = Job::<(), _>::builder()
+    ///     .step(|_cx, _| async move { To::done() })
+    ///     .name("example")
+    ///     .pool(pool)
+    ///     .build()
+    ///     .await?;
+    ///
+    /// job.run().await?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     pub async fn run(self) -> Result {
         let queue = self.queue.clone();
         let job = self.clone();
@@ -1253,6 +1357,45 @@ where
     }
 
     /// Starts both a worker and scheduler for the job and returns a handle.
+    ///
+    /// The returned handle may be used to gracefully shutdown the worker and
+    /// scheduler.
+    ///
+    /// # Errors
+    ///
+    /// This has the same error conditions as [`Worker::run`] and
+    /// [`Scheduler::run`]. It will also return an error if either of the
+    /// spawned worker or scheduler cannot be joined.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::PgPool;
+    /// use jiff::ToSpan;
+    /// use underway::{Job, To};
+    ///
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # /*
+    /// let pool = { /* A `PgPool`. */ };
+    /// # */
+    /// #
+    ///
+    /// let job = Job::<(), _>::builder()
+    ///     .step(|_cx, _| async move { To::done() })
+    ///     .name("example")
+    ///     .pool(pool)
+    ///     .build()
+    ///     .await?;
+    ///
+    /// job.start().await??;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     pub fn start(self) -> JobHandle {
         let shutdown_token = CancellationToken::new();
         let mut workers = JoinSet::new();
