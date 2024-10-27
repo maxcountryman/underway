@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            select schedule, timezone, input\n            from underway.task_schedule \n            where name = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "schedule",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "timezone",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "input",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "ff45d5a6d9d8b7bc40a52aa2e471a0e665607fd01725a866c3dca0b21f25b0cb"
+}
