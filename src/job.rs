@@ -626,10 +626,12 @@ use std::{
     marker::PhantomData,
     mem,
     pin::Pin,
+    result::Result as StdResult,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
+    task::Poll,
 };
 
 use builder_states::{Initial, PoolSet, QueueNameSet, QueueSet, StateSet, StepSet};
@@ -637,7 +639,8 @@ use jiff::Span;
 use sealed::JobState;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sqlx::{PgExecutor, PgPool, Postgres, Transaction};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::{JoinError, JoinSet};
+use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 use ulid::Ulid;
 
@@ -717,6 +720,56 @@ mod sealed {
         pub step_input: serde_json::Value,
         pub job_id: Uuid,
     } // TODO: Versioning?
+}
+
+/// Container for the runtime of the job instance.
+///
+/// Provides a method to gracefully stop the worker and scheduler.
+pub struct JobHandle {
+    workers: JoinSet<StdResult<Result<()>, JoinError>>,
+    shutdown_token: CancellationToken,
+}
+
+impl JobHandle {
+    /// Signals the worker and scheduler to shutdown and waits for them to
+    /// finish.
+    pub async fn shutdown(mut self) -> Result<()> {
+        self.shutdown_token.cancel();
+
+        // Await all tasks in the join set
+        while let Some(result) = self.workers.join_next().await {
+            match result? {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => return Err(err),
+                Err(join_err) => return Err(join_err.into()),
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl Unpin for JobHandle {}
+
+impl Future for JobHandle {
+    type Output = StdResult<Result<()>, JoinError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        // Poll the join set to see if all tasks are done
+        while let Poll::Ready(Some(result)) = self.workers.poll_join_next(cx) {
+            match result? {
+                Ok(Ok(())) => continue,
+                Ok(Err(err)) => return Poll::Ready(Ok(Err(err))),
+                Err(join_err) => return Poll::Ready(Err(join_err)),
+            }
+        }
+
+        if self.workers.is_empty() {
+            Poll::Ready(Ok(Ok(())))
+        } else {
+            Poll::Pending
+        }
+    }
 }
 
 /// Sequential set of functions, where the output of the last is the input to
@@ -870,13 +923,34 @@ where
         Ok(())
     }
 
-    /// Same as [`run`](Job::run) but spawns the future and returns the
-    /// [`JoinHandle`].
-    pub fn start(self) -> JoinHandle<Result> {
-        tokio::spawn(async move { self.run().await })
-    }
+    /// Starts both a worker and scheduler for the job and returns a handle.
+    pub fn start(self) -> JobHandle {
+        let shutdown_token = CancellationToken::new();
+        let mut workers = JoinSet::new();
 
-    // TODO: stop method
+        let queue = self.queue.clone();
+        let job = self.clone();
+
+        let mut worker = Worker::new(queue.clone(), job.clone());
+        worker = worker.shutdown_token(shutdown_token.clone());
+
+        let mut scheduler = Scheduler::new(queue, job);
+        scheduler = scheduler.shutdown_token(shutdown_token.clone());
+
+        // Spawn the tasks using `tokio::spawn` to decouple them from polling the
+        // `Future`.
+        let worker_handle = tokio::spawn(async move { worker.run().await.map_err(Error::from) });
+        let scheduler_handle =
+            tokio::spawn(async move { scheduler.run().await.map_err(Error::from) });
+
+        workers.spawn(worker_handle);
+        workers.spawn(scheduler_handle);
+
+        JobHandle {
+            workers,
+            shutdown_token,
+        }
+    }
 
     fn first_job_input(&self, input: &I) -> Result<JobState> {
         let step_input = serde_json::to_value(input)?;

@@ -203,6 +203,12 @@ impl<T: Task + Sync> Worker<T> {
         self
     }
 
+    /// Sets the shutdown token.
+    pub fn shutdown_token(mut self, shutdown_token: CancellationToken) -> Self {
+        self.shutdown_token = shutdown_token;
+        self
+    }
+
     /// Cancels the shutdown token and begins a graceful shutdown of in-progress
     /// tasks.
     ///
