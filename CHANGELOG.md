@@ -1,5 +1,14 @@
 # Unreleased
 
+# 0.0.6
+
+- Breaking: Queue methods now take input by reference
+- Breaking: Job methods also take input by reference
+- Breaking: The scheduler `run_every` method is removed
+- Pending tasks are now processed upon change via a notify channel #25
+- An `unschedule` method is provided on `Queue` and `Job` #40
+- Graceful shutdown is now available on `JobHandle` returned from `start` #37
+
 # 0.0.5
 
 - Breaking: Tasks require an associated type Output
