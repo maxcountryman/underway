@@ -212,9 +212,7 @@ impl<T: Task> Scheduler<T> {
     ///
     /// - It cannot acquire a new connection from the queue's pool.
     /// - It fails to listen on either the shutdown channel.
-    ///
-    /// It also has the same error conditions as [`Queue::task_schedule`] as
-    /// this is used internally.
+    /// - The cron expression or timezone IANA name are malformed.
     ///
     /// # Example
     ///
