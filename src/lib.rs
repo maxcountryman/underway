@@ -5,8 +5,8 @@
 //! # Overview
 //!
 //! **Underway** provides durable background jobs over Postgres. Jobs are
-//! composed of a sequence of one more steps. Each step takes the output of the
-//! previous step as its input. These simple workflows provide a powerful
+//! composed of a sequence of one or more steps. Each step takes the output of
+//! the previous step as its input. These simple workflows provide a powerful
 //! interface to common deferred work use cases.
 //!
 //! Key Features:
@@ -223,7 +223,7 @@
 //! Underway has been designed around several core concepts, which build on one
 //! another to deliver a robust background-job framework:
 //!
-//! - [Tasks](#tasks) represent a well-structure unit of work.
+//! - [Tasks](#tasks) represent a well-structured unit of work.
 //! - [Jobs](#jobs) are a series of sequential steps, where each step is a
 //!   [`Task`].
 //! - [Queues](#queues) provide an interface for managing task execution.

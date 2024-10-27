@@ -20,7 +20,7 @@
 
 ## 🎨 Overview
 
-**Underway** provides durable background jobs over Postgres. Jobs are composed of a sequence of one more steps. Each step takes the output of the previous step as its input. These simple workflows provide a powerful interface to common deferred work use cases.
+**Underway** provides durable background jobs over Postgres. Jobs are composed of a sequence of one or more steps. Each step takes the output of the previous step as its input. These simple workflows provide a powerful interface to common deferred work use cases.
 
 Key Features:
 
