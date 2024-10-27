@@ -96,7 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     // Here we enqueue a new job to be processed later.
-    job.enqueue(WelcomeEmail {
+    job.enqueue(&WelcomeEmail {
         user_id: 42,
         email: "ferris@example.com".to_string(),
         name: "Ferris".to_string(),
@@ -171,7 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     // Enqueue the job for the given order.
-    job.enqueue(GenerateReceipt { order_id: 42 }).await?;
+    job.enqueue(&GenerateReceipt { order_id: 42 }).await?;
 
     // Start processing enqueued jobs.
     job.start().await??;
@@ -222,7 +222,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Set a daily schedule with the given input.
     let daily = "@daily[America/Los_Angeles]".parse()?;
-    job.schedule(daily, DailyReport).await?;
+    job.schedule(&daily, &DailyReport).await?;
 
     // Start processing enqueued jobs.
     job.start().await??;
