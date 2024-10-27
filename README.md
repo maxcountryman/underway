@@ -20,19 +20,14 @@
 
 ## 🎨 Overview
 
-**Underway** is a framework for building robust, asynchronous background
-jobs in Rust, leveraging PostgreSQL as its queuing backend. It provides a
-streamlined interface for defining jobs as a series of "steps," where each
-step's output becomes the input for the next. This design enables the
-construction of complex, durable, and resilient workflows with ease.
+**Underway** provides durable background jobs over Postgres. Jobs are composed of a sequence of one more steps. Each step takes the output of the previous step as its input. These simple workflows provide a powerful interface to common deferred work use cases.
 
 Key Features:
 
-- **PostgreSQL-Backed** Leverages PostgreSQL with `FOR UPDATE SKIP LOCKED` for
-  reliable task storage and coordination, ensuring efficient, safe
+- **PostgreSQL-Backed** Leverages PostgreSQL with `FOR UPDATE SKIP LOCKED`
+  for reliable task storage and coordination.
 - **Atomic Task Management** Enqueue tasks within your transactions and use
-  the worker's transaction within your tasks for atomic database
-  queries--ensuring consisteny.
+  the worker's transaction within your tasks for atomic queries.
 - **Automatic Retries** Configurable retry strategies ensure tasks are
   reliably completed, even after transient failures.
 - **Cron-Like Scheduling** Schedule recurring tasks with cron-like
@@ -108,7 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })
     .await?;
 
-    // Start processing enqueued tasks.
+    // Start processing enqueued jobs.
     job.start().await??;
 
     Ok(())
