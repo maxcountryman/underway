@@ -791,12 +791,71 @@ where
     I: Serialize + Sync + Send + 'static,
     S: Clone + Send + Sync + 'static,
 {
-    /// Create a new job builder.
+    /// Creates a new job builder.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::PgPool;
+    /// use underway::{Job, To};
+    ///
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # /*
+    /// let pool = { /* A `PgPool`. */ };
+    /// # */
+    /// #
+    ///
+    /// let job = Job::<(), ()>::builder()
+    ///     .step(|_cx, _| async move { To::done() })
+    ///     .name("example")
+    ///     .pool(pool)
+    ///     .build()
+    ///     .await?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     pub fn builder() -> Builder<I, I, S, Initial> {
         Builder::new()
     }
 
     /// Enqueue the job using a connection from the queue's pool.
+    ///
+    /// # Errors
+    ///
+    /// This has the same error conditions as [`Queue::enqueue`].
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::PgPool;
+    /// # use underway::{Job, To};
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # let job = Job::builder()
+    /// #     .step(|_cx, _| async move { To::done() })
+    /// #     .name("example")
+    /// #     .pool(pool)
+    /// #     .build()
+    /// #     .await?;
+    /// # /*
+    /// let job = { /* A `Job`. */ };
+    /// # */
+    /// #
+    ///
+    /// // Enqueue a new job with the given input.
+    /// job.enqueue(&()).await?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     pub async fn enqueue(&self, input: &I) -> Result<TaskId> {
         let mut conn = self.queue.pool.acquire().await?;
         self.enqueue_using(&mut *conn, input).await
@@ -810,6 +869,46 @@ where
     /// **Note:** If you pass a transactional executor and the transaction is
     /// rolled back, the returned task ID will not correspond to any persisted
     /// task.
+    ///
+    /// # Errors
+    ///
+    /// This has the same error conditions as [`Queue::enqueue`].
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::PgPool;
+    /// # use underway::{Job, To};
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # /*
+    /// let pool = { /* A `PgPool`. */ };
+    /// # */
+    /// #
+    ///
+    /// // Our own transaction.
+    /// let mut tx = pool.begin().await?;
+    ///
+    /// # let job = Job::builder()
+    /// #     .step(|_cx, _| async move { To::done() })
+    /// #     .name("example")
+    /// #     .pool(pool.clone())
+    /// #     .build()
+    /// #     .await?;
+    /// # /*
+    /// let job = { /* A `Job`. */ };
+    /// # */
+    /// #
+    ///
+    /// // Enqueue using the transaction we already have.
+    /// job.enqueue_using(&mut *tx, &()).await?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     pub async fn enqueue_using<'a, E>(&self, executor: E, input: &I) -> Result<TaskId>
     where
         E: PgExecutor<'a>,
@@ -821,10 +920,41 @@ where
     /// queue's pool
     ///
     /// The given delay is added to the task's configured delay, if one is set.
-    pub async fn enqueue_after<'a, E>(&self, input: &I, delay: Span) -> Result<TaskId>
-    where
-        E: PgExecutor<'a>,
-    {
+    ///
+    /// # Errors
+    ///
+    /// This has the same error conditions as [`Queue::enqueue_after`].
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::PgPool;
+    /// # use underway::{Job, To};
+    /// use jiff::ToSpan;
+    ///
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # let job = Job::builder()
+    /// #     .step(|_cx, _| async move { To::done() })
+    /// #     .name("example")
+    /// #     .pool(pool)
+    /// #     .build()
+    /// #     .await?;
+    /// # /*
+    /// let job = { /* A `Job`. */ };
+    /// # */
+    /// #
+    ///
+    /// // Enqueue after an hour.
+    /// job.enqueue_after(&(), 1.hour()).await?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
+    pub async fn enqueue_after(&self, input: &I, delay: Span) -> Result<TaskId> {
         let mut conn = self.queue.pool.acquire().await?;
         self.enqueue_after_using(&mut *conn, input, delay).await
     }
@@ -839,6 +969,48 @@ where
     /// **Note:** If you pass a transactional executor and the transaction is
     /// rolled back, the returned task ID will not correspond to any persisted
     /// task.
+    ///
+    /// # Errors
+    ///
+    /// This has the same error conditions as [`Queue::enqueue_after`].
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::PgPool;
+    /// # use underway::{Job, To};
+    /// use jiff::ToSpan;
+    ///
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # /*
+    /// let pool = { /* A `PgPool`. */ };
+    /// # */
+    /// #
+    ///
+    /// // Our own transaction.
+    /// let mut tx = pool.begin().await?;
+    ///
+    /// # let job = Job::builder()
+    /// #     .step(|_cx, _| async move { To::done() })
+    /// #     .name("example")
+    /// #     .pool(pool.clone())
+    /// #     .build()
+    /// #     .await?;
+    /// # /*
+    /// let job = { /* A `Job`. */ };
+    /// # */
+    /// #
+    ///
+    /// // Enqueue after two days using the transaction we already have.
+    /// job.enqueue_after_using(&mut *tx, &(), 2.days()).await?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     pub async fn enqueue_after_using<'a, E>(
         &self,
         executor: E,
@@ -858,6 +1030,38 @@ where
     }
 
     /// Schedule the job using a connection from the queue's pool.
+    ///
+    /// # Errors
+    ///
+    /// This has the same error conditions as [`Queue::schedule`].
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::PgPool;
+    /// # use underway::{Job, To};
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # let job = Job::builder()
+    /// #     .step(|_cx, _| async move { To::done() })
+    /// #     .name("example")
+    /// #     .pool(pool)
+    /// #     .build()
+    /// #     .await?;
+    /// # /*
+    /// let job = { /* A `Job`. */ };
+    /// # */
+    /// #
+    ///
+    /// let every_minute = "0 * * * *[America/Los_Angeles]".parse()?;
+    /// job.schedule(&every_minute, &()).await?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     pub async fn schedule(&self, zoned_schedule: &ZonedSchedule, input: &I) -> Result {
         let mut conn = self.queue.pool.acquire().await?;
         self.schedule_using(&mut *conn, zoned_schedule, input).await
@@ -867,6 +1071,47 @@ where
     ///
     /// This allows jobs to be scheduled using the same transaction as an
     /// application may already be using in a given context.
+    ///
+    /// # Errors
+    ///
+    /// This has the same error conditions as [`Queue::schedule`].
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::PgPool;
+    /// # use underway::{Job, To};
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # /*
+    /// let pool = { /* A `PgPool`. */ };
+    /// # */
+    /// #
+    ///
+    /// // Our own transaction.
+    /// let mut tx = pool.acquire().await?;
+    ///
+    /// # let job = Job::builder()
+    /// #     .step(|_cx, _| async move { To::done() })
+    /// #     .name("example")
+    /// #     .pool(pool.clone())
+    /// #     .build()
+    /// #     .await?;
+    /// # /*
+    /// let job = { /* A `Job`. */ };
+    /// # */
+    /// #
+    ///
+    /// // Schedule weekly using the transaction we already have.
+    /// let weekly = "@weekly[America/Los_Angeles]".parse()?;
+    /// job.schedule_using(&mut *tx, &weekly, &()).await?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     pub async fn schedule_using<'a, E>(
         &self,
         executor: E,
@@ -884,7 +1129,127 @@ where
         Ok(())
     }
 
+    /// Removes the job's schedule using a connection from the queue's pool.
+    ///
+    /// # Errors
+    ///
+    /// This has the same error conditions as [`Queue::unschedule`].
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::PgPool;
+    /// # use underway::{Job, To};
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # let job = Job::<(), _>::builder()
+    /// #     .step(|_cx, _| async move { To::done() })
+    /// #     .name("example")
+    /// #     .pool(pool)
+    /// #     .build()
+    /// #     .await?;
+    /// # /*
+    /// let job = { /* A `Job`. */ };
+    /// # */
+    /// #
+    ///
+    /// // Remove the schedule if one is set.
+    /// job.unschedule().await?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    pub async fn unschedule(&self) -> Result {
+        let mut conn = self.queue.pool.acquire().await?;
+        self.unschedule_using(&mut *conn).await
+    }
+
+    /// Removes the job's schedule using the provided executor.
+    ///
+    /// This allows jobs to be unscheduled using the same transaction as an
+    /// application may already be using in a given context.
+    ///
+    /// # Errors
+    ///
+    /// This has the same error conditions as [`Queue::unschedule`].
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::PgPool;
+    /// # use underway::{Job, To};
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # /*
+    /// let pool = { /* A `PgPool`. */ };
+    /// # */
+    /// #
+    ///
+    /// let mut tx = pool.acquire().await?;
+    ///
+    /// # let job = Job::<(), _>::builder()
+    /// #     .step(|_cx, _| async move { To::done() })
+    /// #     .name("example")
+    /// #     .pool(pool.clone())
+    /// #     .build()
+    /// #     .await?;
+    /// # /*
+    /// let job = { /* A `Job`. */ };
+    /// # */
+    /// #
+    ///
+    /// // Remove the schedule using a transaction we provide.
+    /// job.unschedule_using(&mut *tx).await?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
+    pub async fn unschedule_using<'a, E>(&self, executor: E) -> Result
+    where
+        E: PgExecutor<'a>,
+    {
+        self.queue.unschedule(executor).await?;
+
+        Ok(())
+    }
+
     /// Constructs a worker which then immediately runs task processing.
+    ///
+    /// # Errors
+    ///
+    /// This has the same error conditions as [`Worker::run`].
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::PgPool;
+    /// # use underway::{Job, To};
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # let job = Job::<(), _>::builder()
+    /// #     .step(|_cx, _| async move { To::done() })
+    /// #     .name("example")
+    /// #     .pool(pool)
+    /// #     .build()
+    /// #     .await?;
+    /// # /*
+    /// let job = { /* A `Job`. */ };
+    /// # */
+    /// #
+    ///
+    /// job.run_worker().await?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     pub async fn run_worker(self) -> WorkerResult {
         let queue = self.queue.clone();
         let job = self.clone();
@@ -893,6 +1258,37 @@ where
     }
 
     /// Contructs a worker which then immediately runs schedule processing.
+    ///
+    /// # Errors
+    ///
+    /// This has the same error conditions as [`Scheduler::run`].
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::PgPool;
+    /// # use underway::{Job, To};
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # let job = Job::<(), _>::builder()
+    /// #     .step(|_cx, _| async move { To::done() })
+    /// #     .name("example")
+    /// #     .pool(pool)
+    /// #     .build()
+    /// #     .await?;
+    /// # /*
+    /// let job = { /* A `Job`. */ };
+    /// # */
+    /// #
+    ///
+    /// job.run_scheduler().await?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     pub async fn run_scheduler(self) -> SchedulerResult {
         let queue = self.queue.clone();
         let job = self.clone();
@@ -901,6 +1297,39 @@ where
     }
 
     /// Runs both a worker and scheduler for the job.
+    ///
+    /// # Errors
+    ///
+    /// This has the same error conditions as [`Worker::run`] and
+    /// [`Scheduler::run`]. It will also return an error if either of the
+    /// spawned worker or scheduler cannot be joined.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::PgPool;
+    /// # use underway::{Job, To};
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # let job = Job::<(), _>::builder()
+    /// #     .step(|_cx, _| async move { To::done() })
+    /// #     .name("example")
+    /// #     .pool(pool)
+    /// #     .build()
+    /// #     .await?;
+    /// # /*
+    /// let job = { /* A `Job`. */ };
+    /// # */
+    /// #
+    ///
+    /// job.run().await?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     pub async fn run(self) -> Result {
         let queue = self.queue.clone();
         let job = self.clone();
@@ -924,6 +1353,42 @@ where
     }
 
     /// Starts both a worker and scheduler for the job and returns a handle.
+    ///
+    /// The returned handle may be used to gracefully shutdown the worker and
+    /// scheduler.
+    ///
+    /// # Errors
+    ///
+    /// This has the same error conditions as [`Worker::run`] and
+    /// [`Scheduler::run`]. It will also return an error if either of the
+    /// spawned worker or scheduler cannot be joined.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::PgPool;
+    /// # use underway::{Job, To};
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # let job = Job::<(), _>::builder()
+    /// #     .step(|_cx, _| async move { To::done() })
+    /// #     .name("example")
+    /// #     .pool(pool)
+    /// #     .build()
+    /// #     .await?;
+    /// # /*
+    /// let job = { /* A `Job`. */ };
+    /// # */
+    /// #
+    ///
+    /// job.start().await??;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     pub fn start(self) -> JobHandle {
         let shutdown_token = CancellationToken::new();
         let mut workers = JoinSet::new();
@@ -2085,6 +2550,115 @@ mod tests {
             },
             job_state
         );
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn schedule(pool: PgPool) -> sqlx::Result<(), Error> {
+        #[derive(Serialize, Deserialize)]
+        struct Input {
+            message: String,
+        }
+
+        let queue = Queue::builder()
+            .name("schedule")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let job = Job::builder()
+            .step(|_cx, Input { message }| async move {
+                println!("Executing job with message: {message}");
+                To::done()
+            })
+            .queue(queue.clone())
+            .build();
+
+        assert_eq!(job.retry_policy(), RetryPolicy::default());
+
+        let daily = "@daily[America/Los_Angeles]"
+            .parse()
+            .expect("Schedule should parse");
+        let input = Input {
+            message: "Hello, world!".to_string(),
+        };
+        job.schedule(&daily, &input).await?;
+
+        let (zoned_schedule, schedule_input) = queue
+            .task_schedule(&pool)
+            .await?
+            .expect("Schedule should be set");
+
+        assert_eq!(zoned_schedule, daily);
+        assert_eq!(schedule_input.step_index, 0);
+        assert_eq!(schedule_input.step_input, serde_json::to_value(input)?);
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn unschedule(pool: PgPool) -> sqlx::Result<(), Error> {
+        #[derive(Serialize, Deserialize)]
+        struct Input {
+            message: String,
+        }
+
+        let queue = Queue::builder()
+            .name("unschedule")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let job = Job::builder()
+            .step(|_cx, Input { message }| async move {
+                println!("Executing job with message: {message}");
+                To::done()
+            })
+            .queue(queue.clone())
+            .build();
+
+        assert_eq!(job.retry_policy(), RetryPolicy::default());
+
+        let daily = "@daily[America/Los_Angeles]"
+            .parse()
+            .expect("Schedule should parse");
+        let input = Input {
+            message: "Hello, world!".to_string(),
+        };
+        job.schedule(&daily, &input).await?;
+        job.unschedule().await?;
+
+        assert!(queue.task_schedule(&pool).await?.is_none());
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn unschedule_without_schedule(pool: PgPool) -> sqlx::Result<(), Error> {
+        #[derive(Serialize, Deserialize)]
+        struct Input {
+            message: String,
+        }
+
+        let queue = Queue::builder()
+            .name("unschedule_without_schedule")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let job = Job::builder()
+            .step(|_cx, Input { message }| async move {
+                println!("Executing job with message: {message}");
+                To::done()
+            })
+            .queue(queue.clone())
+            .build();
+
+        assert_eq!(job.retry_policy(), RetryPolicy::default());
+
+        assert!(job.unschedule().await.is_ok());
+        assert!(queue.task_schedule(&pool).await?.is_none());
 
         Ok(())
     }

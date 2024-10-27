@@ -294,6 +294,44 @@ impl<T: Task> Clone for Queue<T> {
 
 impl<T: Task> Queue<T> {
     /// Creates a builder for a new queue.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::{PgPool, Transaction, Postgres};
+    /// # use underway::{Task, task::Result as TaskResult};
+    /// use underway::Queue;
+    ///
+    /// # struct ExampleTask;
+    /// # impl Task for ExampleTask {
+    /// #     type Input = ();
+    /// #     type Output = ();
+    /// #     async fn execute(
+    /// #         &self,
+    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: Self::Input,
+    /// #     ) -> TaskResult<Self::Output> {
+    /// #         Ok(())
+    /// #     }
+    /// # }
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # /*
+    /// let pool = { /* A `PgPool`. */ };
+    /// # */
+    /// let queue: Queue<ExampleTask> = Queue::builder()
+    ///     .name("example")
+    ///     .dead_letter_queue("example_dlq")
+    ///     .pool(pool)
+    ///     .build()
+    ///     .await?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     pub fn builder() -> Builder<T, Initial> {
         Builder::default()
     }
@@ -310,7 +348,7 @@ impl<T: Task> Queue<T> {
     /// type.
     ///
     /// An ID, which is a [`ULID`][ULID] converted to `UUIDv4`, is also assigned
-    /// to the task and returned upon successfully enqueue.
+    /// to the task and returned upon successful enqueue.
     ///
     /// **Note:** If you pass a transactional executor and the transaction is
     /// rolled back, the returned tasl ID will not correspond to any persisted
@@ -326,6 +364,54 @@ impl<T: Task> Queue<T> {
     ///   `std::time::Duration`.
     ///
     /// [ULID]: https://github.com/ulid/spec?tab=readme-ov-file#specification
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::{PgPool, Transaction, Postgres};
+    /// # use underway::{Task, task::Result as TaskResult};
+    /// # use underway::Queue;
+    /// # struct ExampleTask;
+    /// # impl Task for ExampleTask {
+    /// #     type Input = ();
+    /// #     type Output = ();
+    /// #     async fn execute(
+    /// #         &self,
+    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: Self::Input,
+    /// #     ) -> TaskResult<Self::Output> {
+    /// #         Ok(())
+    /// #     }
+    /// # }
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # /*
+    /// let pool = { /* A `PgPool`. */ };
+    /// # */
+    /// #
+    /// # let queue = Queue::builder()
+    /// #     .name("example")
+    /// #     .pool(pool.clone())
+    /// #     .build()
+    /// #     .await?;
+    /// # /*
+    /// let queue = { /* A `Queue`. */ };
+    /// # */
+    /// # let task = ExampleTask;
+    /// # /*
+    /// let task = { /* An implementer of `Task`. */ };
+    /// # */
+    /// #
+    ///
+    /// // Enqueue a new task with input.
+    /// let task_id = queue.enqueue(&pool, &task, &()).await?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     pub async fn enqueue<'a, E>(&self, executor: E, task: &T, input: &T::Input) -> Result<TaskId>
     where
         E: PgExecutor<'a>,
@@ -341,6 +427,55 @@ impl<T: Task> Queue<T> {
     /// This means that if you provide a five-minute delay and the task is
     /// already configured with a thirty-second delay the task will not be
     /// dequeued for at least five and half minutes.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::{PgPool, Transaction, Postgres};
+    /// # use underway::{Task, task::Result as TaskResult};
+    /// # use underway::Queue;
+    /// use jiff::ToSpan;
+    ///
+    /// # struct ExampleTask;
+    /// # impl Task for ExampleTask {
+    /// #     type Input = ();
+    /// #     type Output = ();
+    /// #     async fn execute(
+    /// #         &self,
+    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: Self::Input,
+    /// #     ) -> TaskResult<Self::Output> {
+    /// #         Ok(())
+    /// #     }
+    /// # }
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # /*
+    /// let pool = { /* A `PgPool`. */ };
+    /// # */
+    /// # let queue = Queue::builder()
+    /// #     .name("example")
+    /// #     .pool(pool.clone())
+    /// #     .build()
+    /// #     .await?;
+    /// # /*
+    /// let queue = { /* A `Queue`. */ };
+    /// # */
+    /// # let task = ExampleTask;
+    /// # /*
+    /// let task = { /* An implementer of `Task`. */ };
+    /// # */
+    /// #
+    ///
+    /// // Enqueue a new task with input after five minutes.
+    /// let task_id = queue.enqueue_after(&pool, &task, &(), 5.minutes()).await?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     pub async fn enqueue_after<'a, E>(
         &self,
         executor: E,
@@ -449,6 +584,59 @@ impl<T: Task> Queue<T> {
     ///
     /// - The database operation fails during select.
     /// - The database operation fails during update.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::{PgPool, Transaction, Postgres};
+    /// # use underway::{Task, task::Result as TaskResult};
+    /// # use underway::Queue;
+    /// # struct ExampleTask;
+    /// # impl Task for ExampleTask {
+    /// #     type Input = ();
+    /// #     type Output = ();
+    /// #     async fn execute(
+    /// #         &self,
+    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: Self::Input,
+    /// #     ) -> TaskResult<Self::Output> {
+    /// #         Ok(())
+    /// #     }
+    /// # }
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # /*
+    /// let pool = { /* A `PgPool`. */ };
+    /// # */
+    /// # let queue = Queue::builder()
+    /// #     .name("example")
+    /// #     .pool(pool.clone())
+    /// #     .build()
+    /// #     .await?;
+    /// # /*
+    /// let queue = { /* A `Queue`. */ };
+    /// # */
+    /// # let task = ExampleTask;
+    /// # /*
+    /// let task = { /* An implementer of `Task`. */ };
+    /// # */
+    /// #
+    ///
+    /// // Enqueue a new task.
+    /// queue.enqueue(&pool, &task, &()).await?;
+    ///
+    /// // Dequeue the enqueued task.
+    /// let pending_task = queue
+    ///     .dequeue(&pool)
+    ///     .await?
+    ///     .expect("There should be a pending task.");
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     #[instrument(
         skip(self, conn),
         fields(queue.name = self.name, task.id = tracing::field::Empty),
@@ -504,12 +692,61 @@ impl<T: Task> Queue<T> {
     /// Schedules are useful when a task should be run periodically, according
     /// to a crontab definition.
     ///
+    /// **Note:** After a schedule has been set, [a scheduler
+    /// instance](crate::Scheduler) must be run in order for schedules to
+    /// fire.
+    ///
     /// # Errors
     ///
     /// This function will return an error if:
     ///
     /// - The input value cannot be serialized.
     /// - The database operation fails during insert.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::{PgPool, Transaction, Postgres};
+    /// # use underway::{Task, task::Result as TaskResult};
+    /// # use underway::Queue;
+    /// # struct ExampleTask;
+    /// # impl Task for ExampleTask {
+    /// #     type Input = ();
+    /// #     type Output = ();
+    /// #     async fn execute(
+    /// #         &self,
+    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: Self::Input,
+    /// #     ) -> TaskResult<Self::Output> {
+    /// #         Ok(())
+    /// #     }
+    /// # }
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # /*
+    /// let pool = { /* A `PgPool`. */ };
+    /// # */
+    /// # let task = ExampleTask;
+    /// # let queue = Queue::builder()
+    /// #     .name("example")
+    /// #     .pool(pool.clone())
+    /// #     .build()
+    /// #     .await?;
+    /// # /*
+    /// let queue = { /* A `Queue`. */ };
+    /// # */
+    /// # queue.enqueue(&pool, &task, &()).await?;
+    ///
+    /// // Set a schedule on the queue with the given input.
+    /// let daily = "@daily[America/Los_Angeles]".parse()?;
+    /// queue.schedule(&pool, &daily, &()).await?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     #[instrument(
         skip(self, executor, zoned_schedule, input),
         fields(queue.name = self.name),
@@ -558,6 +795,50 @@ impl<T: Task> Queue<T> {
     /// This function will return an error if:
     ///
     /// - The database operation fails during insert.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::{PgPool, Transaction, Postgres};
+    /// # use underway::{Task, task::Result as TaskResult};
+    /// # use underway::Queue;
+    /// # struct ExampleTask;
+    /// # impl Task for ExampleTask {
+    /// #     type Input = ();
+    /// #     type Output = ();
+    /// #     async fn execute(
+    /// #         &self,
+    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: Self::Input,
+    /// #     ) -> TaskResult<Self::Output> {
+    /// #         Ok(())
+    /// #     }
+    /// # }
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # /*
+    /// let pool = { /* A `PgPool`. */ };
+    /// # */
+    /// # let task = ExampleTask;
+    /// # let queue = Queue::builder()
+    /// #     .name("example")
+    /// #     .pool(pool.clone())
+    /// #     .build()
+    /// #     .await?;
+    /// # /*
+    /// let queue = { /* A `Queue`. */ };
+    /// # */
+    /// # queue.enqueue(&pool, &task, &()).await?;
+    ///
+    /// // Unset the schedule if one was set.
+    /// queue.unschedule(&pool).await?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     #[instrument(
         skip_all,
         fields(queue.name = self.name),
