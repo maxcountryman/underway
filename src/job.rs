@@ -4,6 +4,14 @@
 //! steps form a chain, where one step is linked to the next, until the last
 //! step is reached.
 //!
+//!```text
+//! ┌───────────────┐   ┌───────────────┐   ┌───────────────┐
+//! │ StepFn 1      │   │ StepFn 2      │   │ StepFn 3      │
+//! │ input: ∅      │ ┌╴│ input: 42     │ ┌╴│ input: "foo"  │
+//! │ output: 42    │╶┘ │ output: "foo" │╶┘ │ output: ∅     │
+//! └───────────────┘   └───────────────┘   └───────────────┘
+//! ```
+//!
 //! Because each step is treated as its own task, steps are executed and then
 //! persisted, before the next task is enqueued. This means that when a step,
 //! the job will be resumed from where it was.
