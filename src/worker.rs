@@ -271,21 +271,20 @@ impl<T: Task + Sync> Worker<T> {
     /// #    .build()
     /// #    .await?;
     /// # let task = ExampleTask;
-    /// # let worker = Worker::new(queue, task);
+    /// # let mut worker = Worker::new(queue, task);
     /// # /*
-    /// let worker = { /* A `Worker`. */ };
+    /// let mut worker = { /* A `Worker`. */ };
     /// # */
     /// #
     ///
     /// // Set a fixed concurrency limit.
-    /// worker.concurrency_limit(32);
+    /// worker.set_concurrency_limit(32);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
     /// # }
     /// ```
-    pub fn concurrency_limit(mut self, concurrency_limit: usize) -> Self {
+    pub fn set_concurrency_limit(&mut self, concurrency_limit: usize) {
         self.concurrency_limit = concurrency_limit;
-        self
     }
 
     /// Sets the shutdown token.
@@ -320,22 +319,21 @@ impl<T: Task + Sync> Worker<T> {
     /// #    .build()
     /// #    .await?;
     /// # let task = ExampleTask;
-    /// # let worker = Worker::new(queue, task);
+    /// # let mut worker = Worker::new(queue, task);
     /// # /*
-    /// let worker = { /* A `Worker`. */ };
+    /// let mut worker = { /* A `Worker`. */ };
     /// # */
     /// #
     ///
     /// // Set a custom cancellation token.
     /// let token = CancellationToken::new();
-    /// worker.shutdown_token(token);
+    /// worker.set_shutdown_token(token);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
     /// # }
     /// ```
-    pub fn shutdown_token(mut self, shutdown_token: CancellationToken) -> Self {
+    pub fn set_shutdown_token(&mut self, shutdown_token: CancellationToken) {
         self.shutdown_token = shutdown_token;
-        self
     }
 
     /// Cancels the shutdown token and begins a graceful shutdown of in-progress
