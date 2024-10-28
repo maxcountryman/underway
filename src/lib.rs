@@ -226,7 +226,7 @@
 //! - [Tasks](#tasks) represent a well-structured unit of work.
 //! - [Jobs](#jobs) are a series of sequential steps, where each step is a
 //!   [`Task`].
-//! - [Queues](#queues) provide an interface for managing task execution.
+//! - [Queues](#queues) provide an interface for managing task lifecycle.
 //! - [Workers](#workers) interface with queues to execute tasks.
 //!
 //! ## Tasks
@@ -251,8 +251,8 @@
 //!
 //! ## Queues
 //!
-//! Queues manage tasks, including enqueuing and dequeuing them from the
-//! database.
+//! Queues manage task lifecycle, including enqueuing and dequeuing them from
+//! the database.
 //!
 //! See [`queue`] for more details about queues.
 //!
