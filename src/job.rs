@@ -5,11 +5,10 @@
 //! step is reached.
 //!
 //!```text
-//! ┌───────────────┐   ┌───────────────┐   ┌───────────────┐
-//! │ StepFn 1      │   │ StepFn 2      │   │ StepFn 3      │
-//! │ input: 13     │ ┌╴│ input: 42     │ ┌╴│ input: "foo"  │
-//! │ output: 42    │╶┘ │ output: "foo" │╶┘ │ output: ∅     │
-//! └───────────────┘   └───────────────┘   └───────────────┘
+//! ╭ StepFn 1 ─────╮   ╭ StepFn 2 ─────╮   ╭ StepFn 3 ─────╮
+//! │ input:     13 │ ┌╴│ input:     42 │ ┌╴│ input:  "foo" │
+//! │ output:    42 │╶┘ │ output: "foo" │╶┘ │ output:     ∅ │
+//! ╰───────────────╯   ╰───────────────╯   ╰───────────────╯
 //! ```
 //!
 //! Because each step is treated as its own task, steps are executed and then
