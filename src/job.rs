@@ -1638,7 +1638,7 @@ where
         &self,
         cx: Context<S>,
         input: serde_json::Value,
-    ) -> Pin<Box<dyn Future<Output = TaskResult<Option<(serde_json::Value, Span)>>> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = StepResult> + Send>> {
         let deserialized_input: I = match serde_json::from_value(input) {
             Ok(val) => val,
             Err(e) => return Box::pin(async move { Err(TaskError::Fatal(e.to_string())) }),
