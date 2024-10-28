@@ -1404,10 +1404,10 @@ where
         let job = self.clone();
 
         let mut worker = Worker::new(queue.clone(), job.clone());
-        worker = worker.shutdown_token(shutdown_token.clone());
+        worker.set_shutdown_token(shutdown_token.clone());
 
         let mut scheduler = Scheduler::new(queue, job);
-        scheduler = scheduler.shutdown_token(shutdown_token.clone());
+        scheduler.set_shutdown_token(shutdown_token.clone());
 
         // Spawn the tasks using `tokio::spawn` to decouple them from polling the
         // `Future`.

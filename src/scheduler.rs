@@ -139,22 +139,21 @@ impl<T: Task> Scheduler<T> {
     /// #    .build()
     /// #    .await?;
     /// # let task = ExampleTask;
-    /// # let scheduler = Scheduler::new(queue, task);
+    /// # let mut scheduler = Scheduler::new(queue, task);
     /// # /*
-    /// let scheduler = { /* A `Scheduler`. */ };
+    /// let mut scheduler = { /* A `Scheduler`. */ };
     /// # */
     /// #
     ///
     /// // Set a custom cancellation token.
     /// let token = CancellationToken::new();
-    /// scheduler.shutdown_token(token);
+    /// scheduler.set_shutdown_token(token);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
     /// # }
     /// ```
-    pub fn shutdown_token(mut self, shutdown_token: CancellationToken) -> Self {
+    pub fn set_shutdown_token(&mut self, shutdown_token: CancellationToken) {
         self.shutdown_token = shutdown_token;
-        self
     }
 
     /// Cancels the shutdown token causing the scheduler to exit.
