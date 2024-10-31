@@ -60,7 +60,7 @@
 //!     let pool = PgPool::connect(database_url).await?;
 //!
 //!     // Run migrations.
-//!     underway::MIGRATOR.run(&pool).await?;
+//!     underway::run_migrations(&pool).await?;
 //!
 //!     // Build the job.
 //!     let job = Job::builder()
@@ -135,7 +135,7 @@
 //!     let pool = PgPool::connect(database_url).await?;
 //!
 //!     // Run migrations.
-//!     underway::MIGRATOR.run(&pool).await?;
+//!     underway::run_migrations(&pool).await?;
 //!
 //!     // Build the job.
 //!     let job = Job::builder()
@@ -194,7 +194,7 @@
 //!     let pool = PgPool::connect(database_url).await?;
 //!
 //!     // Run migrations.
-//!     underway::MIGRATOR.run(&pool).await?;
+//!     underway::run_migrations(&pool).await?;
 //!
 //!     // Build the job.
 //!     let job = Job::builder()
@@ -265,7 +265,7 @@
 
 #![warn(clippy::all, nonstandard_style, future_incompatible, missing_docs)]
 
-use sqlx::migrate::Migrator;
+use sqlx::{migrate::Migrator, Acquire, Postgres};
 
 pub use crate::{
     job::{Job, To},
@@ -281,10 +281,19 @@ mod scheduler;
 pub mod task;
 pub mod worker;
 
-/// A SQLx [`Migrator`] which provides Underway's schema migrations.
+static MIGRATOR: Migrator = sqlx::migrate!();
+
+/// Runs Underway migrations.
 ///
 /// These migrations must be applied before queues, tasks, and workers can be
 /// run.
+///
+/// A transaction is acquired via the provided connection and migrations are run
+/// via this transaction.
+///
+/// As there is no direct support for specifying the schema under which the
+/// migrations table will live, we manually specify this via the search path.
+/// This ensures that migrations are isolated to underway._sqlx_migrations.
 ///
 /// **Note**: Changes are managed within a dedicated schema, called "underway".
 ///
@@ -304,8 +313,90 @@ pub mod worker;
 /// let pool = PgPool::connect(database_url).await?;
 ///
 /// // Run migrations.
-/// underway::MIGRATOR.run(&pool).await?;
+/// underway::run_migrations(&pool).await?;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// # });
 /// # }
-pub static MIGRATOR: Migrator = sqlx::migrate!();
+pub async fn run_migrations<'a, A>(conn: A) -> Result<(), sqlx::Error>
+where
+    A: Acquire<'a, Database = Postgres>,
+{
+    let mut tx = conn.begin().await?;
+
+    // Ensure the 'underway' schema exists
+    sqlx::query!("create schema if not exists underway;")
+        .execute(&mut *tx)
+        .await?;
+
+    // Temporarily set search_path for this transaction
+    sqlx::query!("set local search_path to underway;")
+        .execute(&mut *tx)
+        .await?;
+
+    // Run migrations within the 'underway' schema
+    MIGRATOR.run(&mut *tx).await?;
+
+    tx.commit().await?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlx::PgPool;
+
+    use super::run_migrations;
+
+    #[sqlx::test(migrations = false)]
+    async fn sanity_check_run_migrations(pool: PgPool) -> Result<(), sqlx::Error> {
+        run_migrations(&pool).await?;
+
+        let schema_exists: bool = sqlx::query_scalar!(
+            r#"
+            select exists (
+              select 1 from pg_namespace where nspname = 'underway'
+            );
+            "#,
+        )
+        .fetch_one(&pool)
+        .await?
+        .unwrap();
+        assert!(
+            schema_exists,
+            "Schema 'underway' should exist after migrations."
+        );
+
+        let migrations_table_exists: bool = sqlx::query_scalar!(
+            r#"
+            select exists (
+                select 1 from information_schema.tables
+                where table_schema = 'underway' and 
+                      table_name = '_sqlx_migrations'
+            );
+            "#,
+        )
+        .fetch_one(&pool)
+        .await?
+        .unwrap();
+        assert!(
+            migrations_table_exists,
+            "Migrations table should exist in 'underway' schema."
+        );
+
+        let search_path: String = sqlx::query_scalar("show search_path;")
+            .fetch_one(&pool)
+            .await?;
+
+        assert!(
+            !search_path.contains("underway"),
+            "search_path should not include 'underway' after the transaction."
+        );
+
+        assert!(
+            search_path.contains("public"),
+            "Default search_path should include 'public'."
+        );
+
+        Ok(())
+    }
+}

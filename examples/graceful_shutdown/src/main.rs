@@ -51,7 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     // Run migrations.
-    underway::MIGRATOR.run(&pool).await?;
+    underway::run_migrations(&pool).await?;
 
     // Build the job.
     let job = Job::builder()

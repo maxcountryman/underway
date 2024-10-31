@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            select exists (\n              select 1 from pg_namespace where nspname = 'underway'\n            );\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exists",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "2584080f8ca262aa7526dde00a50ae125a6a8e52f4fc76d05d15f2c6f663d1cd"
+}

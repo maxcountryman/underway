@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool = PgPool::connect(database_url).await?;
 
     // Run migrations.
-    underway::MIGRATOR.run(&pool).await?;
+    underway::run_migrations(&pool).await?;
 
     // Create our job.
     let job = Job::builder()

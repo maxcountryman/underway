@@ -73,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool = PgPool::connect(database_url).await?;
 
     // Run migrations.
-    underway::MIGRATOR.run(&pool).await?;
+    underway::run_migrations(&pool).await?;
 
     // Build the job.
     let job = Job::builder()
@@ -148,7 +148,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool = PgPool::connect(database_url).await?;
 
     // Run migrations.
-    underway::MIGRATOR.run(&pool).await?;
+    underway::run_migrations(&pool).await?;
 
     // Build the job.
     let job = Job::builder()
@@ -207,7 +207,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool = PgPool::connect(database_url).await?;
 
     // Run migrations.
-    underway::MIGRATOR.run(&pool).await?;
+    underway::run_migrations(&pool).await?;
 
     // Build the job.
     let job = Job::builder()
