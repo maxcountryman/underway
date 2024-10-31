@@ -1,5 +1,9 @@
 create schema if not exists underway;
 
+-- Manage Underway migrations within the Underway schema.
+create table if not exists underway._sqlx_migrations
+(like public._sqlx_migrations including all);
+
 create table underway.task_queue (
     name       text not null,
     dlq_name   text,

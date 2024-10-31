@@ -152,7 +152,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database_url = &env::var("DATABASE_URL").expect("DATABASE_URL should be set");
     let pool = PgPool::connect(database_url).await?;
 
-    underway::MIGRATOR.run(&pool).await?;
+    underway::run_migrations(&pool).await?;
 
     let openai_client = Client::new();
 
