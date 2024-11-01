@@ -1,3 +1,6 @@
+-- Force anything running this migration to use the right search path.
+set local search_path to underway;
+
 -- function to notify about task changes
 create or replace function underway.task_change_notify()
 returns trigger as $$

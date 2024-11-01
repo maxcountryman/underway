@@ -1,5 +1,8 @@
 create schema if not exists underway;
 
+-- Force anything running this migration to use the right search path.
+set local search_path to underway;
+
 -- Manage Underway migrations within the Underway schema.
 create table if not exists underway._sqlx_migrations
 (like public._sqlx_migrations including all);
