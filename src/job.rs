@@ -632,6 +632,7 @@ use std::{
     future::Future,
     marker::PhantomData,
     mem,
+    ops::Deref,
     pin::Pin,
     result::Result as StdResult,
     sync::{
@@ -720,13 +721,14 @@ type StepConfig<S> = (Box<dyn StepExecutor<S>>, RetryPolicy);
 
 mod sealed {
     use serde::{Deserialize, Serialize};
-    use uuid::Uuid;
+
+    use super::JobId;
 
     #[derive(Debug, Serialize, Deserialize, PartialEq)]
     pub struct JobState {
         pub step_index: usize,
         pub step_input: serde_json::Value,
-        pub job_id: Uuid,
+        pub job_id: JobId,
     } // TODO: Versioning?
 }
 
@@ -780,7 +782,29 @@ impl Future for JobHandle {
     }
 }
 
-type JobId = Uuid;
+/// Unique identifier of a job.
+///
+/// Wraps a UUID which is generated via a ULID.
+///
+/// Each enqueue of a job receives its own ID. IDs are embedded in the input of
+/// tasks on the queue. This means that each task related to a job will have
+/// the same job ID.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct JobId(Uuid);
+
+impl JobId {
+    fn new() -> Self {
+        Self(Ulid::new().into())
+    }
+}
+
+impl Deref for JobId {
+    type Target = Uuid;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 /// Represents a specific job that's been enqueued.
 ///
@@ -1514,7 +1538,7 @@ where
     fn first_job_input(&self, input: &I) -> Result<JobState> {
         let step_input = serde_json::to_value(input)?;
         let step_index = self.current_index.load(Ordering::SeqCst);
-        let job_id = Ulid::new().into();
+        let job_id = JobId::new();
         Ok(JobState {
             step_input,
             step_index,
