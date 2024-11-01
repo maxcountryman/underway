@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            select state as \"state: TaskState\"\n            from underway.task\n            where input->>'job_id' = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "state: TaskState",
+        "type_info": {
+          "Custom": {
+            "name": "underway.task_state",
+            "kind": {
+              "Enum": [
+                "pending",
+                "in_progress",
+                "succeeded",
+                "cancelled",
+                "failed"
+              ]
+            }
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "0d302d44aacf1e8ee3233b8c4814e7355fc4b57d98550cd43aec5c424ac4cdca"
+}

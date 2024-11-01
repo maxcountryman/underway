@@ -650,11 +650,12 @@ use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 use ulid::Ulid;
+use uuid::Uuid;
 
 use crate::{
     queue::{Error as QueueError, Queue},
     scheduler::{Error as SchedulerError, Result as SchedulerResult, Scheduler, ZonedSchedule},
-    task::{Error as TaskError, Id as TaskId, Result as TaskResult, RetryPolicy, Task},
+    task::{Error as TaskError, Result as TaskResult, RetryPolicy, State as TaskState, Task},
     worker::{Error as WorkerError, Result as WorkerResult, Worker},
 };
 
@@ -779,6 +780,80 @@ impl Future for JobHandle {
     }
 }
 
+type JobId = Uuid;
+
+/// Represents a specific job that's been enqueued.
+///
+/// This handle allows for manipulating the state of the job in the queue.
+pub struct EnqueuedJob<T: Task> {
+    id: JobId,
+    queue: Queue<T>,
+}
+
+impl<T: Task> EnqueuedJob<T> {
+    /// Cancels the job if it's still pending.
+    ///
+    /// Because jobs may be composed of multiple steps, the full set of tasks is
+    /// searched and any pending tasks are cancelled.
+    ///
+    /// # Errors
+    ///
+    /// This will return an error if the database operation fails and if the
+    /// task ID cannot be found.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::PgPool;
+    /// # use underway::{Job, To};
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # let job = Job::builder()
+    /// #     .step(|_cx, _| async move { To::done() })
+    /// #     .name("example")
+    /// #     .pool(pool)
+    /// #     .build()
+    /// #     .await?;
+    /// # /*
+    /// let job = { /* A `Job`. */ };
+    /// # */
+    /// #
+    ///
+    /// let enqueued = job.enqueue(&()).await?;
+    ///
+    /// // Cancel the enqueued job.
+    /// enqueued.cancel().await?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
+    pub async fn cancel(&self) -> Result {
+        let mut tx = self.queue.pool.begin().await?;
+        let tasks = sqlx::query!(
+            r#"
+            select id
+            from underway.task
+            where input->>'job_id' = $1 and
+                  state = $2
+            "#,
+            self.id.to_string(),
+            TaskState::Pending as _
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+
+        for task in tasks {
+            self.queue.mark_task_cancelled(&mut *tx, task.id).await?;
+        }
+        tx.commit().await?;
+
+        Ok(())
+    }
+}
+
 /// Sequential set of functions, where the output of the last is the input to
 /// the next.
 pub struct Job<I, S>
@@ -863,7 +938,7 @@ where
     /// # });
     /// # }
     /// ```
-    pub async fn enqueue(&self, input: &I) -> Result<TaskId> {
+    pub async fn enqueue(&self, input: &I) -> Result<EnqueuedJob<Self>> {
         let mut conn = self.queue.pool.acquire().await?;
         self.enqueue_using(&mut *conn, input).await
     }
@@ -916,7 +991,7 @@ where
     /// # });
     /// # }
     /// ```
-    pub async fn enqueue_using<'a, E>(&self, executor: E, input: &I) -> Result<TaskId>
+    pub async fn enqueue_using<'a, E>(&self, executor: E, input: &I) -> Result<EnqueuedJob<Self>>
     where
         E: PgExecutor<'a>,
     {
@@ -961,7 +1036,7 @@ where
     /// # });
     /// # }
     /// ```
-    pub async fn enqueue_after(&self, input: &I, delay: Span) -> Result<TaskId> {
+    pub async fn enqueue_after(&self, input: &I, delay: Span) -> Result<EnqueuedJob<Self>> {
         let mut conn = self.queue.pool.acquire().await?;
         self.enqueue_after_using(&mut *conn, input, delay).await
     }
@@ -1023,17 +1098,22 @@ where
         executor: E,
         input: &I,
         delay: Span,
-    ) -> Result<TaskId>
+    ) -> Result<EnqueuedJob<Self>>
     where
         E: PgExecutor<'a>,
     {
         let job_input = self.first_job_input(input)?;
-        let id = self
-            .queue
+
+        self.queue
             .enqueue_after(executor, self, &job_input, delay)
             .await?;
 
-        Ok(id)
+        let enqueue = EnqueuedJob {
+            id: job_input.job_id,
+            queue: self.queue.clone(),
+        };
+
+        Ok(enqueue)
     }
 
     /// Schedule the job using a connection from the queue's pool.
@@ -2184,7 +2264,7 @@ mod tests {
     use sqlx::PgPool;
 
     use super::*;
-    use crate::{queue::graceful_shutdown, task::State as TaskState};
+    use crate::queue::graceful_shutdown;
 
     #[sqlx::test]
     async fn one_step(pool: PgPool) -> sqlx::Result<(), Error> {
@@ -2588,14 +2668,22 @@ mod tests {
         let input = Step1 {
             message: "Hello, world!".to_string(),
         };
-        let task_id = job.enqueue(&input).await?;
+        let enqueued_job = job.enqueue(&input).await?;
 
         // Dequeue the first task.
         let Some(dequeued_task) = queue.dequeue(&pool).await? else {
             panic!("Task should exist");
         };
 
-        assert_eq!(task_id, dequeued_task.id);
+        assert_eq!(
+            enqueued_job.id,
+            dequeued_task
+                .input
+                .get("job_id")
+                .cloned()
+                .map(serde_json::from_value)
+                .expect("Failed to deserialize 'job_id'")?
+        );
         assert_eq!(dequeued_task.max_attempts, 1);
 
         // TODO: This really should be a method on `Queue`.
@@ -2736,14 +2824,22 @@ mod tests {
         let input = Step1 {
             message: "Hello, world!".to_string(),
         };
-        let task_id = job.enqueue(&input).await?;
+        let enqueued_job = job.enqueue(&input).await?;
 
         // Dequeue the first task.
         let Some(dequeued_task) = queue.dequeue(&pool).await? else {
             panic!("Task should exist");
         };
 
-        assert_eq!(task_id, dequeued_task.id);
+        assert_eq!(
+            enqueued_job.id,
+            dequeued_task
+                .input
+                .get("job_id")
+                .cloned()
+                .map(serde_json::from_value)
+                .expect("Failed to deserialize 'job_id'")?
+        );
 
         let job_state: JobState = serde_json::from_value(dequeued_task.input).unwrap();
         assert_eq!(
@@ -2899,6 +2995,38 @@ mod tests {
 
         assert!(job.unschedule().await.is_ok());
         assert!(queue.task_schedule(&pool).await?.is_none());
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn enqueued_job_cancel(pool: PgPool) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("enqueued_job_cancel")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let job = Job::builder()
+            .step(|_cx, _| async move { To::done() })
+            .queue(queue.clone())
+            .build();
+
+        let enqueued_job = job.enqueue(&()).await?;
+        enqueued_job.cancel().await?;
+
+        let task = sqlx::query!(
+            r#"
+            select state as "state: TaskState"
+            from underway.task
+            where input->>'job_id' = $1
+            "#,
+            enqueued_job.id.to_string()
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(task.state, TaskState::Cancelled);
 
         Ok(())
     }
