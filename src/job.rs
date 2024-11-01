@@ -796,6 +796,10 @@ impl<T: Task> EnqueuedJob<T> {
     /// Because jobs may be composed of multiple steps, the full set of tasks is
     /// searched and any pending tasks are cancelled.
     ///
+    /// Returns `true` if any tasks were successfully cancelled. Put another
+    /// way, if tasks are already cancelled or not eligible for cancellation
+    /// then this returns `false`.
+    ///
     /// # Errors
     ///
     /// This will return an error if the database operation fails and if the
@@ -830,7 +834,7 @@ impl<T: Task> EnqueuedJob<T> {
     /// # });
     /// # }
     /// ```
-    pub async fn cancel(&self) -> Result {
+    pub async fn cancel(&self) -> Result<bool> {
         let mut tx = self.queue.pool.begin().await?;
         let tasks = sqlx::query!(
             r#"
@@ -845,12 +849,15 @@ impl<T: Task> EnqueuedJob<T> {
         .fetch_all(&mut *tx)
         .await?;
 
+        let mut cancelled = false;
         for task in tasks {
-            self.queue.mark_task_cancelled(&mut *tx, task.id).await?;
+            if self.queue.mark_task_cancelled(&mut *tx, task.id).await? {
+                cancelled = true;
+            }
         }
         tx.commit().await?;
 
-        Ok(())
+        Ok(cancelled)
     }
 }
 
@@ -3013,7 +3020,9 @@ mod tests {
             .build();
 
         let enqueued_job = job.enqueue(&()).await?;
-        enqueued_job.cancel().await?;
+
+        // Should return `true`.
+        assert!(enqueued_job.cancel().await?);
 
         let task = sqlx::query!(
             r#"
@@ -3027,6 +3036,9 @@ mod tests {
         .await?;
 
         assert_eq!(task.state, TaskState::Cancelled);
+
+        // Should return `false` since the job is already cancelled.
+        assert!(!enqueued_job.cancel().await?);
 
         Ok(())
     }
