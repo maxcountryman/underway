@@ -728,7 +728,7 @@ mod sealed {
     pub struct JobState {
         pub step_index: usize,
         pub step_input: serde_json::Value,
-        pub job_id: JobId,
+        pub(crate) job_id: JobId,
     } // TODO: Versioning?
 }
 
@@ -790,7 +790,7 @@ impl Future for JobHandle {
 /// tasks on the queue. This means that each task related to a job will have
 /// the same job ID.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
-pub struct JobId(Uuid);
+pub(crate) struct JobId(Uuid);
 
 impl JobId {
     fn new() -> Self {
