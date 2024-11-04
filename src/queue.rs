@@ -932,8 +932,11 @@ impl<T: Task> Queue<T> {
         Ok(())
     }
 
-    #[allow(dead_code)] // TODO: Revisit cancellation re jobs.
-    pub(crate) async fn mark_task_cancelled<'a, E>(&self, executor: E, task_id: TaskId) -> Result
+    pub(crate) async fn mark_task_cancelled<'a, E>(
+        &self,
+        executor: E,
+        task_id: TaskId,
+    ) -> Result<bool>
     where
         E: PgExecutor<'a>,
     {
@@ -955,7 +958,7 @@ impl<T: Task> Queue<T> {
             return Err(Error::TaskNotFound(task_id));
         }
 
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     pub(crate) async fn mark_task_succeeded<'a, E>(&self, executor: E, task_id: TaskId) -> Result
