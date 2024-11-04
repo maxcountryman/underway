@@ -743,6 +743,36 @@ pub struct JobHandle {
 impl JobHandle {
     /// Signals the worker and scheduler to shutdown and waits for them to
     /// finish.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::PgPool;
+    /// # use underway::{Job, To};
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # let job = Job::<(), ()>::builder()
+    /// #     .step(|_cx, _| async move { To::done() })
+    /// #     .name("example")
+    /// #     .pool(pool)
+    /// #     .build()
+    /// #     .await?;
+    /// # /*
+    /// let job = { /* A `Job`. */ };
+    /// # */
+    /// #
+    ///
+    /// let job_handle = job.start();
+    ///
+    /// // Gracefully stop worker and scheduler.
+    /// job_handle.shutdown().await?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     pub async fn shutdown(mut self) -> Result<()> {
         self.shutdown_token.cancel();
 
