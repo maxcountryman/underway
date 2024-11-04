@@ -656,7 +656,9 @@ use uuid::Uuid;
 use crate::{
     queue::{Error as QueueError, Queue},
     scheduler::{Error as SchedulerError, Result as SchedulerResult, Scheduler, ZonedSchedule},
-    task::{Error as TaskError, Result as TaskResult, RetryPolicy, State as TaskState, Task},
+    task::{
+        Error as TaskError, Result as TaskResult, RetryPolicy, State as TaskState, Task, TaskId,
+    },
     worker::{Error as WorkerError, Result as WorkerResult, Worker},
 };
 
@@ -892,7 +894,7 @@ impl<T: Task> EnqueuedJob<T> {
         let mut tx = self.queue.pool.begin().await?;
         let tasks = sqlx::query!(
             r#"
-            select id
+            select id as "id: TaskId"
             from underway.task
             where input->>'job_id' = $1 and
                   state = $2
@@ -2752,7 +2754,7 @@ mod tests {
         // Return the task back to the queue so we can process it with the worker.
         sqlx::query!(
             "update underway.task set state = $2 where id = $1",
-            dequeued_task.id,
+            dequeued_task.id as _,
             TaskState::Pending as _
         )
         .execute(&pool)
@@ -2917,7 +2919,7 @@ mod tests {
         // Return the task back to the queue so we can process it with the worker.
         sqlx::query!(
             "update underway.task set state = $2 where id = $1",
-            dequeued_task.id,
+            dequeued_task.id as _,
             TaskState::Pending as _
         )
         .execute(&pool)

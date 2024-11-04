@@ -131,7 +131,7 @@ use tracing::instrument;
 
 use crate::{
     queue::{acquire_advisory_xact_lock, Error as QueueError, Queue, SHUTDOWN_CHANNEL},
-    task::{DequeuedTask, Error as TaskError, Id as TaskId, RetryCount, RetryPolicy, Task},
+    task::{DequeuedTask, Error as TaskError, RetryCount, RetryPolicy, Task, TaskId},
 };
 pub(crate) type Result<T = ()> = std::result::Result<T, Error>;
 
@@ -972,7 +972,7 @@ mod tests {
             from underway.task
             where id = $1
             "#,
-            task_id
+            task_id as _
         )
         .fetch_one(&pool)
         .await?;

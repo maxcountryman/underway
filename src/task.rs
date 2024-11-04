@@ -76,11 +76,12 @@
 //! # });
 //! # }
 //! ```
-use std::{future::Future, result::Result as StdResult};
+use std::{fmt, fmt::Display, future::Future, ops::Deref, result::Result as StdResult};
 
 use jiff::{Span, ToSpan};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sqlx::{postgres::types::PgInterval, Postgres, Transaction};
+use ulid::Ulid;
 use uuid::Uuid;
 
 pub(crate) use self::retry_policy::RetryCount;
@@ -93,7 +94,29 @@ mod retry_policy;
 /// Task IDs are [ULID][ULID]s which are converted to UUIDv4 for storage.
 ///
 /// [ULID]: https://github.com/ulid/spec?tab=readme-ov-file#specification
-pub type Id = Uuid;
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Hash, Eq, PartialEq, sqlx::Type)]
+#[sqlx(transparent)]
+pub struct TaskId(Uuid);
+
+impl TaskId {
+    pub(crate) fn new() -> Self {
+        Self(Ulid::new().into())
+    }
+}
+
+impl Deref for TaskId {
+    type Target = Uuid;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Display for TaskId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// A type alias for task execution results.
 pub type Result<T> = StdResult<T, Error>;
@@ -489,7 +512,7 @@ pub trait Task: Send + 'static {
 #[derive(Debug)]
 pub struct DequeuedTask {
     /// Task ID.
-    pub id: Id,
+    pub id: TaskId,
 
     /// Input as a `serde_json::Value`.
     pub input: serde_json::Value,

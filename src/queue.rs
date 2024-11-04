@@ -228,11 +228,9 @@ use sqlx::{
     Acquire, PgConnection, PgExecutor, PgPool, Postgres,
 };
 use tracing::instrument;
-use ulid::Ulid;
-use uuid::Uuid;
 
 use crate::{
-    task::{DequeuedTask, Id as TaskId, State as TaskState, Task},
+    task::{DequeuedTask, State as TaskState, Task, TaskId},
     ZonedSchedule,
 };
 
@@ -263,7 +261,7 @@ pub enum Error {
     /// This could be due to the task not existing at all or other clauses in
     /// the query that prevent a row from being returned.
     #[error("Task with ID {0} not found.")]
-    TaskNotFound(Uuid),
+    TaskNotFound(TaskId),
 
     /// Indicates that the schedule associated with the task is malformed.
     #[error("A malformed schedule was retrieved.")]
@@ -509,7 +507,7 @@ impl<T: Task> Queue<T> {
     where
         E: PgExecutor<'a>,
     {
-        let id: TaskId = Ulid::new().into();
+        let id = TaskId::new();
 
         let input_value = serde_json::to_value(input)?;
 
@@ -538,7 +536,7 @@ impl<T: Task> Queue<T> {
               priority
             ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             "#,
-            id,
+            id as _,
             self.name,
             input_value,
             StdDuration::try_from(timeout)? as _,
@@ -652,7 +650,7 @@ impl<T: Task> Queue<T> {
             DequeuedTask,
             r#"
             select
-              id,
+              id as "id: TaskId",
               input,
               timeout,
               retry_count,
@@ -919,7 +917,7 @@ impl<T: Task> Queue<T> {
                 updated_at = now()
             where id = $1
             "#,
-            task_id,
+            task_id as _,
             TaskState::InProgress as _
         )
         .execute(executor)
@@ -947,7 +945,7 @@ impl<T: Task> Queue<T> {
                 updated_at = now()
             where id = $1 and state < $3
             "#,
-            task_id,
+            task_id as _,
             TaskState::Cancelled as _,
             TaskState::Succeeded as _
         )
@@ -973,7 +971,7 @@ impl<T: Task> Queue<T> {
                 updated_at = now()
             where id = $1
             "#,
-            task_id,
+            task_id as _,
             TaskState::Succeeded as _
         )
         .execute(executor)
@@ -1012,7 +1010,7 @@ impl<T: Task> Queue<T> {
             "#,
             retry_count,
             std::time::Duration::try_from(delay)? as _,
-            task_id,
+            task_id as _,
             TaskState::Pending as _
         )
         .execute(executor)
@@ -1036,7 +1034,7 @@ impl<T: Task> Queue<T> {
                 updated_at = now()
             where id = $1
             "#,
-            task_id,
+            task_id as _,
             TaskState::Failed as _
         )
         .execute(executor)
@@ -1068,7 +1066,7 @@ impl<T: Task> Queue<T> {
                 updated_at = now()
             where id = $1
             "#,
-            task_id,
+            task_id as _,
             retry_count,
             error_message,
         )
@@ -1097,7 +1095,7 @@ impl<T: Task> Queue<T> {
             set task_queue_name = $2
             where id = $1
             "#,
-            task_id,
+            task_id as _,
             dlq_name
         )
         .execute(executor)
@@ -1383,12 +1381,12 @@ mod tests {
             from underway.task
             where id = $1
             "#,
-            task_id
+            task_id as _
         )
         .fetch_one(&pool)
         .await?;
 
-        assert_eq!(dequeued_task.id, task_id);
+        assert_eq!(dequeued_task.id, *task_id);
         assert_eq!(dequeued_task.input, input);
         assert_eq!(dequeued_task.retry_count, 0);
 
@@ -1437,7 +1435,7 @@ mod tests {
             select delay from underway.task
             where id = $1
             "#,
-            task_id
+            task_id as _
         )
         .fetch_one(&pool)
         .await?;
@@ -1500,7 +1498,7 @@ mod tests {
             from underway.task
             where id = $1
             "#,
-            task_id
+            task_id as _
         )
         .fetch_one(&pool)
         .await?;
@@ -1590,7 +1588,7 @@ mod tests {
             r#"
             select id, state as "state: TaskState" from underway.task where id = $1
             "#,
-            task_id
+            task_id as _
         )
         .fetch_one(&pool)
         .await?;
@@ -1630,7 +1628,7 @@ mod tests {
             r#"
             select id, retry_count, delay from underway.task where id = $1
             "#,
-            task_id
+            task_id as _
         )
         .fetch_optional(&pool)
         .await?;
@@ -1669,9 +1667,9 @@ mod tests {
         // Verify the task state
         let task_row = sqlx::query!(
             r#"
-            select id, state as "state: TaskState" from underway.task where id = $1
+            select state as "state: TaskState" from underway.task where id = $1
             "#,
-            task_id
+            task_id as _
         )
         .fetch_one(&pool)
         .await?;
@@ -1701,9 +1699,9 @@ mod tests {
         // Verify the task state
         let task_row = sqlx::query!(
             r#"
-            select id, state as "state: TaskState" from underway.task where id = $1
+            select state as "state: TaskState" from underway.task where id = $1
             "#,
-            task_id
+            task_id as _
         )
         .fetch_one(&pool)
         .await?;
@@ -1721,7 +1719,7 @@ mod tests {
             .build()
             .await?;
 
-        let nonexistent_task_id = Uuid::new_v4();
+        let nonexistent_task_id = TaskId::new();
 
         // Attempt to mark a non-existent task as succeeded
         let result = queue.mark_task_succeeded(&pool, nonexistent_task_id).await;
@@ -1748,7 +1746,7 @@ mod tests {
             .build()
             .await?;
 
-        let nonexistent_task_id = Uuid::new_v4();
+        let nonexistent_task_id = TaskId::new();
 
         // Attempt to mark a non-existent task as succeeded
         let result = queue.mark_task_failed(&pool, nonexistent_task_id).await;
@@ -1789,7 +1787,7 @@ mod tests {
             r#"
             select id, state as "state: TaskState" from underway.task where id = $1
             "#,
-            task_id
+            task_id as _
         )
         .fetch_optional(&pool)
         .await?;
@@ -1827,7 +1825,7 @@ mod tests {
             r#"
             select id, retry_count, error_message from underway.task where id = $1
             "#,
-            task_id
+            task_id as _
         )
         .fetch_optional(&pool)
         .await?;
@@ -1863,7 +1861,7 @@ mod tests {
             r#"
             select id, task_queue_name from underway.task where id = $1
             "#,
-            task_id
+            task_id as _
         )
         .fetch_optional(&pool)
         .await?;
