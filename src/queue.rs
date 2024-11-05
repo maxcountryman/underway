@@ -1221,6 +1221,28 @@ impl<T: Task> Default for Builder<T, Initial> {
 
 impl<T: Task> Builder<T, Initial> {
     /// Create a new queue builder.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use sqlx::{Postgres, Transaction};
+    /// # use underway::{Task, task::Result as TaskResult};
+    /// # struct ExampleTask;
+    /// # impl Task for ExampleTask {
+    /// #     type Input = ();
+    /// #     type Output = ();
+    /// #     async fn execute(
+    /// #         &self,
+    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: Self::Input,
+    /// #     ) -> TaskResult<Self::Output> {
+    /// #         Ok(())
+    /// #     }
+    /// # }
+    /// use underway::Queue;
+    ///
+    /// let queue_builder = Queue::<ExampleTask>::builder();
+    /// ```
     pub fn new() -> Self {
         Self {
             state: Initial,
@@ -1229,6 +1251,28 @@ impl<T: Task> Builder<T, Initial> {
     }
 
     /// Set the queue name.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use sqlx::{Postgres, Transaction};
+    /// # use underway::{Task, task::Result as TaskResult};
+    /// # struct ExampleTask;
+    /// # impl Task for ExampleTask {
+    /// #     type Input = ();
+    /// #     type Output = ();
+    /// #     async fn execute(
+    /// #         &self,
+    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: Self::Input,
+    /// #     ) -> TaskResult<Self::Output> {
+    /// #         Ok(())
+    /// #     }
+    /// # }
+    /// use underway::Queue;
+    ///
+    /// let queue_builder = Queue::<ExampleTask>::builder().name("my-queue");
+    /// ```
     pub fn name(self, name: impl Into<String>) -> Builder<T, NameSet> {
         Builder {
             state: NameSet {
@@ -1242,12 +1286,69 @@ impl<T: Task> Builder<T, Initial> {
 
 impl<T: Task> Builder<T, NameSet> {
     /// Set the dead-letter queue name.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use sqlx::{Postgres, Transaction};
+    /// # use underway::{Task, task::Result as TaskResult};
+    /// # struct ExampleTask;
+    /// # impl Task for ExampleTask {
+    /// #     type Input = ();
+    /// #     type Output = ();
+    /// #     async fn execute(
+    /// #         &self,
+    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: Self::Input,
+    /// #     ) -> TaskResult<Self::Output> {
+    /// #         Ok(())
+    /// #     }
+    /// # }
+    /// use underway::Queue;
+    ///
+    /// let queue_builder = Queue::<ExampleTask>::builder()
+    ///     .name("example")
+    ///     .dead_letter_queue("example-dlq");
+    /// ```
     pub fn dead_letter_queue(mut self, dlq_name: impl Into<String>) -> Self {
         self.state.dlq_name = Some(dlq_name.into());
         self
     }
 
     /// Set the database connection pool.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::{Postgres, Transaction};
+    /// # use underway::{Task, task::Result as TaskResult};
+    /// # struct ExampleTask;
+    /// # impl Task for ExampleTask {
+    /// #     type Input = ();
+    /// #     type Output = ();
+    /// #     async fn execute(
+    /// #         &self,
+    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: Self::Input,
+    /// #     ) -> TaskResult<Self::Output> {
+    /// #         Ok(())
+    /// #     }
+    /// # }
+    /// use sqlx::PgPool;
+    /// use underway::Queue;
+    ///
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// let queue_builder = Queue::<ExampleTask>::builder()
+    ///     .name("example")
+    ///     .pool(pool.clone());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     pub fn pool(self, pool: PgPool) -> Builder<T, PoolSet> {
         Builder {
             state: PoolSet {
@@ -1262,6 +1363,41 @@ impl<T: Task> Builder<T, NameSet> {
 
 impl<T: Task> Builder<T, PoolSet> {
     /// Builds the queue.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::{Postgres, Transaction};
+    /// # use underway::{Task, task::Result as TaskResult};
+    /// # struct ExampleTask;
+    /// # impl Task for ExampleTask {
+    /// #     type Input = ();
+    /// #     type Output = ();
+    /// #     async fn execute(
+    /// #         &self,
+    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: Self::Input,
+    /// #     ) -> TaskResult<Self::Output> {
+    /// #         Ok(())
+    /// #     }
+    /// # }
+    /// use sqlx::PgPool;
+    /// use underway::Queue;
+    ///
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// let queue_builder = Queue::<ExampleTask>::builder()
+    ///     .name("example")
+    ///     .pool(pool.clone())
+    ///     .build()
+    ///     .await?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
     pub async fn build(self) -> Result<Queue<T>> {
         let state = self.state;
 
@@ -1586,7 +1722,11 @@ mod tests {
         // Verify the task state
         let task_row = sqlx::query!(
             r#"
-            select id, state as "state: TaskState" from underway.task where id = $1
+            select 
+              state as "state: TaskState", 
+              started_at as "started_at: i64"
+            from underway.task
+            where id = $1
             "#,
             task_id as _
         )
@@ -1594,6 +1734,7 @@ mod tests {
         .await?;
 
         assert_eq!(task_row.state, TaskState::InProgress);
+        assert!(task_row.started_at.is_some());
 
         Ok(())
     }
@@ -1638,11 +1779,10 @@ mod tests {
         let dequeued_task = dequeued_task.unwrap();
         assert_eq!(dequeued_task.retry_count, retry_count);
 
-        // TODO:
-        // assertion `left == right` failed
-        //  left: PT60s
-        // right: PT60s
-        // assert_eq!(pg_interval_to_span(&dequeued_task.delay), delay);
+        assert_eq!(
+            pg_interval_to_span(&dequeued_task.delay).compare(delay)?,
+            std::cmp::Ordering::Equal
+        );
 
         Ok(())
     }
