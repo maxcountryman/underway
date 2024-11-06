@@ -1,10 +1,15 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            select \n              state as \"state: TaskState\", \n              started_at as \"started_at: i64\"\n            from underway.task\n            where id = $1\n            ",
+  "query": "\n            select id, state as \"state: TaskState\"\n            from underway.task\n            where id = $1\n            ",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
         "name": "state: TaskState",
         "type_info": {
           "Custom": {
@@ -20,11 +25,6 @@
             }
           }
         }
-      },
-      {
-        "ordinal": 1,
-        "name": "started_at: i64",
-        "type_info": "Timestamptz"
       }
     ],
     "parameters": {
@@ -34,8 +34,8 @@
     },
     "nullable": [
       false,
-      true
+      false
     ]
   },
-  "hash": "ea258e573cb7a23484f1e45fadd584bd93533612b470ce841e2b69eabfd5da3f"
+  "hash": "85a73e45e72618023e0a722bb8a830dd13016316783200f3767114377a3bacfa"
 }

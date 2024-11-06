@@ -1,12 +1,10 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            update underway.task\n            set state = $4,\n                retry_count = $1,\n                delay = $2,\n                updated_at = now()\n            where id = $3\n            ",
+  "query": "\n            update underway.task\n            set state = $2,\n                updated_at = now(),\n                completed_at = now()\n            where id = $1\n            ",
   "describe": {
     "columns": [],
     "parameters": {
       "Left": [
-        "Int4",
-        "Interval",
         "Uuid",
         {
           "Custom": {
@@ -26,5 +24,5 @@
     },
     "nullable": []
   },
-  "hash": "c2860d9ef842e2172ca63b12fbe0bcfcb93c7b5f3ccc48a767951349316f40fc"
+  "hash": "98f5535ef035447135c267ffb61e3ee1eb5c42a9c3038ccbe7b93c92d393c54f"
 }

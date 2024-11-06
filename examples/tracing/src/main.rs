@@ -59,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await?;
 
-    tracing::info!(task.id = %task_id.as_hyphenated(), "Enqueued task");
+    tracing::info!("Enqueued job");
 
     // Start the worker to process tasks.
     job.run().await?;

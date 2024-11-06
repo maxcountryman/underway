@@ -1655,9 +1655,9 @@ where
                 .enqueue_after(&mut *tx, self, &next_job_input, delay)
                 .await
                 .map_err(|err| TaskError::Retryable(err.to_string()))?;
-
-            tx.commit().await?;
         };
+
+        tx.commit().await?;
 
         Ok(())
     }
@@ -2357,8 +2357,9 @@ mod tests {
         };
         job.enqueue(&input).await?;
 
+        let mut conn = pool.acquire().await?;
         let pending_task = queue
-            .dequeue(&pool)
+            .dequeue(&mut conn)
             .await?
             .expect("There should be an enqueued task");
 
@@ -2396,8 +2397,9 @@ mod tests {
         };
         job.enqueue(&input).await?;
 
+        let mut conn = pool.acquire().await?;
         let pending_task = queue
-            .dequeue(&pool)
+            .dequeue(&mut conn)
             .await?
             .expect("There should be an enqueued task");
 
@@ -2447,8 +2449,9 @@ mod tests {
         };
         job.enqueue(&input).await?;
 
+        let mut conn = pool.acquire().await?;
         let pending_task = queue
-            .dequeue(&pool)
+            .dequeue(&mut conn)
             .await?
             .expect("There should be an enqueued task");
 
@@ -2544,8 +2547,9 @@ mod tests {
         };
         job.enqueue(&input).await?;
 
+        let mut conn = pool.acquire().await?;
         let pending_task = queue
-            .dequeue(&pool)
+            .dequeue(&mut conn)
             .await?
             .expect("There should be an enqueued task");
 
@@ -2582,8 +2586,9 @@ mod tests {
         };
         job.enqueue(&input).await?;
 
+        let mut conn = pool.acquire().await?;
         let pending_task = queue
-            .dequeue(&pool)
+            .dequeue(&mut conn)
             .await?
             .expect("There should be an enqueued task");
 
@@ -2671,8 +2676,9 @@ mod tests {
         worker.process_next_task().await?;
 
         // Inspect the second task.
+        let mut conn = pool.acquire().await?;
         let pending_task = queue
-            .dequeue(&pool)
+            .dequeue(&mut conn)
             .await?
             .expect("There should be an enqueued task");
 
@@ -2734,7 +2740,8 @@ mod tests {
         let enqueued_job = job.enqueue(&input).await?;
 
         // Dequeue the first task.
-        let Some(dequeued_task) = queue.dequeue(&pool).await? else {
+        let mut conn = pool.acquire().await?;
+        let Some(dequeued_task) = queue.dequeue(&mut conn).await? else {
             panic!("Task should exist");
         };
 
@@ -2747,7 +2754,7 @@ mod tests {
                 .map(serde_json::from_value)
                 .expect("Failed to deserialize 'job_id'")?
         );
-        assert_eq!(dequeued_task.max_attempts, 1);
+        assert_eq!(dequeued_task.retry_policy.max_attempts, 1);
 
         // TODO: This really should be a method on `Queue`.
         //
@@ -2768,11 +2775,12 @@ mod tests {
         worker.process_next_task().await?;
 
         // Dequeue the second task.
-        let Some(dequeued_task) = queue.dequeue(&pool).await? else {
+        let mut conn = pool.acquire().await?;
+        let Some(dequeued_task) = queue.dequeue(&mut conn).await? else {
             panic!("Next task should exist");
         };
 
-        assert_eq!(dequeued_task.max_attempts, 15);
+        assert_eq!(dequeued_task.retry_policy.max_attempts, 15);
 
         Ok(())
     }
@@ -2835,8 +2843,9 @@ mod tests {
         worker.process_next_task().await?;
 
         // Inspect the second task.
+        let mut conn = pool.acquire().await?;
         let pending_task = queue
-            .dequeue(&pool)
+            .dequeue(&mut conn)
             .await?
             .expect("There should be an enqueued task");
 
@@ -2890,7 +2899,8 @@ mod tests {
         let enqueued_job = job.enqueue(&input).await?;
 
         // Dequeue the first task.
-        let Some(dequeued_task) = queue.dequeue(&pool).await? else {
+        let mut conn = pool.acquire().await?;
+        let Some(dequeued_task) = queue.dequeue(&mut conn).await? else {
             panic!("Task should exist");
         };
 
@@ -2933,7 +2943,8 @@ mod tests {
         worker.process_next_task().await?;
 
         // Dequeue the second task.
-        let Some(dequeued_task) = queue.dequeue(&pool).await? else {
+        let mut conn = pool.acquire().await?;
+        let Some(dequeued_task) = queue.dequeue(&mut conn).await? else {
             panic!("Next task should exist");
         };
 

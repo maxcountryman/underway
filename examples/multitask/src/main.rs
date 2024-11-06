@@ -5,7 +5,7 @@ use sqlx::{PgPool, Postgres, Transaction};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use underway::{
     queue::Error as QueueError,
-    task::{Id as TaskId, Result as TaskResult},
+    task::{Result as TaskResult, TaskId},
     Queue, Task, Worker,
 };
 

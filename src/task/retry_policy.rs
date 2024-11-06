@@ -1,6 +1,5 @@
 use jiff::{Span, ToSpan};
-
-use crate::task::DequeuedTask;
+use serde::{Deserialize, Serialize};
 
 /// Configuration of a policy for retries in case of task failure.
 ///
@@ -14,7 +13,7 @@ use crate::task::DequeuedTask;
 ///     .backoff_coefficient(4.0)
 ///     .build();
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, sqlx::FromRow)]
 pub struct RetryPolicy {
     pub(crate) max_attempts: i32,
     pub(crate) initial_interval_ms: i32,
@@ -43,25 +42,6 @@ impl RetryPolicy {
         let backoff_delay = base_delay * self.backoff_coefficient.powi(retry_count - 1);
         let delay = backoff_delay.min(self.max_interval_ms as f32) as i64;
         delay.milliseconds()
-    }
-}
-
-impl From<DequeuedTask> for RetryPolicy {
-    fn from(
-        DequeuedTask {
-            max_attempts,
-            initial_interval_ms,
-            max_interval_ms,
-            backoff_coefficient,
-            ..
-        }: DequeuedTask,
-    ) -> Self {
-        Self {
-            max_attempts,
-            initial_interval_ms,
-            max_interval_ms,
-            backoff_coefficient,
-        }
     }
 }
 

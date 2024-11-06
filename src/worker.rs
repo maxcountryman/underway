@@ -117,7 +117,7 @@
 //! For cases where it's unimportant to wait for tasks to complete, this routine
 //! can be ignored.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use jiff::{Span, ToSpan};
 use serde::Deserialize;
@@ -131,7 +131,7 @@ use tracing::instrument;
 
 use crate::{
     queue::{acquire_advisory_xact_lock, Error as QueueError, Queue, SHUTDOWN_CHANNEL},
-    task::{DequeuedTask, Error as TaskError, RetryCount, RetryPolicy, Task, TaskId},
+    task::{Error as TaskError, RetryCount, RetryPolicy, Task, TaskId},
 };
 pub(crate) type Result<T = ()> = std::result::Result<T, Error>;
 
@@ -709,7 +709,7 @@ impl<T: Task + Sync> Worker<T> {
     pub async fn process_next_task(&self) -> Result<Option<TaskId>> {
         let mut tx = self.queue.pool.begin().await?;
 
-        let Some(pending_task) = self.queue.dequeue(&mut tx).await? else {
+        let Some(pending_task) = self.queue.dequeue(&mut *tx).await? else {
             return Ok(None);
         };
 
@@ -737,7 +737,8 @@ impl<T: Task + Sync> Worker<T> {
                     }
 
                     Err(err) => {
-                        self.handle_task_error(&mut tx, task_id, pending_task, err)
+                        let retry_policy = &pending_task.retry_policy;
+                        self.handle_task_error(&mut *tx, task_id, retry_policy, err)
                             .await?;
                     }
                 }
@@ -745,7 +746,8 @@ impl<T: Task + Sync> Worker<T> {
 
             _ = tokio::time::sleep(timeout) => {
                 tracing::error!("Task execution timed out");
-                self.handle_task_timeout(&mut tx, task_id, pending_task).await?;
+                let retry_policy = &pending_task.retry_policy;
+                self.handle_task_timeout(&mut tx, task_id, retry_policy, timeout).await?;
             }
         }
 
@@ -758,7 +760,7 @@ impl<T: Task + Sync> Worker<T> {
         &self,
         conn: &mut PgConnection,
         task_id: TaskId,
-        dequeued_task: DequeuedTask,
+        retry_policy: &RetryPolicy,
         err: TaskError,
     ) -> Result {
         tracing::error!(err = %err, "Task execution encountered an error");
@@ -768,13 +770,11 @@ impl<T: Task + Sync> Worker<T> {
             return self.finalize_task_failure(conn, task_id).await;
         }
 
-        let retry_count = dequeued_task.retry_count + 1;
-        let retry_policy: RetryPolicy = dequeued_task.into();
-
         self.queue
-            .update_task_failure(&mut *conn, task_id, retry_count, &err.to_string())
+            .update_task_failure(&mut *conn, task_id, &err)
             .await?;
 
+        let retry_count = self.queue.retry_count(&mut *conn, &task_id).await?;
         if retry_count < retry_policy.max_attempts {
             self.schedule_task_retry(conn, task_id, retry_count, &retry_policy)
                 .await?;
@@ -785,21 +785,22 @@ impl<T: Task + Sync> Worker<T> {
         Ok(())
     }
 
-    async fn handle_task_timeout<'a>(
+    async fn handle_task_timeout(
         &self,
         conn: &mut PgConnection,
         task_id: TaskId,
-        dequeued_task: DequeuedTask,
+        retry_policy: &RetryPolicy,
+        timeout: Duration,
     ) -> Result {
         tracing::error!("Task execution timed out");
 
-        let retry_count = dequeued_task.retry_count + 1;
-        let retry_policy: RetryPolicy = dequeued_task.into();
-
+        let err = &TaskError::TimedOut(timeout.try_into()?);
         self.queue
-            .update_task_failure(&mut *conn, task_id, retry_count, "Task timed out")
+            .update_task_failure(&mut *conn, task_id, err)
             .await?;
 
+        // Poll count after updating task failure;.
+        let retry_count = self.queue.retry_count(&mut *conn, &task_id).await?;
         if retry_count < retry_policy.max_attempts {
             self.schedule_task_retry(conn, task_id, retry_count, &retry_policy)
                 .await?;
@@ -822,7 +823,7 @@ impl<T: Task + Sync> Worker<T> {
         let delay = retry_policy.calculate_delay(retry_count);
 
         self.queue
-            .reschedule_task_for_retry(&mut *conn, task_id, retry_count, delay)
+            .reschedule_task_for_retry(&mut *conn, task_id, delay)
             .await?;
 
         Ok(())
@@ -925,14 +926,15 @@ mod tests {
         // Enqueue a task.
         let task = TestTask;
         queue.enqueue(&pool, &task, &()).await?;
-        assert!(queue.dequeue(&pool).await?.is_some());
+        let mut conn = pool.acquire().await?;
+        assert!(queue.dequeue(&mut conn).await?.is_some());
 
         // Process the task.
         let worker = Worker::new(queue.clone(), task);
         worker.process_next_task().await?;
 
         // Ensure the task is no longer available on the queue.
-        assert!(queue.dequeue(&pool).await?.is_none());
+        assert!(queue.dequeue(&mut conn).await?.is_none());
 
         Ok(())
     }

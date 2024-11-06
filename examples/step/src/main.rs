@@ -50,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let squared = n.pow(2);
             tracing::info!("Squared value: {n}^2 = {squared}");
             // Proceed to the next step with the new state.
-            To::next(Modulo { n })
+            To::next(Modulo { n: squared })
         })
         // Step 3: Compute modulo of the result.
         .step(|_ctx, Modulo { n }| async move {
