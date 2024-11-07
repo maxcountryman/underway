@@ -27,7 +27,7 @@ create table underway.task_attempt (
     attempt_number  integer not null,
 
     -- Task state.
-    state           underway.task_state not null default 'pending',
+    state           underway.task_state not null default 'in_progress',
 
     -- Error metatdata.
     error_message   text,
