@@ -19,7 +19,7 @@ sqlx = { version = "0.8.2", features = [
     "runtime-tokio-rustls",
     "uuid",
 ] }
-thiserror = "1.0.63"
+thiserror = "2.0.0"
 tokio = { version = "1.40.0", features = [
     "full",
 ] } # TODO: "full" shouldn't be required
