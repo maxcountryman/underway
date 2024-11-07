@@ -83,7 +83,7 @@ use std::{
     result::Result as StdResult,
 };
 
-use jiff::{Span, ToSpan};
+use jiff::{SignedDuration, Span, ToSpan};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sqlx::{postgres::types::PgInterval, types::Json, Postgres, Transaction};
 use ulid::Ulid;
@@ -136,7 +136,7 @@ pub enum Error {
 
     /// Indicates the task timed out during execution.
     #[error("Task timed out after {0} during execution")]
-    TimedOut(Span),
+    TimedOut(SignedDuration),
 
     /// Error indicating that the task has encountered an unrecoverable error
     /// state.
