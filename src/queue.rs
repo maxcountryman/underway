@@ -1800,7 +1800,7 @@ mod tests {
                 let pool = pool.clone();
                 tokio::spawn(async move {
                     let mut tx = pool.begin().await?;
-                    let ret = queue.dequeue(&mut *tx).await;
+                    let ret = queue.dequeue(&mut tx).await;
                     tx.commit().await?;
                     ret
                 })
@@ -1861,10 +1861,10 @@ mod tests {
         let mut tx = pool.begin().await?;
 
         // N.B. Task must be dequeued to ensure an attempt row is created.
-        queue.dequeue(&mut *tx).await?;
+        queue.dequeue(&mut tx).await?;
 
         // Mark the task as in progress
-        queue.mark_task_in_progress(&mut *tx, task_id).await?;
+        queue.mark_task_in_progress(&mut tx, task_id).await?;
 
         // Verify the task state
         let task_row = sqlx::query!(
@@ -1999,10 +1999,10 @@ mod tests {
         let mut tx = pool.begin().await?;
 
         // N.B. Task must be dequeued to ensure attempt row is created.
-        queue.dequeue(&mut *tx).await?;
+        queue.dequeue(&mut tx).await?;
 
         // Mark the task as succeeded
-        queue.mark_task_succeeded(&mut *tx, task_id).await?;
+        queue.mark_task_succeeded(&mut tx, task_id).await?;
 
         // Verify the task state
         let task_row = sqlx::query!(
@@ -2094,10 +2094,10 @@ mod tests {
         let mut tx = pool.begin().await?;
 
         // N.B. We can't mark a task failed if it hasn't been dequeued.
-        queue.dequeue(&mut *tx).await?;
+        queue.dequeue(&mut tx).await?;
 
         // Mark the task as failed
-        queue.mark_task_failed(&mut *tx, task_id).await?;
+        queue.mark_task_failed(&mut tx, task_id).await?;
 
         // Verify the task state
         let task_row = sqlx::query!(
@@ -2135,10 +2135,10 @@ mod tests {
         let mut tx = pool.begin().await?;
 
         // N.B. Task must be dequeued to ensure attempt row is created.
-        queue.dequeue(&mut *tx).await?;
+        queue.dequeue(&mut tx).await?;
 
         // Update task failure.
-        queue.update_task_failure(&mut *tx, task_id, error).await?;
+        queue.update_task_failure(&mut tx, task_id, error).await?;
 
         // Query to verify the failure update
         let task_attempt_row = sqlx::query!(
