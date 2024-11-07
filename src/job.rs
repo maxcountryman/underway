@@ -907,7 +907,7 @@ impl<T: Task> EnqueuedJob<T> {
 
         let mut cancelled = false;
         for task in tasks {
-            if self.queue.mark_task_cancelled(&mut *tx, task.id).await? {
+            if self.queue.mark_task_cancelled(&mut tx, task.id).await? {
                 cancelled = true;
             }
         }

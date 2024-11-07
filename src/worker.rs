@@ -709,7 +709,7 @@ impl<T: Task + Sync> Worker<T> {
     pub async fn process_next_task(&self) -> Result<Option<TaskId>> {
         let mut tx = self.queue.pool.begin().await?;
 
-        let Some(pending_task) = self.queue.dequeue(&mut *tx).await? else {
+        let Some(pending_task) = self.queue.dequeue(&mut tx).await? else {
             return Ok(None);
         };
 
@@ -733,12 +733,12 @@ impl<T: Task + Sync> Worker<T> {
             result = self.task.execute(execute_tx, input) => {
                 match result {
                     Ok(_) => {
-                        self.queue.mark_task_succeeded(&mut *tx, task_id).await?;
+                        self.queue.mark_task_succeeded(&mut tx, task_id).await?;
                     }
 
                     Err(err) => {
                         let retry_policy = &pending_task.retry_policy;
-                        self.handle_task_error(&mut *tx, task_id, retry_policy, err)
+                        self.handle_task_error(&mut tx, task_id, retry_policy, err)
                             .await?;
                     }
                 }
@@ -776,7 +776,7 @@ impl<T: Task + Sync> Worker<T> {
 
         let retry_count = self.queue.retry_count(&mut *conn, &task_id).await?;
         if retry_count < retry_policy.max_attempts {
-            self.schedule_task_retry(conn, task_id, retry_count, &retry_policy)
+            self.schedule_task_retry(conn, task_id, retry_count, retry_policy)
                 .await?;
         } else {
             self.finalize_task_failure(conn, task_id).await?;
@@ -802,7 +802,7 @@ impl<T: Task + Sync> Worker<T> {
         // Poll count after updating task failure;.
         let retry_count = self.queue.retry_count(&mut *conn, &task_id).await?;
         if retry_count < retry_policy.max_attempts {
-            self.schedule_task_retry(conn, task_id, retry_count, &retry_policy)
+            self.schedule_task_retry(conn, task_id, retry_count, retry_policy)
                 .await?;
         } else {
             self.finalize_task_failure(conn, task_id).await?;
