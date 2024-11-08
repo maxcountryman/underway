@@ -2584,13 +2584,26 @@ mod tests {
 
         assert!(queue.dequeue(&mut conn).await?.is_some());
 
-        let attempt_rows = sqlx::query!("select task_id from underway.task_attempt")
-            .fetch_all(&pool)
-            .await?;
+        let attempt_rows = sqlx::query!(
+            r#"
+            select task_id, state as "state: TaskState"
+            from underway.task_attempt
+            order by created_at
+            "#
+        )
+        .fetch_all(&pool)
+        .await?;
 
         assert_eq!(attempt_rows.len(), 2);
-        for attempt_row in attempt_rows {
+
+        for (i, attempt_row) in attempt_rows.into_iter().enumerate() {
             assert_eq!(attempt_row.task_id, *task_id);
+            let expected_state = match i {
+                0 => TaskState::Failed,
+                1 => TaskState::InProgress,
+                _ => panic!("Unexpected attempt row index"),
+            };
+            assert_eq!(attempt_row.state, expected_state);
         }
 
         Ok(())
