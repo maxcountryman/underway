@@ -1,5 +1,4 @@
 use jiff::{Span, ToSpan};
-use serde::{Deserialize, Serialize};
 
 /// Configuration of a policy for retries in case of task failure.
 ///
@@ -13,12 +12,13 @@ use serde::{Deserialize, Serialize};
 ///     .backoff_coefficient(4.0)
 ///     .build();
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Copy, PartialEq, sqlx::Type)]
+#[sqlx(type_name = "underway.task_retry_policy")]
 pub struct RetryPolicy {
     pub(crate) max_attempts: i32,
     pub(crate) initial_interval_ms: i32,
     pub(crate) max_interval_ms: i32,
-    pub(crate) backoff_coefficient: f32,
+    pub(crate) backoff_coefficient: f64,
 }
 
 pub(crate) type RetryCount = i32;
@@ -38,9 +38,9 @@ impl RetryPolicy {
     }
 
     pub(crate) fn calculate_delay(&self, retry_count: RetryCount) -> Span {
-        let base_delay = self.initial_interval_ms as f32;
+        let base_delay = self.initial_interval_ms as f64;
         let backoff_delay = base_delay * self.backoff_coefficient.powi(retry_count - 1);
-        let delay = backoff_delay.min(self.max_interval_ms as f32) as i64;
+        let delay = backoff_delay.min(self.max_interval_ms as f64) as i64;
         delay.milliseconds()
     }
 }
@@ -141,7 +141,7 @@ impl Builder {
     /// // Set a backoff coefficient of one point five.
     /// let retry_policy_builder = RetryPolicy::builder().backoff_coefficient(1.5);
     /// ```
-    pub const fn backoff_coefficient(mut self, backoff_coefficient: f32) -> Self {
+    pub const fn backoff_coefficient(mut self, backoff_coefficient: f64) -> Self {
         self.inner.backoff_coefficient = backoff_coefficient;
         self
     }

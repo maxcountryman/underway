@@ -226,7 +226,6 @@ use builder_states::{Initial, NameSet, PoolSet};
 use jiff::{Span, ToSpan};
 use sqlx::{
     postgres::{PgAdvisoryLock, PgAdvisoryLockGuard},
-    types::Json,
     PgConnection, PgExecutor, PgPool,
 };
 use tracing::instrument;
@@ -541,7 +540,7 @@ impl<T: Task> Queue<T> {
             StdDuration::try_from(timeout)? as _,
             StdDuration::try_from(ttl)? as _,
             StdDuration::try_from(delay)? as _,
-            serde_json::to_value(retry_policy)?,
+            retry_policy as RetryPolicy,
             concurrency_key,
             priority
         )
@@ -645,7 +644,7 @@ impl<T: Task> Queue<T> {
               id as "id: TaskId",
               input,
               timeout,
-              retry_policy as "retry_policy: Json<RetryPolicy>",
+              retry_policy as "retry_policy: RetryPolicy",
               concurrency_key
             from underway.task
             where task_queue_name = $1
@@ -1672,7 +1671,7 @@ mod tests {
         // Query the database to verify the task was enqueued
         let dequeued_task = sqlx::query!(
             r#"
-            select id, input, retry_policy as "retry_policy: Json<RetryPolicy>", concurrency_key, priority
+            select id, input, retry_policy as "retry_policy: RetryPolicy", concurrency_key, priority
             from underway.task
             where id = $1
             "#,

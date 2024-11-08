@@ -11,7 +11,31 @@
         "Interval",
         "Interval",
         "Interval",
-        "Jsonb",
+        {
+          "Custom": {
+            "name": "underway.task_retry_policy",
+            "kind": {
+              "Composite": [
+                [
+                  "max_attempts",
+                  "Int4"
+                ],
+                [
+                  "initial_interval_ms",
+                  "Int4"
+                ],
+                [
+                  "max_interval_ms",
+                  "Int4"
+                ],
+                [
+                  "backoff_coefficient",
+                  "Float8"
+                ]
+              ]
+            }
+          }
+        },
         "Text",
         "Int4"
       ]

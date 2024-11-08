@@ -85,7 +85,7 @@ use std::{
 
 use jiff::{SignedDuration, Span, ToSpan};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use sqlx::{postgres::types::PgInterval, types::Json, Postgres, Transaction};
+use sqlx::{postgres::types::PgInterval, Postgres, Transaction};
 use ulid::Ulid;
 use uuid::Uuid;
 
@@ -531,7 +531,7 @@ pub struct DequeuedTask {
     pub timeout: PgInterval,
 
     /// [`RetryPolicy`] for the task.
-    pub retry_policy: Json<RetryPolicy>,
+    pub retry_policy: RetryPolicy,
 
     /// Concurrency key.
     pub concurrency_key: Option<String>,

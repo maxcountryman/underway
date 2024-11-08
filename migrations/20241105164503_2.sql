@@ -12,8 +12,17 @@ drop column if exists started_at,
 drop column if exists succeeded_at,
 drop column if exists last_failed_at;
 
+-- Define retry policies as their own type
+create type underway.task_retry_policy as (
+    max_attempts         int,
+    initial_interval_ms  int,
+    max_interval_ms      int,
+    backoff_coefficient  float
+);
+
 alter table underway.task
-add column if not exists retry_policy jsonb not null default '{"max_attempts": 5, "initial_interval_ms": 1000, "max_interval_ms": 60000, "backoff_coefficient": 2.0}';
+    add column if not exists retry_policy underway.task_retry_policy not null 
+    default row(5, 1000, 60000, 2.0)::underway.task_retry_policy;
 
 alter table underway.task
 add column if not exists completed_at timestamp with time zone;
