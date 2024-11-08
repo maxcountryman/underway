@@ -2381,9 +2381,183 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn verify_attempt_rows(pool: PgPool) -> sqlx::Result<(), Error> {
-        let queue = Queue::<TestTask>::builder()
-            .name("verify_attempt_row")
+    async fn verify_attempt_rows_for_success(pool: PgPool) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("verify_attempt_rows_for_success")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let task_id = queue.enqueue(&pool, &TestTask, &json!("{}")).await?;
+
+        // Dequeue the task to ensure the attempt row is created.
+        let mut conn = pool.acquire().await?;
+        queue.dequeue(&mut conn).await?;
+
+        let attempt_rows = sqlx::query!(
+            r#"select task_id, state as "state: TaskState" from underway.task_attempt"#
+        )
+        .fetch_all(&pool)
+        .await?;
+
+        assert_eq!(attempt_rows.len(), 1);
+        for attempt_row in attempt_rows {
+            assert_eq!(attempt_row.task_id, *task_id);
+            assert_eq!(attempt_row.state, TaskState::InProgress);
+        }
+
+        // Simulate the task succeeding.
+        queue.mark_task_succeeded(&mut conn, task_id).await?;
+
+        let task_row = sqlx::query!(
+            r#"select state as "state: TaskState" from underway.task where id = $1"#,
+            task_id as TaskId
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(task_row.state, TaskState::Succeeded);
+
+        let attempt_rows = sqlx::query!(
+            r#"select task_id, state as "state: TaskState" from underway.task_attempt"#
+        )
+        .fetch_all(&pool)
+        .await?;
+
+        assert_eq!(attempt_rows.len(), 1);
+        for attempt_row in attempt_rows {
+            assert_eq!(attempt_row.task_id, *task_id);
+            assert_eq!(attempt_row.state, TaskState::Succeeded);
+        }
+
+        assert!(
+            queue.dequeue(&mut conn).await?.is_none(),
+            "The task succeeded so nothing else should be queued"
+        );
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn verify_attempt_rows_for_failure(pool: PgPool) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("verify_attempt_rows_for_failure")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let task_id = queue.enqueue(&pool, &TestTask, &json!("{}")).await?;
+
+        // Dequeue the task to ensure the attempt row is created.
+        let mut conn = pool.acquire().await?;
+        queue.dequeue(&mut conn).await?;
+
+        let attempt_rows = sqlx::query!(
+            r#"select task_id, state as "state: TaskState" from underway.task_attempt"#
+        )
+        .fetch_all(&pool)
+        .await?;
+
+        assert_eq!(attempt_rows.len(), 1);
+        for attempt_row in attempt_rows {
+            assert_eq!(attempt_row.task_id, *task_id);
+            assert_eq!(attempt_row.state, TaskState::InProgress);
+        }
+
+        // Simulate the task succeeding.
+        queue.mark_task_failed(&mut conn, task_id).await?;
+
+        let task_row = sqlx::query!(
+            r#"select state as "state: TaskState" from underway.task where id = $1"#,
+            task_id as TaskId
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(task_row.state, TaskState::Failed);
+
+        let attempt_rows = sqlx::query!(
+            r#"select task_id, state as "state: TaskState" from underway.task_attempt"#
+        )
+        .fetch_all(&pool)
+        .await?;
+
+        assert_eq!(attempt_rows.len(), 1);
+        for attempt_row in attempt_rows {
+            assert_eq!(attempt_row.task_id, *task_id);
+            assert_eq!(attempt_row.state, TaskState::Failed);
+        }
+
+        assert!(
+            queue.dequeue(&mut conn).await?.is_none(),
+            "The task failed so nothing else should be queued"
+        );
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn verify_attempt_rows_for_cancelled(pool: PgPool) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("verify_attempt_rows_for_cancelled")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let task_id = queue.enqueue(&pool, &TestTask, &json!("{}")).await?;
+
+        // Dequeue the task to ensure the attempt row is created.
+        let mut conn = pool.acquire().await?;
+        queue.dequeue(&mut conn).await?;
+
+        let attempt_rows = sqlx::query!(
+            r#"select task_id, state as "state: TaskState" from underway.task_attempt"#
+        )
+        .fetch_all(&pool)
+        .await?;
+
+        assert_eq!(attempt_rows.len(), 1);
+        for attempt_row in attempt_rows {
+            assert_eq!(attempt_row.task_id, *task_id);
+            assert_eq!(attempt_row.state, TaskState::InProgress);
+        }
+
+        // Simulate the task succeeding.
+        queue.mark_task_cancelled(&mut conn, task_id).await?;
+
+        let task_row = sqlx::query!(
+            r#"select state as "state: TaskState" from underway.task where id = $1"#,
+            task_id as TaskId
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(task_row.state, TaskState::Cancelled);
+
+        let attempt_rows = sqlx::query!(
+            r#"select task_id, state as "state: TaskState" from underway.task_attempt"#
+        )
+        .fetch_all(&pool)
+        .await?;
+
+        assert_eq!(attempt_rows.len(), 1);
+        for attempt_row in attempt_rows {
+            assert_eq!(attempt_row.task_id, *task_id);
+            assert_eq!(attempt_row.state, TaskState::Cancelled);
+        }
+
+        assert!(
+            queue.dequeue(&mut conn).await?.is_none(),
+            "The task is cancelled so nothing else should be queued"
+        );
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn verify_attempt_rows_for_reschedule(pool: PgPool) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("verify_attempt_rows_for_reschedule")
             .pool(pool.clone())
             .build()
             .await?;
