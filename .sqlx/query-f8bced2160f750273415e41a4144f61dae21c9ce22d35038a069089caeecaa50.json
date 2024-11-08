@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select task_id, state as \"state: TaskState\" from underway.task_attempt",
+  "query": "\n            select\n              task_id,\n              state as \"state: TaskState\",\n              completed_at as \"completed_at: i64\"\n            from underway.task_attempt\n            ",
   "describe": {
     "columns": [
       {
@@ -25,6 +25,11 @@
             }
           }
         }
+      },
+      {
+        "ordinal": 2,
+        "name": "completed_at: i64",
+        "type_info": "Timestamptz"
       }
     ],
     "parameters": {
@@ -32,8 +37,9 @@
     },
     "nullable": [
       false,
-      false
+      false,
+      true
     ]
   },
-  "hash": "ae23862a335632d6246431e10f8d50a820341d0fb021be3828d9fc4d0b91314f"
+  "hash": "f8bced2160f750273415e41a4144f61dae21c9ce22d35038a069089caeecaa50"
 }

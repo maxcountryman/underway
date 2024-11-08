@@ -958,7 +958,8 @@ impl<T: Task> Queue<T> {
             r#"
             update underway.task_attempt
             set state = $3,
-                updated_at = now()
+                updated_at = now(),
+                completed_at = now()
             where task_id = (
                 select task_id
                 from underway.task_attempt
@@ -982,7 +983,8 @@ impl<T: Task> Queue<T> {
             r#"
             update underway.task
             set state = $2,
-                updated_at = now()
+                updated_at = now(),
+                completed_at = now()
             where id = $1 and state < $3
             "#,
             task_id as TaskId,
@@ -1009,7 +1011,8 @@ impl<T: Task> Queue<T> {
             r#"
             update underway.task_attempt
             set state = $3,
-                updated_at = now()
+                updated_at = now(),
+                completed_at = now()
             where task_id = (
                 select task_id
                 from underway.task_attempt
@@ -1067,7 +1070,8 @@ impl<T: Task> Queue<T> {
             r#"
             update underway.task_attempt
             set state = $3,
-                updated_at = now()
+                updated_at = now(),
+                completed_at = now()
             where task_id = (
                 select task_id
                 from underway.task_attempt
@@ -1120,7 +1124,8 @@ impl<T: Task> Queue<T> {
             r#"
             update underway.task_attempt
             set state = $3,
-                updated_at = now()
+                updated_at = now(),
+                completed_at = now()
             where task_id = (
                 select task_id
                 from underway.task_attempt
@@ -1146,7 +1151,8 @@ impl<T: Task> Queue<T> {
             r#"
             update underway.task
             set state = $2,
-                updated_at = now()
+                updated_at = now(),
+                completed_at = now()
             where id = $1
             "#,
             task_id as TaskId,
@@ -2395,7 +2401,10 @@ mod tests {
         queue.dequeue(&mut conn).await?;
 
         let attempt_rows = sqlx::query!(
-            r#"select task_id, state as "state: TaskState" from underway.task_attempt"#
+            r#"
+            select task_id, state as "state: TaskState", completed_at as "completed_at: i64"
+            from underway.task_attempt
+            "#
         )
         .fetch_all(&pool)
         .await?;
@@ -2404,22 +2413,28 @@ mod tests {
         for attempt_row in attempt_rows {
             assert_eq!(attempt_row.task_id, *task_id);
             assert_eq!(attempt_row.state, TaskState::InProgress);
+            assert!(attempt_row.completed_at.is_none());
         }
 
         // Simulate the task succeeding.
         queue.mark_task_succeeded(&mut conn, task_id).await?;
 
         let task_row = sqlx::query!(
-            r#"select state as "state: TaskState" from underway.task where id = $1"#,
+            r#"select state as "state: TaskState", completed_at as "completed_at: i64"
+            from underway.task where id = $1"#,
             task_id as TaskId
         )
         .fetch_one(&pool)
         .await?;
 
         assert_eq!(task_row.state, TaskState::Succeeded);
+        assert!(task_row.completed_at.is_some());
 
         let attempt_rows = sqlx::query!(
-            r#"select task_id, state as "state: TaskState" from underway.task_attempt"#
+            r#"
+            select task_id, state as "state: TaskState", completed_at as "completed_at: i64"
+            from underway.task_attempt
+            "#
         )
         .fetch_all(&pool)
         .await?;
@@ -2428,6 +2443,7 @@ mod tests {
         for attempt_row in attempt_rows {
             assert_eq!(attempt_row.task_id, *task_id);
             assert_eq!(attempt_row.state, TaskState::Succeeded);
+            assert!(attempt_row.completed_at.is_some());
         }
 
         assert!(
@@ -2453,7 +2469,10 @@ mod tests {
         queue.dequeue(&mut conn).await?;
 
         let attempt_rows = sqlx::query!(
-            r#"select task_id, state as "state: TaskState" from underway.task_attempt"#
+            r#"
+            select task_id, state as "state: TaskState", completed_at as "completed_at: i64"
+            from underway.task_attempt
+            "#
         )
         .fetch_all(&pool)
         .await?;
@@ -2462,22 +2481,30 @@ mod tests {
         for attempt_row in attempt_rows {
             assert_eq!(attempt_row.task_id, *task_id);
             assert_eq!(attempt_row.state, TaskState::InProgress);
+            assert!(attempt_row.completed_at.is_none());
         }
 
         // Simulate the task succeeding.
         queue.mark_task_failed(&mut conn, task_id).await?;
 
         let task_row = sqlx::query!(
-            r#"select state as "state: TaskState" from underway.task where id = $1"#,
+            r#"
+            select state as "state: TaskState", completed_at as "completed_at: i64"
+            from underway.task where id = $1
+            "#,
             task_id as TaskId
         )
         .fetch_one(&pool)
         .await?;
 
         assert_eq!(task_row.state, TaskState::Failed);
+        assert!(task_row.completed_at.is_some());
 
         let attempt_rows = sqlx::query!(
-            r#"select task_id, state as "state: TaskState" from underway.task_attempt"#
+            r#"
+            select task_id, state as "state: TaskState", completed_at as "completed_at: i64"
+            from underway.task_attempt
+            "#
         )
         .fetch_all(&pool)
         .await?;
@@ -2486,6 +2513,7 @@ mod tests {
         for attempt_row in attempt_rows {
             assert_eq!(attempt_row.task_id, *task_id);
             assert_eq!(attempt_row.state, TaskState::Failed);
+            assert!(attempt_row.completed_at.is_some());
         }
 
         assert!(
@@ -2511,7 +2539,10 @@ mod tests {
         queue.dequeue(&mut conn).await?;
 
         let attempt_rows = sqlx::query!(
-            r#"select task_id, state as "state: TaskState" from underway.task_attempt"#
+            r#"
+            select task_id, state as "state: TaskState", completed_at as "completed_at: i64"
+            from underway.task_attempt
+            "#
         )
         .fetch_all(&pool)
         .await?;
@@ -2520,22 +2551,30 @@ mod tests {
         for attempt_row in attempt_rows {
             assert_eq!(attempt_row.task_id, *task_id);
             assert_eq!(attempt_row.state, TaskState::InProgress);
+            assert!(attempt_row.completed_at.is_none());
         }
 
         // Simulate the task succeeding.
         queue.mark_task_cancelled(&mut conn, task_id).await?;
 
         let task_row = sqlx::query!(
-            r#"select state as "state: TaskState" from underway.task where id = $1"#,
+            r#"
+            select state as "state: TaskState", completed_at as "completed_at: i64"
+            from underway.task where id = $1
+            "#,
             task_id as TaskId
         )
         .fetch_one(&pool)
         .await?;
 
         assert_eq!(task_row.state, TaskState::Cancelled);
+        assert!(task_row.completed_at.is_some());
 
         let attempt_rows = sqlx::query!(
-            r#"select task_id, state as "state: TaskState" from underway.task_attempt"#
+            r#"
+            select task_id, state as "state: TaskState", completed_at as "completed_at: i64"
+            from underway.task_attempt
+            "#
         )
         .fetch_all(&pool)
         .await?;
@@ -2544,6 +2583,7 @@ mod tests {
         for attempt_row in attempt_rows {
             assert_eq!(attempt_row.task_id, *task_id);
             assert_eq!(attempt_row.state, TaskState::Cancelled);
+            assert!(attempt_row.completed_at.is_some());
         }
 
         assert!(
@@ -2568,13 +2608,23 @@ mod tests {
         let mut conn = pool.acquire().await?;
         queue.dequeue(&mut conn).await?;
 
-        let attempt_rows = sqlx::query!("select task_id from underway.task_attempt")
-            .fetch_all(&pool)
-            .await?;
+        let attempt_rows = sqlx::query!(
+            r#"
+            select
+              task_id,
+              state as "state: TaskState",
+              completed_at as "completed_at: i64"
+            from underway.task_attempt
+            "#
+        )
+        .fetch_all(&pool)
+        .await?;
 
         assert_eq!(attempt_rows.len(), 1);
         for attempt_row in attempt_rows {
             assert_eq!(attempt_row.task_id, *task_id);
+            assert_eq!(attempt_row.state, TaskState::InProgress);
+            assert!(attempt_row.completed_at.is_none());
         }
 
         // Simulate the task being rescheduled.
@@ -2586,9 +2636,11 @@ mod tests {
 
         let attempt_rows = sqlx::query!(
             r#"
-            select task_id, state as "state: TaskState"
+            select 
+              task_id, state as "state: TaskState",
+              completed_at as "completed_at: i64"
             from underway.task_attempt
-            order by created_at
+            order by started_at
             "#
         )
         .fetch_all(&pool)
@@ -2598,12 +2650,18 @@ mod tests {
 
         for (i, attempt_row) in attempt_rows.into_iter().enumerate() {
             assert_eq!(attempt_row.task_id, *task_id);
-            let expected_state = match i {
-                0 => TaskState::Failed,
-                1 => TaskState::InProgress,
+
+            match i {
+                0 => {
+                    assert!(attempt_row.completed_at.is_some());
+                    assert_eq!(attempt_row.state, TaskState::Failed);
+                }
+                1 => {
+                    assert!(attempt_row.completed_at.is_none());
+                    assert_eq!(attempt_row.state, TaskState::InProgress);
+                }
                 _ => panic!("Unexpected attempt row index"),
             };
-            assert_eq!(attempt_row.state, expected_state);
         }
 
         Ok(())

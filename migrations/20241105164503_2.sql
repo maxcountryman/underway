@@ -41,8 +41,9 @@ create table underway.task_attempt (
     -- Error metatdata.
     error_message   text,
 
-    created_at      timestamp with time zone not null default now(),
+    started_at      timestamp with time zone not null default now(),
     updated_at      timestamp with time zone not null default now(),
+    completed_at    timestamp with time zone,
 
     primary key (task_id, task_queue_name, attempt_number),
     foreign key (task_id, task_queue_name) references underway.task(id, task_queue_name) on delete cascade
