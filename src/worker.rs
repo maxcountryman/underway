@@ -739,6 +739,7 @@ impl<T: Task + Sync> Worker<T> {
                     }
 
                     Err(ref error) => {
+                        dbg!("error case");
                         let retry_policy = &in_progress_task.retry_policy;
                         self.handle_task_error(&mut tx, &in_progress_task, retry_policy, error)
                             .await?;

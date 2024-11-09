@@ -4,6 +4,7 @@ set local search_path to underway;
 -- Remove attempt-specific columns from `task`
 alter table underway.task
 drop column if exists retry_count,
+drop column if exists max_attempts,
 drop column if exists initial_interval_ms,
 drop column if exists max_interval_ms,
 drop column if exists backoff_coefficient,
