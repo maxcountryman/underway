@@ -76,11 +76,16 @@
 //! # });
 //! # }
 //! ```
-use std::{fmt, fmt::Display, future::Future, ops::Deref, result::Result as StdResult};
+use std::{
+    fmt::{self, Display},
+    future::Future,
+    ops::Deref,
+    result::Result as StdResult,
+};
 
-use jiff::{Span, ToSpan};
+use jiff::{SignedDuration, Span, ToSpan};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use sqlx::{postgres::types::PgInterval, Postgres, Transaction};
+use sqlx::{Postgres, Transaction};
 use ulid::Ulid;
 use uuid::Uuid;
 
@@ -123,10 +128,15 @@ pub type Result<T> = StdResult<T, Error>;
 
 /// Task errors.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// Error returned by the `sqlx` crate during database operations.
     #[error(transparent)]
     Database(#[from] sqlx::Error),
+
+    /// Indicates the task timed out during execution.
+    #[error("Task timed out after {0} during execution")]
+    TimedOut(SignedDuration),
 
     /// Error indicating that the task has encountered an unrecoverable error
     /// state.
@@ -506,37 +516,6 @@ pub trait Task: Send + 'static {
     fn priority(&self) -> i32 {
         0
     }
-}
-
-/// Dequeued task.
-#[derive(Debug)]
-pub struct DequeuedTask {
-    /// Task ID.
-    pub id: TaskId,
-
-    /// Input as a `serde_json::Value`.
-    pub input: serde_json::Value,
-
-    /// Timeout.
-    pub timeout: PgInterval,
-
-    /// Total times retried.
-    pub retry_count: i32,
-
-    /// Maximum retry attempts.
-    pub max_attempts: i32,
-
-    /// Initial interval in milliseconds.
-    pub initial_interval_ms: i32,
-
-    /// Maximum interval in milliseconds.
-    pub max_interval_ms: i32,
-
-    /// Backoff coefficient.
-    pub backoff_coefficient: f32,
-
-    /// Concurrency key.
-    pub concurrency_key: Option<String>,
 }
 
 /// Represents the possible states a task can be in.

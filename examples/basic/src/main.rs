@@ -42,15 +42,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     // Enqueue a job task.
-    let task_id = job
-        .enqueue(&WelcomeEmail {
-            user_id: 42,
-            email: "ferris@example.com".to_string(),
-            name: "Ferris".to_string(),
-        })
-        .await?;
-
-    println!("Enqueued task with ID: {task_id}");
+    job.enqueue(&WelcomeEmail {
+        user_id: 42,
+        email: "ferris@example.com".to_string(),
+        name: "Ferris".to_string(),
+    })
+    .await?;
 
     // Start the worker to process tasks.
     job.run().await?;

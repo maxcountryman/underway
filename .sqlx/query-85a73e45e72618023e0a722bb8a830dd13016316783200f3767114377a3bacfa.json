@@ -1,18 +1,17 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            select id as \"id: TaskId\"\n            from underway.task\n            where input->>'job_id' = $1 and\n                  state = $2\n            ",
+  "query": "\n            select id, state as \"state: TaskState\"\n            from underway.task\n            where id = $1\n            ",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "id: TaskId",
+        "name": "id",
         "type_info": "Uuid"
-      }
-    ],
-    "parameters": {
-      "Left": [
-        "Text",
-        {
+      },
+      {
+        "ordinal": 1,
+        "name": "state: TaskState",
+        "type_info": {
           "Custom": {
             "name": "underway.task_state",
             "kind": {
@@ -26,11 +25,17 @@
             }
           }
         }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
       ]
     },
     "nullable": [
+      false,
       false
     ]
   },
-  "hash": "e6a0949430cf67fb2452bf41533d402338b3afbbef23785c8460ecc2c00cd5a3"
+  "hash": "85a73e45e72618023e0a722bb8a830dd13016316783200f3767114377a3bacfa"
 }

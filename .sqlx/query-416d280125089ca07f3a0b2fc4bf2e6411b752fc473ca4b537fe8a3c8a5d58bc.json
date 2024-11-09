@@ -1,0 +1,104 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            update underway.task\n            set state = $3\n            where id = (\n                select id\n                from underway.task\n                where task_queue_name = $1\n                  and state = $2\n                  and created_at + delay <= now()\n                order by priority desc, created_at, id\n                limit 1\n                for update skip locked\n            )\n            returning\n                id as \"id: TaskId\",\n                task_queue_name as \"queue_name\",\n                input,\n                timeout,\n                retry_policy as \"retry_policy: RetryPolicy\",\n                concurrency_key\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: TaskId",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "queue_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "input",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 3,
+        "name": "timeout",
+        "type_info": "Interval"
+      },
+      {
+        "ordinal": 4,
+        "name": "retry_policy: RetryPolicy",
+        "type_info": {
+          "Custom": {
+            "name": "underway.task_retry_policy",
+            "kind": {
+              "Composite": [
+                [
+                  "max_attempts",
+                  "Int4"
+                ],
+                [
+                  "initial_interval_ms",
+                  "Int4"
+                ],
+                [
+                  "max_interval_ms",
+                  "Int4"
+                ],
+                [
+                  "backoff_coefficient",
+                  "Float8"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "concurrency_key",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        {
+          "Custom": {
+            "name": "underway.task_state",
+            "kind": {
+              "Enum": [
+                "pending",
+                "in_progress",
+                "succeeded",
+                "cancelled",
+                "failed"
+              ]
+            }
+          }
+        },
+        {
+          "Custom": {
+            "name": "underway.task_state",
+            "kind": {
+              "Enum": [
+                "pending",
+                "in_progress",
+                "succeeded",
+                "cancelled",
+                "failed"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "416d280125089ca07f3a0b2fc4bf2e6411b752fc473ca4b537fe8a3c8a5d58bc"
+}

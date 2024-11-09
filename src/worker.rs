@@ -117,7 +117,7 @@
 //! For cases where it's unimportant to wait for tasks to complete, this routine
 //! can be ignored.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use jiff::{Span, ToSpan};
 use serde::Deserialize;
@@ -130,8 +130,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
 use crate::{
-    queue::{acquire_advisory_xact_lock, Error as QueueError, Queue, SHUTDOWN_CHANNEL},
-    task::{DequeuedTask, Error as TaskError, RetryCount, RetryPolicy, Task, TaskId},
+    queue::{
+        acquire_advisory_xact_lock, Error as QueueError, InProgressTask, Queue, SHUTDOWN_CHANNEL,
+    },
+    task::{Error as TaskError, RetryCount, RetryPolicy, Task, TaskId},
 };
 pub(crate) type Result<T = ()> = std::result::Result<T, Error>;
 
@@ -709,22 +711,22 @@ impl<T: Task + Sync> Worker<T> {
     pub async fn process_next_task(&self) -> Result<Option<TaskId>> {
         let mut tx = self.queue.pool.begin().await?;
 
-        let Some(pending_task) = self.queue.dequeue(&mut tx).await? else {
+        let Some(in_progress_task) = self.queue.dequeue(&mut tx).await? else {
             return Ok(None);
         };
 
-        let task_id = pending_task.id;
+        let task_id = in_progress_task.id;
         tracing::Span::current().record("task.id", task_id.as_hyphenated().to_string());
 
         // Ensure that only one worker may process a task of a given concurrency key at
         // a time.
-        if let Some(concurrency_key) = &pending_task.concurrency_key {
+        if let Some(concurrency_key) = &in_progress_task.concurrency_key {
             acquire_advisory_xact_lock(&mut *tx, concurrency_key).await?;
         }
 
-        let input: T::Input = serde_json::from_value(pending_task.input.clone())?;
+        let input: T::Input = serde_json::from_value(in_progress_task.input.clone())?;
 
-        let timeout = pg_interval_to_span(&pending_task.timeout)
+        let timeout = pg_interval_to_span(&in_progress_task.timeout)
             .try_into()
             .expect("Task timeout should be compatible with std::time");
 
@@ -733,11 +735,12 @@ impl<T: Task + Sync> Worker<T> {
             result = self.task.execute(execute_tx, input) => {
                 match result {
                     Ok(_) => {
-                        self.queue.mark_task_succeeded(&mut *tx, task_id).await?;
+                        in_progress_task.mark_succeeded(&mut tx).await?;
                     }
 
-                    Err(err) => {
-                        self.handle_task_error(&mut tx, task_id, pending_task, err)
+                    Err(ref error) => {
+                        let retry_policy = &in_progress_task.retry_policy;
+                        self.handle_task_error(&mut tx, &in_progress_task, retry_policy, error)
                             .await?;
                     }
                 }
@@ -745,7 +748,8 @@ impl<T: Task + Sync> Worker<T> {
 
             _ = tokio::time::sleep(timeout) => {
                 tracing::error!("Task execution timed out");
-                self.handle_task_timeout(&mut tx, task_id, pending_task).await?;
+                let retry_policy = &in_progress_task.retry_policy;
+                self.handle_task_timeout(&mut tx, &in_progress_task, retry_policy, timeout).await?;
             }
         }
 
@@ -757,54 +761,49 @@ impl<T: Task + Sync> Worker<T> {
     async fn handle_task_error(
         &self,
         conn: &mut PgConnection,
-        task_id: TaskId,
-        dequeued_task: DequeuedTask,
-        err: TaskError,
+        in_progress_task: &InProgressTask,
+        retry_policy: &RetryPolicy,
+        error: &TaskError,
     ) -> Result {
-        tracing::error!(err = %err, "Task execution encountered an error");
+        tracing::error!(err = %error, "Task execution encountered an error");
 
         // Short-circuit on fatal errors.
-        if matches!(err, TaskError::Fatal(_)) {
-            return self.finalize_task_failure(conn, task_id).await;
+        if matches!(error, TaskError::Fatal(_)) {
+            return self.finalize_task_failure(conn, in_progress_task).await;
         }
 
-        let retry_count = dequeued_task.retry_count + 1;
-        let retry_policy: RetryPolicy = dequeued_task.into();
+        in_progress_task.record_failure(conn, error).await?;
 
-        self.queue
-            .update_task_failure(&mut *conn, task_id, retry_count, &err.to_string())
-            .await?;
-
+        let retry_count = in_progress_task.retry_count(&mut *conn).await?;
         if retry_count < retry_policy.max_attempts {
-            self.schedule_task_retry(conn, task_id, retry_count, &retry_policy)
+            self.schedule_task_retry(conn, in_progress_task, retry_count, retry_policy)
                 .await?;
         } else {
-            self.finalize_task_failure(conn, task_id).await?;
+            self.finalize_task_failure(conn, in_progress_task).await?;
         }
 
         Ok(())
     }
 
-    async fn handle_task_timeout<'a>(
+    async fn handle_task_timeout(
         &self,
         conn: &mut PgConnection,
-        task_id: TaskId,
-        dequeued_task: DequeuedTask,
+        in_progress_task: &InProgressTask,
+        retry_policy: &RetryPolicy,
+        timeout: Duration,
     ) -> Result {
         tracing::error!("Task execution timed out");
 
-        let retry_count = dequeued_task.retry_count + 1;
-        let retry_policy: RetryPolicy = dequeued_task.into();
+        let error = &TaskError::TimedOut(timeout.try_into()?);
+        in_progress_task.record_failure(&mut *conn, error).await?;
 
-        self.queue
-            .update_task_failure(&mut *conn, task_id, retry_count, "Task timed out")
-            .await?;
-
+        // Poll count after updating task failure.
+        let retry_count = in_progress_task.retry_count(&mut *conn).await?;
         if retry_count < retry_policy.max_attempts {
-            self.schedule_task_retry(conn, task_id, retry_count, &retry_policy)
+            self.schedule_task_retry(conn, in_progress_task, retry_count, retry_policy)
                 .await?;
         } else {
-            self.finalize_task_failure(conn, task_id).await?;
+            self.finalize_task_failure(conn, in_progress_task).await?;
         }
 
         Ok(())
@@ -813,29 +812,30 @@ impl<T: Task + Sync> Worker<T> {
     async fn schedule_task_retry(
         &self,
         conn: &mut PgConnection,
-        task_id: TaskId,
+        in_progress_task: &InProgressTask,
         retry_count: RetryCount,
         retry_policy: &RetryPolicy,
     ) -> Result {
         tracing::info!("Retry policy available, scheduling retry");
 
         let delay = retry_policy.calculate_delay(retry_count);
-
-        self.queue
-            .reschedule_task_for_retry(&mut *conn, task_id, retry_count, delay)
-            .await?;
+        in_progress_task.retry_after(&mut *conn, delay).await?;
 
         Ok(())
     }
 
-    async fn finalize_task_failure(&self, conn: &mut PgConnection, task_id: TaskId) -> Result {
+    async fn finalize_task_failure(
+        &self,
+        conn: &mut PgConnection,
+        in_progress_task: &InProgressTask,
+    ) -> Result {
         tracing::info!("Retry policy exhausted, handling failed task");
 
-        self.queue.mark_task_failed(&mut *conn, task_id).await?;
+        in_progress_task.mark_failed(&mut *conn).await?;
 
         if let Some(dlq_name) = &self.queue.dlq_name {
             self.queue
-                .move_task_to_dlq(&mut *conn, task_id, dlq_name)
+                .move_task_to_dlq(&mut *conn, in_progress_task.id, dlq_name)
                 .await?;
         }
 
@@ -925,14 +925,15 @@ mod tests {
         // Enqueue a task.
         let task = TestTask;
         queue.enqueue(&pool, &task, &()).await?;
-        assert!(queue.dequeue(&pool).await?.is_some());
+        let mut conn = pool.acquire().await?;
+        assert!(queue.dequeue(&mut conn).await?.is_some());
 
         // Process the task.
         let worker = Worker::new(queue.clone(), task);
         worker.process_next_task().await?;
 
         // Ensure the task is no longer available on the queue.
-        assert!(queue.dequeue(&pool).await?.is_none());
+        assert!(queue.dequeue(&mut conn).await?.is_none());
 
         Ok(())
     }

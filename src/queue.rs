@@ -106,7 +106,8 @@
 //! // Enqueue the task.
 //! queue.enqueue(&pool, &task, &()).await?;
 //!
-//! if let Some(task) = queue.dequeue(&pool).await? {
+//! let mut tx = pool.begin().await?;
+//! if let Some(task) = queue.dequeue(&mut *tx).await? {
 //!     // Process the task here
 //! }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
@@ -225,12 +226,12 @@ use builder_states::{Initial, NameSet, PoolSet};
 use jiff::{Span, ToSpan};
 use sqlx::{
     postgres::{PgAdvisoryLock, PgAdvisoryLockGuard},
-    Acquire, PgConnection, PgExecutor, PgPool, Postgres,
+    PgConnection, PgExecutor, PgPool,
 };
 use tracing::instrument;
 
 use crate::{
-    task::{DequeuedTask, State as TaskState, Task, TaskId},
+    task::{Error as TaskError, RetryPolicy, State as TaskState, Task, TaskId},
     ZonedSchedule,
 };
 
@@ -528,13 +529,10 @@ impl<T: Task> Queue<T> {
               timeout,
               ttl,
               delay,
-              max_attempts,
-              initial_interval_ms,
-              max_interval_ms,
-              backoff_coefficient,
+              retry_policy,
               concurrency_key,
               priority
-            ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             "#,
             id as _,
             self.name,
@@ -542,11 +540,8 @@ impl<T: Task> Queue<T> {
             StdDuration::try_from(timeout)? as _,
             StdDuration::try_from(ttl)? as _,
             StdDuration::try_from(delay)? as _,
-            retry_policy.max_attempts,
-            retry_policy.initial_interval_ms,
-            retry_policy.max_interval_ms,
-            retry_policy.backoff_coefficient,
-            concurrency_key as _,
+            retry_policy as RetryPolicy,
+            concurrency_key,
             priority
         )
         .execute(executor)
@@ -627,8 +622,9 @@ impl<T: Task> Queue<T> {
     /// queue.enqueue(&pool, &task, &()).await?;
     ///
     /// // Dequeue the enqueued task.
+    /// let mut tx = pool.begin().await?;
     /// let pending_task = queue
-    ///     .dequeue(&pool)
+    ///     .dequeue(&mut *tx)
     ///     .await?
     ///     .expect("There should be a pending task.");
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -640,49 +636,72 @@ impl<T: Task> Queue<T> {
         fields(queue.name = self.name, task.id = tracing::field::Empty),
         err
     )]
-    pub async fn dequeue<'a, A>(&self, conn: A) -> Result<Option<DequeuedTask>>
-    where
-        A: Acquire<'a, Database = Postgres>,
-    {
-        let mut tx = conn.begin().await?;
-
-        let task_row = sqlx::query_as!(
-            DequeuedTask,
+    pub async fn dequeue(&self, conn: &mut PgConnection) -> Result<Option<InProgressTask>> {
+        let in_progress_task = sqlx::query_as!(
+            InProgressTask,
             r#"
-            select
-              id as "id: TaskId",
-              input,
-              timeout,
-              retry_count,
-              max_attempts,
-              initial_interval_ms,
-              max_interval_ms,
-              backoff_coefficient,
-              concurrency_key
-            from underway.task
-            where task_queue_name = $1
-              and state = $2
-              and created_at + delay <= now()
-            order by priority desc, created_at, id
-            limit 1
-            for update skip locked
+            update underway.task
+            set state = $3
+            where id = (
+                select id
+                from underway.task
+                where task_queue_name = $1
+                  and state = $2
+                  and created_at + delay <= now()
+                order by priority desc, created_at, id
+                limit 1
+                for update skip locked
+            )
+            returning
+                id as "id: TaskId",
+                task_queue_name as "queue_name",
+                input,
+                timeout,
+                retry_policy as "retry_policy: RetryPolicy",
+                concurrency_key
             "#,
             self.name,
-            TaskState::Pending as _,
+            TaskState::Pending as TaskState,
+            TaskState::InProgress as TaskState
         )
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut *conn)
         .await?;
 
-        if let Some(task_row) = &task_row {
-            let task_id = task_row.id;
+        if let Some(in_progress_task) = &in_progress_task {
+            let task_id = in_progress_task.id;
             tracing::Span::current().record("task.id", task_id.as_hyphenated().to_string());
 
-            self.mark_task_in_progress(&mut *tx, task_row.id).await?;
+            // Insert a new task attempt row
+            sqlx::query!(
+                r#"
+                with next_attempt as (
+                    select coalesce(max(attempt_number) + 1, 1) as attempt_number
+                    from underway.task_attempt
+                    where task_id = $1
+                      and task_queue_name = $2
+                )
+                insert into underway.task_attempt (
+                    task_id,
+                    task_queue_name,
+                    state,
+                    attempt_number
+                ) 
+                values (
+                    $1, 
+                    $2, 
+                    $3,
+                    (select attempt_number from next_attempt)
+                )
+                "#,
+                task_id as TaskId,
+                self.name,
+                TaskState::InProgress as TaskState
+            )
+            .execute(&mut *conn)
+            .await?;
         }
 
-        tx.commit().await?;
-
-        Ok(task_row)
+        Ok(in_progress_task)
     }
 
     /// Creates a schedule for the queue.
@@ -905,181 +924,6 @@ impl<T: Task> Queue<T> {
         Ok(())
     }
 
-    async fn mark_task_in_progress<'a, E>(&self, executor: E, task_id: TaskId) -> Result
-    where
-        E: PgExecutor<'a>,
-    {
-        let result = sqlx::query!(
-            r#"
-            update underway.task
-            set state = $2,
-                started_at = now(),
-                updated_at = now()
-            where id = $1
-            "#,
-            task_id as _,
-            TaskState::InProgress as _
-        )
-        .execute(executor)
-        .await?;
-
-        if result.rows_affected() == 0 {
-            return Err(Error::TaskNotFound(task_id));
-        }
-
-        Ok(())
-    }
-
-    pub(crate) async fn mark_task_cancelled<'a, E>(
-        &self,
-        executor: E,
-        task_id: TaskId,
-    ) -> Result<bool>
-    where
-        E: PgExecutor<'a>,
-    {
-        let result = sqlx::query!(
-            r#"
-            update underway.task
-            set state = $2,
-                updated_at = now()
-            where id = $1 and state < $3
-            "#,
-            task_id as _,
-            TaskState::Cancelled as _,
-            TaskState::Succeeded as _
-        )
-        .execute(executor)
-        .await?;
-
-        if result.rows_affected() == 0 {
-            return Err(Error::TaskNotFound(task_id));
-        }
-
-        Ok(result.rows_affected() > 0)
-    }
-
-    pub(crate) async fn mark_task_succeeded<'a, E>(&self, executor: E, task_id: TaskId) -> Result
-    where
-        E: PgExecutor<'a>,
-    {
-        let result = sqlx::query!(
-            r#"
-            update underway.task
-            set state = $2,
-                succeeded_at = now(),
-                updated_at = now()
-            where id = $1
-            "#,
-            task_id as _,
-            TaskState::Succeeded as _
-        )
-        .execute(executor)
-        .await?;
-
-        if result.rows_affected() == 0 {
-            return Err(Error::TaskNotFound(task_id));
-        }
-
-        Ok(())
-    }
-
-    #[instrument(
-        skip(self, executor, task_id),
-        fields(queue.name = self.name, task.id = %task_id.as_hyphenated()),
-        err
-    )]
-    pub(crate) async fn reschedule_task_for_retry<'a, E>(
-        &self,
-        executor: E,
-        task_id: TaskId,
-        retry_count: i32,
-        delay: Span,
-    ) -> Result
-    where
-        E: PgExecutor<'a>,
-    {
-        let result = sqlx::query!(
-            r#"
-            update underway.task
-            set state = $4,
-                retry_count = $1,
-                delay = $2,
-                updated_at = now()
-            where id = $3
-            "#,
-            retry_count,
-            std::time::Duration::try_from(delay)? as _,
-            task_id as _,
-            TaskState::Pending as _
-        )
-        .execute(executor)
-        .await?;
-
-        if result.rows_affected() == 0 {
-            return Err(Error::TaskNotFound(task_id));
-        }
-
-        Ok(())
-    }
-
-    pub(crate) async fn mark_task_failed<'a, E>(&self, executor: E, task_id: TaskId) -> Result
-    where
-        E: PgExecutor<'a>,
-    {
-        let result = sqlx::query!(
-            r#"
-            update underway.task
-            set state = $2,
-                updated_at = now()
-            where id = $1
-            "#,
-            task_id as _,
-            TaskState::Failed as _
-        )
-        .execute(executor)
-        .await?;
-
-        if result.rows_affected() == 0 {
-            return Err(Error::TaskNotFound(task_id));
-        }
-
-        Ok(())
-    }
-
-    pub(crate) async fn update_task_failure<'a, E>(
-        &self,
-        executor: E,
-        task_id: TaskId,
-        retry_count: i32,
-        error_message: &str,
-    ) -> Result
-    where
-        E: PgExecutor<'a>,
-    {
-        let result = sqlx::query!(
-            r#"
-            update underway.task
-            set retry_count = $2,
-                error_message = $3,
-                last_failed_at = now(),
-                updated_at = now()
-            where id = $1
-            "#,
-            task_id as _,
-            retry_count,
-            error_message,
-        )
-        .execute(executor)
-        .await?;
-
-        if result.rows_affected() == 0 {
-            return Err(Error::TaskNotFound(task_id));
-        }
-
-        Ok(())
-    }
-
     pub(crate) async fn move_task_to_dlq<'a, E>(
         &self,
         executor: E,
@@ -1095,7 +939,7 @@ impl<T: Task> Queue<T> {
             set task_queue_name = $2
             where id = $1
             "#,
-            task_id as _,
+            task_id as TaskId,
             dlq_name
         )
         .execute(executor)
@@ -1106,6 +950,305 @@ impl<T: Task> Queue<T> {
         }
 
         Ok(())
+    }
+}
+
+/// Represents an in-progress task that's been dequeued.
+///
+/// Importantly, Postgres manages a lock over the row this task belongs to. This
+/// means that so long as database operations over this are performed in the
+/// same transaction they are atomic.
+///
+/// Typically this will not be used directly. Instead workers use this type to
+/// manage state transitions as they process the task. In fact, all valid state
+/// transitions are encapsulated by it and this is the only interface through
+/// which task state should be altered.
+#[derive(Debug, sqlx::FromRow)]
+pub struct InProgressTask {
+    pub(crate) id: TaskId,
+    pub(crate) queue_name: String,
+    pub(crate) input: serde_json::Value,
+    pub(crate) timeout: sqlx::postgres::types::PgInterval,
+    pub(crate) retry_policy: RetryPolicy,
+    pub(crate) concurrency_key: Option<String>,
+}
+
+impl InProgressTask {
+    pub(crate) async fn mark_succeeded(&self, conn: &mut PgConnection) -> Result {
+        // Update the task attempt row.
+        let result = sqlx::query!(
+            r#"
+            update underway.task_attempt
+            set state = $3,
+                updated_at = now(),
+                completed_at = now()
+            where task_id = (
+                select task_id
+                from underway.task_attempt
+                where task_id = $1 and
+                      task_queue_name = $2
+                order by attempt_number desc
+                limit 1
+            ) 
+            "#,
+            self.id as TaskId,
+            self.queue_name,
+            TaskState::Succeeded as TaskState
+        )
+        .execute(&mut *conn)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(Error::TaskNotFound(self.id));
+        }
+
+        // Update the task row.
+        let result = sqlx::query!(
+            r#"
+            update underway.task
+            set state = $2,
+                updated_at = now(),
+                completed_at = now()
+            where id = $1
+            "#,
+            self.id as TaskId,
+            TaskState::Succeeded as TaskState
+        )
+        .execute(&mut *conn)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(Error::TaskNotFound(self.id));
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn mark_cancelled(&self, conn: &mut PgConnection) -> Result<bool> {
+        // Update task attempt row if one exists.
+        //
+        // N.B.: A task may be cancelled before an attempt row has been created.
+        sqlx::query!(
+            r#"
+            update underway.task_attempt
+            set state = $3,
+                updated_at = now(),
+                completed_at = now()
+            where task_id = (
+                select task_id
+                from underway.task_attempt
+                where task_id = $1
+                  and task_queue_name = $2 
+                  and state < $4
+                order by attempt_number desc
+                limit 1
+            )
+            "#,
+            self.id as TaskId,
+            self.queue_name,
+            TaskState::Cancelled as TaskState,
+            TaskState::Succeeded as TaskState
+        )
+        .execute(&mut *conn)
+        .await?;
+
+        // Update task row.
+        let result = sqlx::query!(
+            r#"
+            update underway.task
+            set state = $2,
+                updated_at = now(),
+                completed_at = now()
+            where id = $1 and state < $3
+            "#,
+            self.id as TaskId,
+            TaskState::Cancelled as TaskState,
+            TaskState::Succeeded as TaskState
+        )
+        .execute(&mut *conn)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(Error::TaskNotFound(self.id));
+        }
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    #[instrument(
+        skip(self, conn),
+        fields(queue.name = self.queue_name, task.id = %self.id.as_hyphenated()),
+        err
+    )]
+    pub(crate) async fn retry_after(&self, conn: &mut PgConnection, delay: Span) -> Result {
+        let result = sqlx::query!(
+            r#"
+            update underway.task_attempt
+            set state = $3,
+                updated_at = now(),
+                completed_at = now()
+            where task_id = (
+                select task_id
+                from underway.task_attempt
+                where task_id = $1 
+                  and task_queue_name = $2
+                order by attempt_number desc
+                limit 1
+            ) 
+            "#,
+            self.id as TaskId,
+            self.queue_name,
+            TaskState::Failed as TaskState
+        )
+        .execute(&mut *conn)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(Error::TaskNotFound(self.id));
+        }
+
+        let result = sqlx::query!(
+            r#"
+            update underway.task
+            set state = $3,
+                delay = $2,
+                updated_at = now()
+            where id = $1
+            "#,
+            self.id as TaskId,
+            StdDuration::try_from(delay)? as _,
+            TaskState::Pending as TaskState
+        )
+        .execute(&mut *conn)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(Error::TaskNotFound(self.id));
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn record_failure(
+        &self,
+        conn: &mut PgConnection,
+        error: &TaskError,
+    ) -> Result {
+        let result = sqlx::query!(
+            r#"
+            update underway.task_attempt
+            set state = $3,
+                updated_at = now(),
+                error_message = $4
+            where task_id = (
+                select task_id
+                from underway.task_attempt
+                where task_id = $1
+                  and task_queue_name = $2
+                order by attempt_number desc
+                limit 1
+            ) 
+            "#,
+            self.id as TaskId,
+            self.queue_name,
+            TaskState::Failed as TaskState,
+            error.to_string(),
+        )
+        .execute(&mut *conn)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(Error::TaskNotFound(self.id));
+        }
+
+        let result = sqlx::query!(
+            r#"
+            update underway.task
+            set updated_at = now()
+            where id = $1 
+              and task_queue_name = $2 
+            "#,
+            self.id as TaskId,
+            self.queue_name,
+        )
+        .execute(&mut *conn)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(Error::TaskNotFound(self.id));
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn mark_failed(&self, conn: &mut PgConnection) -> Result {
+        // Update the task attempt row.
+        let result = sqlx::query!(
+            r#"
+            update underway.task_attempt
+            set state = $3,
+                updated_at = now(),
+                completed_at = now()
+            where task_id = (
+                select task_id
+                from underway.task_attempt
+                where task_id = $1 
+                  and task_queue_name = $2
+                order by attempt_number desc
+                limit 1
+            ) 
+            "#,
+            self.id as TaskId,
+            self.queue_name,
+            TaskState::Failed as TaskState
+        )
+        .execute(&mut *conn)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(Error::TaskNotFound(self.id));
+        }
+
+        // Update the task row.
+        let result = sqlx::query!(
+            r#"
+            update underway.task
+            set state = $2,
+                updated_at = now(),
+                completed_at = now()
+            where id = $1
+            "#,
+            self.id as TaskId,
+            TaskState::Failed as TaskState
+        )
+        .execute(&mut *conn)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(Error::TaskNotFound(self.id));
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn retry_count<'a, E>(&self, executor: E) -> Result<i32>
+    where
+        E: PgExecutor<'a>,
+    {
+        Ok(sqlx::query_scalar!(
+            r#"
+            select count(*)::int as "count!"
+            from underway.task_attempt
+            where task_id = $1
+              and task_queue_name = $2
+              and state = $3
+            "#,
+            self.id as TaskId,
+            self.queue_name,
+            TaskState::Failed as TaskState
+        )
+        .fetch_one(executor)
+        .await?)
     }
 }
 
@@ -1448,7 +1591,8 @@ where
 mod tests {
     use std::collections::HashSet;
 
-    use sqlx::Transaction;
+    use serde_json::json;
+    use sqlx::{Postgres, Transaction};
 
     use super::*;
     use crate::{task::Result as TaskResult, worker::pg_interval_to_span};
@@ -1511,9 +1655,9 @@ mod tests {
         let task_id = queue.enqueue(&pool, &task, &input).await?;
 
         // Query the database to verify the task was enqueued
-        let dequeued_task = sqlx::query!(
+        let in_progress_task = sqlx::query!(
             r#"
-            select id, input, retry_count, max_attempts, initial_interval_ms, max_interval_ms, backoff_coefficient, concurrency_key, priority
+            select id, input, retry_policy as "retry_policy: RetryPolicy", concurrency_key, priority
             from underway.task
             where id = $1
             "#,
@@ -1522,30 +1666,30 @@ mod tests {
         .fetch_one(&pool)
         .await?;
 
-        assert_eq!(dequeued_task.id, *task_id);
-        assert_eq!(dequeued_task.input, input);
-        assert_eq!(dequeued_task.retry_count, 0);
+        assert_eq!(in_progress_task.id, *task_id);
+        assert_eq!(in_progress_task.input, input);
 
         let expected_retry_policy = task.retry_policy();
+        let retry_policy = in_progress_task.retry_policy;
         assert_eq!(
-            dequeued_task.max_attempts,
+            retry_policy.max_attempts,
             expected_retry_policy.max_attempts
         );
         assert_eq!(
-            dequeued_task.initial_interval_ms,
+            retry_policy.initial_interval_ms,
             expected_retry_policy.initial_interval_ms
         );
         assert_eq!(
-            dequeued_task.max_interval_ms,
+            retry_policy.max_interval_ms,
             expected_retry_policy.max_interval_ms
         );
         assert_eq!(
-            dequeued_task.backoff_coefficient,
+            retry_policy.backoff_coefficient,
             expected_retry_policy.backoff_coefficient
         );
 
-        assert_eq!(dequeued_task.concurrency_key, task.concurrency_key());
-        assert_eq!(dequeued_task.priority, task.priority());
+        assert_eq!(in_progress_task.concurrency_key, task.concurrency_key());
+        assert_eq!(in_progress_task.priority, task.priority());
 
         Ok(())
     }
@@ -1599,33 +1743,35 @@ mod tests {
         let task_id = queue.enqueue(&pool, &task, &input).await?;
 
         // Dequeue the task
-        let dequeued_task = queue.dequeue(&pool).await?;
+        let mut conn = pool.acquire().await?;
+        let in_progress_task = queue
+            .dequeue(&mut conn)
+            .await?
+            .expect("There should be a task to dequeue");
 
-        assert!(dequeued_task.is_some(), "We should have a task enqueued");
+        assert_eq!(in_progress_task.id, task_id);
+        assert_eq!(in_progress_task.input, input);
+        assert_eq!(in_progress_task.retry_count(&pool).await?, 0);
 
-        let dequeued_task = dequeued_task.unwrap();
-        assert_eq!(dequeued_task.id, task_id);
-        assert_eq!(dequeued_task.input, input);
-        assert_eq!(dequeued_task.retry_count, 0);
-
+        let retry_policy = in_progress_task.retry_policy;
         let expected_retry_policy = task.retry_policy();
         assert_eq!(
-            dequeued_task.max_attempts,
+            retry_policy.max_attempts,
             expected_retry_policy.max_attempts
         );
         assert_eq!(
-            dequeued_task.initial_interval_ms,
+            retry_policy.initial_interval_ms,
             expected_retry_policy.initial_interval_ms
         );
         assert_eq!(
-            dequeued_task.max_interval_ms,
+            retry_policy.max_interval_ms,
             expected_retry_policy.max_interval_ms
         );
         assert_eq!(
-            dequeued_task.backoff_coefficient,
+            retry_policy.backoff_coefficient,
             expected_retry_policy.backoff_coefficient
         );
-        assert_eq!(dequeued_task.concurrency_key, task.concurrency_key());
+        assert_eq!(in_progress_task.concurrency_key, task.concurrency_key());
 
         // Query the database to verify the task's state was set.
         let dequeued_task = sqlx::query!(
@@ -1665,7 +1811,12 @@ mod tests {
             .map(|_| {
                 let queue = queue.clone();
                 let pool = pool.clone();
-                tokio::spawn(async move { queue.dequeue(&pool).await })
+                tokio::spawn(async move {
+                    let mut tx = pool.begin().await?;
+                    let ret = queue.dequeue(&mut tx).await;
+                    tx.commit().await?;
+                    ret
+                })
             })
             .collect();
 
@@ -1678,7 +1829,10 @@ mod tests {
         // Ensure all tasks were dequeued without duplicates
         let mut task_ids = HashSet::new();
         for dequeued_task in results.into_iter().flatten() {
-            assert!(task_ids.insert(dequeued_task.id));
+            assert!(
+                task_ids.insert(dequeued_task.id),
+                "Task ID should be unique"
+            );
         }
 
         assert_eq!(task_ids.len(), 5);
@@ -1695,7 +1849,8 @@ mod tests {
             .await?;
 
         // Attempt to dequeue without enqueuing any tasks
-        let dequeued_task = queue.dequeue(&pool).await?;
+        let mut conn = pool.acquire().await?;
+        let dequeued_task = queue.dequeue(&mut conn).await?;
 
         assert!(dequeued_task.is_none());
 
@@ -1716,25 +1871,41 @@ mod tests {
         // Enqueue a task
         let task_id = queue.enqueue(&pool, &task, &input).await?;
 
-        // Mark the task as in progress
-        queue.mark_task_in_progress(&pool, task_id).await?;
+        let mut tx = pool.begin().await?;
+
+        // N.B. Task must be dequeued to ensure an attempt row is created.
+        queue
+            .dequeue(&mut tx)
+            .await?
+            .expect("A task should be dequeued");
 
         // Verify the task state
         let task_row = sqlx::query!(
             r#"
-            select 
-              state as "state: TaskState", 
-              started_at as "started_at: i64"
+            select id, state as "state: TaskState"
             from underway.task
             where id = $1
             "#,
-            task_id as _
+            task_id as TaskId
         )
-        .fetch_one(&pool)
+        .fetch_one(&mut *tx)
         .await?;
 
         assert_eq!(task_row.state, TaskState::InProgress);
-        assert!(task_row.started_at.is_some());
+
+        // Verify task attempt exists.
+        let task_attempt_row = sqlx::query!(
+            r#"
+            select task_id
+            from underway.task_attempt
+            where task_id = $1
+            "#,
+            task_row.id
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        assert!(task_attempt_row.is_some());
 
         Ok(())
     }
@@ -1753,31 +1924,39 @@ mod tests {
         // Enqueue a task
         let task_id = queue.enqueue(&pool, &task, &input).await?;
 
-        // Reschedule the task for retry
-        let retry_count = 1;
-
         // TODO: Converting PgInterval to Span may need to be revisited as minutes and
         // seconds do no properly line up.
         let delay = 1.minute();
 
-        queue
-            .reschedule_task_for_retry(&pool, task_id, retry_count, delay)
-            .await?;
+        let mut conn = pool.acquire().await?;
+        let in_progress_task = queue
+            .dequeue(&mut conn)
+            .await?
+            .expect("A task should be dequeued");
+
+        in_progress_task.retry_after(&mut conn, delay).await?;
 
         // Query to verify rescheduled task
         let dequeued_task = sqlx::query!(
             r#"
-            select id, retry_count, delay from underway.task where id = $1
+            select state as "state: TaskState", delay from underway.task where id = $1
             "#,
-            task_id as _
+            task_id as TaskId
         )
         .fetch_optional(&pool)
-        .await?;
+        .await?
+        .expect("Task should be available");
 
-        assert!(dequeued_task.is_some());
-
-        let dequeued_task = dequeued_task.unwrap();
-        assert_eq!(dequeued_task.retry_count, retry_count);
+        assert_eq!(
+            in_progress_task.retry_count(&pool).await?,
+            1,
+            "Task should show one retry since it's been rescheduled"
+        );
+        assert_eq!(
+            dequeued_task.state,
+            TaskState::Pending,
+            "Task should be set to Pending so it'll be retried"
+        );
 
         assert_eq!(
             pg_interval_to_span(&dequeued_task.delay).compare(delay)?,
@@ -1801,8 +1980,14 @@ mod tests {
         // Enqueue a task
         let task_id = queue.enqueue(&pool, &task, &input).await?;
 
+        let mut conn = pool.acquire().await?;
+        let in_progress_task = queue
+            .dequeue(&mut conn)
+            .await?
+            .expect("A task should be dequeued");
+
         // Cancel the task
-        queue.mark_task_cancelled(&pool, task_id).await?;
+        in_progress_task.mark_cancelled(&mut conn).await?;
 
         // Verify the task state
         let task_row = sqlx::query!(
@@ -1833,8 +2018,16 @@ mod tests {
         // Enqueue a task
         let task_id = queue.enqueue(&pool, &task, &input).await?;
 
+        let mut tx = pool.begin().await?;
+
+        // N.B. Task must be dequeued to ensure attempt row is created.
+        let in_progress_task = queue
+            .dequeue(&mut tx)
+            .await?
+            .expect("A task should be dequeued");
+
         // Mark the task as succeeded
-        queue.mark_task_succeeded(&pool, task_id).await?;
+        in_progress_task.mark_succeeded(&mut tx).await?;
 
         // Verify the task state
         let task_row = sqlx::query!(
@@ -1843,64 +2036,10 @@ mod tests {
             "#,
             task_id as _
         )
-        .fetch_one(&pool)
+        .fetch_one(&mut *tx)
         .await?;
 
         assert_eq!(task_row.state, TaskState::Succeeded);
-
-        Ok(())
-    }
-
-    #[sqlx::test]
-    async fn mark_nonexistent_task_succeeded(pool: PgPool) -> sqlx::Result<(), Error> {
-        let queue: Queue<TestTask> = Queue::builder()
-            .name("test_nonexistent_task")
-            .pool(pool.clone())
-            .build()
-            .await?;
-
-        let nonexistent_task_id = TaskId::new();
-
-        // Attempt to mark a non-existent task as succeeded
-        let result = queue.mark_task_succeeded(&pool, nonexistent_task_id).await;
-
-        assert!(result.is_err(), "Expected an error, but got Ok");
-
-        if let Err(Error::TaskNotFound(id)) = result {
-            assert_eq!(id, nonexistent_task_id, "Task IDs should match");
-        } else {
-            panic!(
-                "Expected TaskNotFound error, but got {:?}",
-                result.unwrap_err()
-            );
-        }
-
-        Ok(())
-    }
-
-    #[sqlx::test]
-    async fn mark_nonexistent_task_failed(pool: PgPool) -> sqlx::Result<(), Error> {
-        let queue: Queue<TestTask> = Queue::builder()
-            .name("test_nonexistent_task")
-            .pool(pool.clone())
-            .build()
-            .await?;
-
-        let nonexistent_task_id = TaskId::new();
-
-        // Attempt to mark a non-existent task as succeeded
-        let result = queue.mark_task_failed(&pool, nonexistent_task_id).await;
-
-        assert!(result.is_err(), "Expected an error, but got Ok");
-
-        if let Err(Error::TaskNotFound(id)) = result {
-            assert_eq!(id, nonexistent_task_id, "Task IDs should match");
-        } else {
-            panic!(
-                "Expected TaskNotFound error, but got {:?}",
-                result.unwrap_err()
-            );
-        }
 
         Ok(())
     }
@@ -1919,17 +2058,25 @@ mod tests {
         // Enqueue a task
         let task_id = queue.enqueue(&pool, &task, &input).await?;
 
+        let mut tx = pool.begin().await?;
+
+        // N.B. We can't mark a task failed if it hasn't been dequeued.
+        let in_progress_task = queue
+            .dequeue(&mut tx)
+            .await?
+            .expect("A task should be dequeued");
+
         // Mark the task as failed
-        queue.mark_task_failed(&pool, task_id).await?;
+        in_progress_task.mark_failed(&mut tx).await?;
 
         // Verify the task state
         let task_row = sqlx::query!(
             r#"
             select id, state as "state: TaskState" from underway.task where id = $1
             "#,
-            task_id as _
+            task_id as TaskId
         )
-        .fetch_optional(&pool)
+        .fetch_optional(&mut *tx)
         .await?;
 
         assert!(task_row.is_some());
@@ -1953,27 +2100,31 @@ mod tests {
         let task_id = queue.enqueue(&pool, &task, &input).await?;
 
         // Update task failure details
-        let retry_count = 2;
-        let error_message = "Some failure occurred";
+        let error = &TaskError::Retryable("Some failure occurred".to_string());
 
-        queue
-            .update_task_failure(&pool, task_id, retry_count, error_message)
-            .await?;
+        let mut tx = pool.begin().await?;
+
+        // N.B. Task must be dequeued to ensure attempt row is created.
+        let in_progress_task = queue
+            .dequeue(&mut tx)
+            .await?
+            .expect("A task should be dequeued");
+
+        // Update task failure.
+        in_progress_task.record_failure(&mut tx, error).await?;
 
         // Query to verify the failure update
-        let task_row = sqlx::query!(
+        let task_attempt_row = sqlx::query!(
             r#"
-            select id, retry_count, error_message from underway.task where id = $1
+            select error_message from underway.task_attempt where task_id = $1 order by attempt_number desc
             "#,
-            task_id as _
+            task_id as TaskId
         )
-        .fetch_optional(&pool)
-        .await?;
+        .fetch_optional(&mut *tx)
+        .await?.expect("Task attempt row should exist");
 
-        assert!(task_row.is_some());
-        let task_row = task_row.unwrap();
-        assert_eq!(task_row.retry_count, retry_count);
-        assert_eq!(task_row.error_message, Some(error_message.to_string()));
+        assert_eq!(in_progress_task.retry_count(&mut *tx).await?, 1);
+        assert_eq!(task_attempt_row.error_message, Some(error.to_string()));
 
         Ok(())
     }
@@ -2167,6 +2318,297 @@ mod tests {
             .await?;
 
         assert!(queue.unschedule(&pool).await.is_ok());
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn verify_attempt_rows_for_success(pool: PgPool) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("verify_attempt_rows_for_success")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let task_id = queue.enqueue(&pool, &TestTask, &json!("{}")).await?;
+
+        // Dequeue the task to ensure the attempt row is created.
+        let mut conn = pool.acquire().await?;
+        let in_progress_task = queue
+            .dequeue(&mut conn)
+            .await?
+            .expect("A task should be dequeued");
+
+        let attempt_rows = sqlx::query!(
+            r#"
+            select task_id, state as "state: TaskState", completed_at as "completed_at: i64"
+            from underway.task_attempt
+            "#
+        )
+        .fetch_all(&pool)
+        .await?;
+
+        assert_eq!(attempt_rows.len(), 1);
+        for attempt_row in attempt_rows {
+            assert_eq!(attempt_row.task_id, *task_id);
+            assert_eq!(attempt_row.state, TaskState::InProgress);
+            assert!(attempt_row.completed_at.is_none());
+        }
+
+        // Simulate the task succeeding.
+        in_progress_task.mark_succeeded(&mut conn).await?;
+
+        let task_row = sqlx::query!(
+            r#"select state as "state: TaskState", completed_at as "completed_at: i64"
+            from underway.task where id = $1"#,
+            task_id as TaskId
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(task_row.state, TaskState::Succeeded);
+        assert!(task_row.completed_at.is_some());
+
+        let attempt_rows = sqlx::query!(
+            r#"
+            select task_id, state as "state: TaskState", completed_at as "completed_at: i64"
+            from underway.task_attempt
+            "#
+        )
+        .fetch_all(&pool)
+        .await?;
+
+        assert_eq!(attempt_rows.len(), 1);
+        for attempt_row in attempt_rows {
+            assert_eq!(attempt_row.task_id, *task_id);
+            assert_eq!(attempt_row.state, TaskState::Succeeded);
+            assert!(attempt_row.completed_at.is_some());
+        }
+
+        assert!(
+            queue.dequeue(&mut conn).await?.is_none(),
+            "The task succeeded so nothing else should be queued"
+        );
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn verify_attempt_rows_for_failure(pool: PgPool) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("verify_attempt_rows_for_failure")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let task_id = queue.enqueue(&pool, &TestTask, &json!("{}")).await?;
+
+        // Dequeue the task to ensure the attempt row is created.
+        let mut conn = pool.acquire().await?;
+        let in_progress_task = queue
+            .dequeue(&mut conn)
+            .await?
+            .expect("A task should be dequeued");
+
+        let attempt_rows = sqlx::query!(
+            r#"
+            select task_id, state as "state: TaskState", completed_at as "completed_at: i64"
+            from underway.task_attempt
+            "#
+        )
+        .fetch_all(&pool)
+        .await?;
+
+        assert_eq!(attempt_rows.len(), 1);
+        for attempt_row in attempt_rows {
+            assert_eq!(attempt_row.task_id, *task_id);
+            assert_eq!(attempt_row.state, TaskState::InProgress);
+            assert!(attempt_row.completed_at.is_none());
+        }
+
+        // Simulate the task succeeding.
+        in_progress_task.mark_failed(&mut conn).await?;
+
+        let task_row = sqlx::query!(
+            r#"
+            select state as "state: TaskState", completed_at as "completed_at: i64"
+            from underway.task where id = $1
+            "#,
+            task_id as TaskId
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(task_row.state, TaskState::Failed);
+        assert!(task_row.completed_at.is_some());
+
+        let attempt_rows = sqlx::query!(
+            r#"
+            select task_id, state as "state: TaskState", completed_at as "completed_at: i64"
+            from underway.task_attempt
+            "#
+        )
+        .fetch_all(&pool)
+        .await?;
+
+        assert_eq!(attempt_rows.len(), 1);
+        for attempt_row in attempt_rows {
+            assert_eq!(attempt_row.task_id, *task_id);
+            assert_eq!(attempt_row.state, TaskState::Failed);
+            assert!(attempt_row.completed_at.is_some());
+        }
+
+        assert!(
+            queue.dequeue(&mut conn).await?.is_none(),
+            "The task failed so nothing else should be queued"
+        );
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn verify_attempt_rows_for_cancelled(pool: PgPool) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("verify_attempt_rows_for_cancelled")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let task_id = queue.enqueue(&pool, &TestTask, &json!("{}")).await?;
+
+        // Dequeue the task to ensure the attempt row is created.
+        let mut conn = pool.acquire().await?;
+        let in_progress_task = queue
+            .dequeue(&mut conn)
+            .await?
+            .expect("A task should be dequeued");
+
+        let attempt_rows = sqlx::query!(
+            r#"
+            select task_id, state as "state: TaskState", completed_at as "completed_at: i64"
+            from underway.task_attempt
+            "#
+        )
+        .fetch_all(&pool)
+        .await?;
+
+        assert_eq!(attempt_rows.len(), 1);
+        for attempt_row in attempt_rows {
+            assert_eq!(attempt_row.task_id, *task_id);
+            assert_eq!(attempt_row.state, TaskState::InProgress);
+            assert!(attempt_row.completed_at.is_none());
+        }
+
+        // Simulate the task succeeding.
+        in_progress_task.mark_cancelled(&mut conn).await?;
+
+        let task_row = sqlx::query!(
+            r#"
+            select state as "state: TaskState", completed_at as "completed_at: i64"
+            from underway.task where id = $1
+            "#,
+            task_id as TaskId
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(task_row.state, TaskState::Cancelled);
+        assert!(task_row.completed_at.is_some());
+
+        let attempt_rows = sqlx::query!(
+            r#"
+            select task_id, state as "state: TaskState", completed_at as "completed_at: i64"
+            from underway.task_attempt
+            "#
+        )
+        .fetch_all(&pool)
+        .await?;
+
+        assert_eq!(attempt_rows.len(), 1);
+        for attempt_row in attempt_rows {
+            assert_eq!(attempt_row.task_id, *task_id);
+            assert_eq!(attempt_row.state, TaskState::Cancelled);
+            assert!(attempt_row.completed_at.is_some());
+        }
+
+        assert!(
+            queue.dequeue(&mut conn).await?.is_none(),
+            "The task is cancelled so nothing else should be queued"
+        );
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn verify_attempt_rows_for_reschedule(pool: PgPool) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("verify_attempt_rows_for_reschedule")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let task_id = queue.enqueue(&pool, &TestTask, &json!("{}")).await?;
+
+        // Dequeue the task to ensure the attempt row is created.
+        let mut conn = pool.acquire().await?;
+        let in_progress_task = queue
+            .dequeue(&mut conn)
+            .await?
+            .expect("A task should be dequeued");
+
+        let attempt_rows = sqlx::query!(
+            r#"
+            select
+              task_id,
+              state as "state: TaskState",
+              completed_at as "completed_at: i64"
+            from underway.task_attempt
+            "#
+        )
+        .fetch_all(&pool)
+        .await?;
+
+        assert_eq!(attempt_rows.len(), 1);
+        for attempt_row in attempt_rows {
+            assert_eq!(attempt_row.task_id, *task_id);
+            assert_eq!(attempt_row.state, TaskState::InProgress);
+            assert!(attempt_row.completed_at.is_none());
+        }
+
+        // Simulate the task being rescheduled.
+        in_progress_task.retry_after(&mut conn, Span::new()).await?;
+
+        assert!(queue.dequeue(&mut conn).await?.is_some());
+
+        let attempt_rows = sqlx::query!(
+            r#"
+            select 
+              task_id, state as "state: TaskState",
+              completed_at as "completed_at: i64"
+            from underway.task_attempt
+            order by started_at
+            "#
+        )
+        .fetch_all(&pool)
+        .await?;
+
+        assert_eq!(attempt_rows.len(), 2);
+
+        for (i, attempt_row) in attempt_rows.into_iter().enumerate() {
+            assert_eq!(attempt_row.task_id, *task_id);
+
+            match i {
+                0 => {
+                    assert!(attempt_row.completed_at.is_some());
+                    assert_eq!(attempt_row.state, TaskState::Failed);
+                }
+                1 => {
+                    assert!(attempt_row.completed_at.is_none());
+                    assert_eq!(attempt_row.state, TaskState::InProgress);
+                }
+                _ => panic!("Unexpected attempt row index"),
+            };
+        }
 
         Ok(())
     }
