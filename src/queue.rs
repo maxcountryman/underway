@@ -641,7 +641,7 @@ impl<T: Task> Queue<T> {
             InProgressTask,
             r#"
             update underway.task
-            set state = $3
+            set state = $3, last_attempt_at = now()
             where id = (
                 select id
                 from underway.task
@@ -982,14 +982,16 @@ impl InProgressTask {
             set state = $3,
                 updated_at = now(),
                 completed_at = now()
-            where task_id = (
-                select task_id
-                from underway.task_attempt
-                where task_id = $1 and
-                      task_queue_name = $2
-                order by attempt_number desc
-                limit 1
-            ) 
+            where task_id = $1
+              and task_queue_name = $2
+              and attempt_number = (
+                  select attempt_number
+                  from underway.task_attempt
+                  where task_id = $1
+                    and task_queue_name = $2
+                  order by attempt_number desc
+                  limit 1
+              ) 
             "#,
             self.id as TaskId,
             self.queue_name,
@@ -1034,15 +1036,17 @@ impl InProgressTask {
             set state = $3,
                 updated_at = now(),
                 completed_at = now()
-            where task_id = (
-                select task_id
-                from underway.task_attempt
-                where task_id = $1
-                  and task_queue_name = $2 
-                  and state < $4
-                order by attempt_number desc
-                limit 1
-            )
+            where task_id = $1
+              and task_queue_name = $2
+              and attempt_number = (
+                  select attempt_number
+                  from underway.task_attempt
+                  where task_id = $1
+                    and task_queue_name = $2
+                    and state < $4
+                  order by attempt_number desc
+                  limit 1
+              ) 
             "#,
             self.id as TaskId,
             self.queue_name,
@@ -1087,14 +1091,16 @@ impl InProgressTask {
             set state = $3,
                 updated_at = now(),
                 completed_at = now()
-            where task_id = (
-                select task_id
-                from underway.task_attempt
-                where task_id = $1 
-                  and task_queue_name = $2
-                order by attempt_number desc
-                limit 1
-            ) 
+            where task_id = $1
+              and task_queue_name = $2
+              and attempt_number = (
+                  select attempt_number
+                  from underway.task_attempt
+                  where task_id = $1
+                    and task_queue_name = $2
+                  order by attempt_number desc
+                  limit 1
+              ) 
             "#,
             self.id as TaskId,
             self.queue_name,
@@ -1140,14 +1146,16 @@ impl InProgressTask {
             set state = $3,
                 updated_at = now(),
                 error_message = $4
-            where task_id = (
-                select task_id
-                from underway.task_attempt
-                where task_id = $1
-                  and task_queue_name = $2
-                order by attempt_number desc
-                limit 1
-            ) 
+            where task_id = $1
+              and task_queue_name = $2
+              and attempt_number = (
+                  select attempt_number
+                  from underway.task_attempt
+                  where task_id = $1
+                    and task_queue_name = $2
+                  order by attempt_number desc
+                  limit 1
+              ) 
             "#,
             self.id as TaskId,
             self.queue_name,
@@ -1189,14 +1197,16 @@ impl InProgressTask {
             set state = $3,
                 updated_at = now(),
                 completed_at = now()
-            where task_id = (
-                select task_id
-                from underway.task_attempt
-                where task_id = $1 
-                  and task_queue_name = $2
-                order by attempt_number desc
-                limit 1
-            ) 
+            where task_id = $1
+              and task_queue_name = $2
+              and attempt_number = (
+                  select attempt_number
+                  from underway.task_attempt
+                  where task_id = $1
+                    and task_queue_name = $2
+                  order by attempt_number desc
+                  limit 1
+              ) 
             "#,
             self.id as TaskId,
             self.queue_name,
@@ -2549,66 +2559,95 @@ mod tests {
 
         let task_id = queue.enqueue(&pool, &TestTask, &json!("{}")).await?;
 
-        // Dequeue the task to ensure the attempt row is created.
         let mut conn = pool.acquire().await?;
-        let in_progress_task = queue
+        let mut in_progress_task = queue
             .dequeue(&mut conn)
             .await?
             .expect("A task should be dequeued");
 
-        let attempt_rows = sqlx::query!(
-            r#"
-            select
-              task_id,
-              state as "state: TaskState",
-              completed_at as "completed_at: i64"
-            from underway.task_attempt
-            "#
-        )
-        .fetch_all(&pool)
-        .await?;
+        async fn fetch_and_verify_attempts(
+            pool: &PgPool,
+            task_id: TaskId,
+            expected_attempts: &[(TaskState, bool)],
+        ) -> sqlx::Result<()> {
+            let attempt_rows = sqlx::query!(
+                r#"
+                select
+                    task_id,
+                    state as "state: TaskState",
+                    completed_at as "completed_at: i64"
+                from underway.task_attempt
+                where task_id = $1
+                order by started_at
+                "#,
+                task_id as TaskId
+            )
+            .fetch_all(pool)
+            .await?;
 
-        assert_eq!(attempt_rows.len(), 1);
-        for attempt_row in attempt_rows {
-            assert_eq!(attempt_row.task_id, *task_id);
-            assert_eq!(attempt_row.state, TaskState::InProgress);
-            assert!(attempt_row.completed_at.is_none());
+            assert_eq!(attempt_rows.len(), expected_attempts.len());
+
+            let mut prev_completed_at: Option<i64> = None;
+
+            for (i, attempt_row) in attempt_rows.into_iter().enumerate() {
+                assert_eq!(attempt_row.task_id, *task_id);
+
+                let (expected_state, expect_completed) = &expected_attempts[i];
+
+                if *expect_completed {
+                    assert!(attempt_row.completed_at.is_some());
+                    if let Some(prev) = prev_completed_at {
+                        assert!(
+                            prev <= attempt_row.completed_at.unwrap(),
+                            "completed_at timestamps are not in chronological order"
+                        );
+                    }
+                    prev_completed_at = attempt_row.completed_at;
+                } else {
+                    assert!(attempt_row.completed_at.is_none());
+                }
+
+                assert_eq!(attempt_row.state, *expected_state);
+            }
+
+            Ok(())
         }
+
+        // First verification
+        fetch_and_verify_attempts(&pool, task_id, &[(TaskState::InProgress, false)]).await?;
 
         // Simulate the task being rescheduled.
         in_progress_task.retry_after(&mut conn, Span::new()).await?;
 
-        assert!(queue.dequeue(&mut conn).await?.is_some());
+        in_progress_task = queue
+            .dequeue(&mut conn)
+            .await?
+            .expect("Task should be dequeued again");
 
-        let attempt_rows = sqlx::query!(
-            r#"
-            select 
-              task_id, state as "state: TaskState",
-              completed_at as "completed_at: i64"
-            from underway.task_attempt
-            order by started_at
-            "#
+        // Second verification
+        fetch_and_verify_attempts(
+            &pool,
+            task_id,
+            &[(TaskState::Failed, true), (TaskState::InProgress, false)],
         )
-        .fetch_all(&pool)
         .await?;
 
-        assert_eq!(attempt_rows.len(), 2);
+        // Simulate the task being rescheduled again.
+        in_progress_task.retry_after(&mut conn, Span::new()).await?;
 
-        for (i, attempt_row) in attempt_rows.into_iter().enumerate() {
-            assert_eq!(attempt_row.task_id, *task_id);
+        assert!(queue.dequeue(&mut conn).await?.is_some());
 
-            match i {
-                0 => {
-                    assert!(attempt_row.completed_at.is_some());
-                    assert_eq!(attempt_row.state, TaskState::Failed);
-                }
-                1 => {
-                    assert!(attempt_row.completed_at.is_none());
-                    assert_eq!(attempt_row.state, TaskState::InProgress);
-                }
-                _ => panic!("Unexpected attempt row index"),
-            };
-        }
+        // Third verification
+        fetch_and_verify_attempts(
+            &pool,
+            task_id,
+            &[
+                (TaskState::Failed, true),
+                (TaskState::Failed, true),
+                (TaskState::InProgress, false),
+            ],
+        )
+        .await?;
 
         Ok(())
     }

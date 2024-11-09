@@ -1646,8 +1646,18 @@ where
             tx: step_tx,
         };
 
-        // Enqueue the next step if one is given.
-        if let Some((next_input, delay)) = step.execute_step(cx, step_input).await? {
+        // Execute the step and handle any errors.
+        let step_result = match step.execute_step(cx, step_input).await {
+            Ok(result) => result,
+            Err(err) => {
+                // N.B.: Commit the transaction to ensure attempt rows are persisted.
+                tx.commit().await?;
+                return Err(err);
+            }
+        };
+
+        // If there's a next step, enqueue it.
+        if let Some((next_input, delay)) = step_result {
             // Advance current index after executing the step.
             let next_index = step_index + 1;
             self.current_index.store(next_index, Ordering::SeqCst);
@@ -1662,8 +1672,9 @@ where
                 .enqueue_after(&mut *tx, self, &next_job_input, delay)
                 .await
                 .map_err(|err| TaskError::Retryable(err.to_string()))?;
-        };
+        }
 
+        // Commit the transaction.
         tx.commit().await?;
 
         Ok(())
