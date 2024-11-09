@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            select\n              id as \"id: TaskId\",\n              input,\n              timeout,\n              retry_policy as \"retry_policy: RetryPolicy\",\n              concurrency_key\n            from underway.task\n            where task_queue_name = $1\n              and state = $2\n              and created_at + delay <= now()\n            order by priority desc, created_at, id\n            limit 1\n            for update skip locked\n            ",
+  "query": "\n            select\n              id as \"id: TaskId\",\n              task_queue_name as \"queue_name\",\n              input,\n              retry_policy as \"retry_policy: RetryPolicy\",\n              timeout,\n              concurrency_key\n            from underway.task\n            where input->>'job_id' = $1\n              and state = $2\n            ",
   "describe": {
     "columns": [
       {
@@ -10,13 +10,13 @@
       },
       {
         "ordinal": 1,
-        "name": "input",
-        "type_info": "Jsonb"
+        "name": "queue_name",
+        "type_info": "Text"
       },
       {
         "ordinal": 2,
-        "name": "timeout",
-        "type_info": "Interval"
+        "name": "input",
+        "type_info": "Jsonb"
       },
       {
         "ordinal": 3,
@@ -49,6 +49,11 @@
       },
       {
         "ordinal": 4,
+        "name": "timeout",
+        "type_info": "Interval"
+      },
+      {
+        "ordinal": 5,
         "name": "concurrency_key",
         "type_info": "Text"
       }
@@ -77,8 +82,9 @@
       false,
       false,
       false,
+      false,
       true
     ]
   },
-  "hash": "dbf30b8a57443b51c6d59fce0f584ddd392475d354c628e1d39a8edab3ec9af4"
+  "hash": "fa13a4875b569ce138438632ab68c60ec62e001cbe007b9a75776cf54e21f9cc"
 }

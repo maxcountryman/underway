@@ -654,7 +654,7 @@ use ulid::Ulid;
 use uuid::Uuid;
 
 use crate::{
-    queue::{Error as QueueError, Queue},
+    queue::{Error as QueueError, InProgressTask, Queue},
     scheduler::{Error as SchedulerError, Result as SchedulerResult, Scheduler, ZonedSchedule},
     task::{
         Error as TaskError, Result as TaskResult, RetryPolicy, State as TaskState, Task, TaskId,
@@ -892,22 +892,29 @@ impl<T: Task> EnqueuedJob<T> {
     /// ```
     pub async fn cancel(&self) -> Result<bool> {
         let mut tx = self.queue.pool.begin().await?;
-        let tasks = sqlx::query!(
+        let in_progress_tasks = sqlx::query_as!(
+            InProgressTask,
             r#"
-            select id as "id: TaskId"
+            select
+              id as "id: TaskId",
+              task_queue_name as "queue_name",
+              input,
+              retry_policy as "retry_policy: RetryPolicy",
+              timeout,
+              concurrency_key
             from underway.task
-            where input->>'job_id' = $1 and
-                  state = $2
+            where input->>'job_id' = $1
+              and state = $2
             "#,
             self.id.to_string(),
-            TaskState::Pending as _
+            TaskState::Pending as TaskState
         )
         .fetch_all(&mut *tx)
         .await?;
 
         let mut cancelled = false;
-        for task in tasks {
-            if self.queue.mark_task_cancelled(&mut tx, task.id).await? {
+        for in_progress_task in in_progress_tasks {
+            if in_progress_task.mark_cancelled(&mut tx).await? {
                 cancelled = true;
             }
         }

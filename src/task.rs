@@ -85,7 +85,7 @@ use std::{
 
 use jiff::{SignedDuration, Span, ToSpan};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use sqlx::{postgres::types::PgInterval, Postgres, Transaction};
+use sqlx::{Postgres, Transaction};
 use ulid::Ulid;
 use uuid::Uuid;
 
@@ -516,25 +516,6 @@ pub trait Task: Send + 'static {
     fn priority(&self) -> i32 {
         0
     }
-}
-
-/// Dequeued task.
-#[derive(Debug, sqlx::FromRow)]
-pub struct DequeuedTask {
-    /// Task ID.
-    pub id: TaskId,
-
-    /// Input as a `serde_json::Value`.
-    pub input: serde_json::Value,
-
-    /// Timeout.
-    pub timeout: PgInterval,
-
-    /// [`RetryPolicy`] for the task.
-    pub retry_policy: RetryPolicy,
-
-    /// Concurrency key.
-    pub concurrency_key: Option<String>,
 }
 
 /// Represents the possible states a task can be in.
