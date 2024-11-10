@@ -220,7 +220,7 @@
 //! # }
 //! ```
 
-use std::{marker::PhantomData, time::Duration as StdDuration};
+use std::{borrow::Cow, marker::PhantomData, time::Duration as StdDuration};
 
 use builder_states::{Initial, NameSet, PoolSet};
 use jiff::{Span, ToSpan};
@@ -1297,10 +1297,21 @@ impl InProgressTask {
 
         Ok(())
     }
+
+    pub(crate) async fn try_acquire_lock(&self, conn: &mut PgConnection) -> Result<bool> {
+        try_acquire_advisory_xact_lock(conn, &self.lock_key()).await
+    }
+
+    fn lock_key(&self) -> Cow<str> {
+        match &self.concurrency_key {
+            Some(concurrency_key) => Cow::Borrowed(concurrency_key),
+            None => Cow::Owned(self.id.to_string()),
+        }
+    }
 }
 
 #[instrument(skip(executor), err)]
-pub(crate) async fn try_acquire_advisory_xact_lock<'a, E>(executor: E, key: &str) -> Result<bool>
+async fn try_acquire_advisory_xact_lock<'a, E>(executor: E, key: &str) -> Result<bool>
 where
     E: PgExecutor<'a>,
 {

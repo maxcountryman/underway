@@ -130,10 +130,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
 use crate::{
-    queue::{
-        try_acquire_advisory_xact_lock, Error as QueueError, InProgressTask, Queue,
-        SHUTDOWN_CHANNEL,
-    },
+    queue::{Error as QueueError, InProgressTask, Queue, SHUTDOWN_CHANNEL},
     task::{Error as TaskError, RetryCount, RetryPolicy, Task, TaskId},
 };
 pub(crate) type Result<T = ()> = std::result::Result<T, Error>;
@@ -722,11 +719,7 @@ impl<T: Task + Sync> Worker<T> {
         let mut tx = self.queue.pool.begin().await?;
 
         // Acquire an advisory lock on either the concurrency key or the task ID.
-        let lock_key = match &in_progress_task.concurrency_key {
-            Some(concurrency_key) => concurrency_key.as_str(),
-            None => &task_id.to_string(),
-        };
-        if !try_acquire_advisory_xact_lock(&mut *tx, lock_key).await? {
+        if !in_progress_task.try_acquire_lock(&mut tx).await? {
             return Ok(None);
         }
 
