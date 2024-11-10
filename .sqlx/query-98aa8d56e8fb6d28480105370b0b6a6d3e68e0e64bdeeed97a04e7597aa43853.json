@@ -1,12 +1,12 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select pg_advisory_xact_lock(hashtext($1))",
+  "query": "select pg_try_advisory_xact_lock(hashtext($1))",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "pg_advisory_xact_lock",
-        "type_info": "Void"
+        "name": "pg_try_advisory_xact_lock",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
@@ -18,5 +18,5 @@
       null
     ]
   },
-  "hash": "e31efccd3da03c27df3b249503901d1b95832cd005b3f70ab958b654087b388c"
+  "hash": "98aa8d56e8fb6d28480105370b0b6a6d3e68e0e64bdeeed97a04e7597aa43853"
 }

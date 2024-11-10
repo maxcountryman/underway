@@ -131,7 +131,8 @@ use tracing::instrument;
 
 use crate::{
     queue::{
-        acquire_advisory_xact_lock, Error as QueueError, InProgressTask, Queue, SHUTDOWN_CHANNEL,
+        try_acquire_advisory_xact_lock, Error as QueueError, InProgressTask, Queue,
+        SHUTDOWN_CHANNEL,
     },
     task::{Error as TaskError, RetryCount, RetryPolicy, Task, TaskId},
 };
@@ -720,15 +721,13 @@ impl<T: Task + Sync> Worker<T> {
         // Transaction scoped to the task execution.
         let mut tx = self.queue.pool.begin().await?;
 
-        if let Some(concurrency_key) = &in_progress_task.concurrency_key {
-            // Acquire an advisory lock on the concurrency key to ensure that only one
-            // worker can process tasks with the same concurrency key at a time.
-            acquire_advisory_xact_lock(&mut *tx, concurrency_key).await?;
-        } else {
-            // Acquire an advisory lock on the task ID to prevent multiple workers from
-            // processing the same task simultaneously. This lock ensures that only one
-            // worker can process this specific task while the transaction is active.
-            acquire_advisory_xact_lock(&mut *tx, &task_id.to_string()).await?;
+        // Acquire an advisory lock on either the concurrency key or the task ID.
+        let lock_key = match &in_progress_task.concurrency_key {
+            Some(concurrency_key) => concurrency_key.as_str(),
+            None => &task_id.to_string(),
+        };
+        if !try_acquire_advisory_xact_lock(&mut *tx, lock_key).await? {
+            return Ok(None);
         }
 
         let input: T::Input = serde_json::from_value(in_progress_task.input.clone())?;

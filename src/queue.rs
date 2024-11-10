@@ -1298,15 +1298,16 @@ impl InProgressTask {
 }
 
 #[instrument(skip(executor), err)]
-pub(crate) async fn acquire_advisory_xact_lock<'a, E>(executor: E, key: &str) -> Result
+pub(crate) async fn try_acquire_advisory_xact_lock<'a, E>(executor: E, key: &str) -> Result<bool>
 where
     E: PgExecutor<'a>,
 {
-    sqlx::query!("select pg_advisory_xact_lock(hashtext($1))", key)
-        .execute(executor)
-        .await?;
-
-    Ok(())
+    Ok(
+        sqlx::query_scalar!("select pg_try_advisory_xact_lock(hashtext($1))", key)
+            .fetch_one(executor)
+            .await?
+            .unwrap_or(false),
+    )
 }
 
 #[instrument(skip(conn, lock), err)]
