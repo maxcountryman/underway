@@ -645,7 +645,9 @@ impl<T: Task> Queue<T> {
             InProgressTask,
             r#"
             update underway.task
-            set state = $3, last_attempt_at = now()
+            set state = $3,
+                last_attempt_at = now(),
+                last_heartbeat_at = now()
             where id = (
                 select id
                 from underway.task
