@@ -901,6 +901,7 @@ impl<T: Task> EnqueuedJob<T> {
               input,
               retry_policy as "retry_policy: RetryPolicy",
               timeout,
+              heartbeat,
               concurrency_key
             from underway.task
             where input->>'job_id' = $1
@@ -2375,9 +2376,8 @@ mod tests {
         };
         job.enqueue(&input).await?;
 
-        let mut conn = pool.acquire().await?;
         let pending_task = queue
-            .dequeue(&mut conn)
+            .dequeue()
             .await?
             .expect("There should be an enqueued task");
 
@@ -2415,9 +2415,8 @@ mod tests {
         };
         job.enqueue(&input).await?;
 
-        let mut conn = pool.acquire().await?;
         let pending_task = queue
-            .dequeue(&mut conn)
+            .dequeue()
             .await?
             .expect("There should be an enqueued task");
 
@@ -2467,9 +2466,8 @@ mod tests {
         };
         job.enqueue(&input).await?;
 
-        let mut conn = pool.acquire().await?;
         let pending_task = queue
-            .dequeue(&mut conn)
+            .dequeue()
             .await?
             .expect("There should be an enqueued task");
 
@@ -2565,9 +2563,8 @@ mod tests {
         };
         job.enqueue(&input).await?;
 
-        let mut conn = pool.acquire().await?;
         let pending_task = queue
-            .dequeue(&mut conn)
+            .dequeue()
             .await?
             .expect("There should be an enqueued task");
 
@@ -2604,9 +2601,8 @@ mod tests {
         };
         job.enqueue(&input).await?;
 
-        let mut conn = pool.acquire().await?;
         let pending_task = queue
-            .dequeue(&mut conn)
+            .dequeue()
             .await?
             .expect("There should be an enqueued task");
 
@@ -2694,9 +2690,8 @@ mod tests {
         worker.process_next_task().await?;
 
         // Inspect the second task.
-        let mut conn = pool.acquire().await?;
         let pending_task = queue
-            .dequeue(&mut conn)
+            .dequeue()
             .await?
             .expect("There should be an enqueued task");
 
@@ -2758,8 +2753,7 @@ mod tests {
         let enqueued_job = job.enqueue(&input).await?;
 
         // Dequeue the first task.
-        let mut conn = pool.acquire().await?;
-        let Some(dequeued_task) = queue.dequeue(&mut conn).await? else {
+        let Some(dequeued_task) = queue.dequeue().await? else {
             panic!("Task should exist");
         };
 
@@ -2793,8 +2787,7 @@ mod tests {
         worker.process_next_task().await?;
 
         // Dequeue the second task.
-        let mut conn = pool.acquire().await?;
-        let Some(dequeued_task) = queue.dequeue(&mut conn).await? else {
+        let Some(dequeued_task) = queue.dequeue().await? else {
             panic!("Next task should exist");
         };
 
@@ -2861,9 +2854,8 @@ mod tests {
         worker.process_next_task().await?;
 
         // Inspect the second task.
-        let mut conn = pool.acquire().await?;
         let pending_task = queue
-            .dequeue(&mut conn)
+            .dequeue()
             .await?
             .expect("There should be an enqueued task");
 
@@ -2917,8 +2909,7 @@ mod tests {
         let enqueued_job = job.enqueue(&input).await?;
 
         // Dequeue the first task.
-        let mut conn = pool.acquire().await?;
-        let Some(dequeued_task) = queue.dequeue(&mut conn).await? else {
+        let Some(dequeued_task) = queue.dequeue().await? else {
             panic!("Task should exist");
         };
 
@@ -2961,8 +2952,7 @@ mod tests {
         worker.process_next_task().await?;
 
         // Dequeue the second task.
-        let mut conn = pool.acquire().await?;
-        let Some(dequeued_task) = queue.dequeue(&mut conn).await? else {
+        let Some(dequeued_task) = queue.dequeue().await? else {
             panic!("Next task should exist");
         };
 

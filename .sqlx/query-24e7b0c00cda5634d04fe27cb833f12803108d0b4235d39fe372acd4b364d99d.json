@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            update underway.task\n            set state = $3, last_attempt_at = now()\n            where id = (\n                select id\n                from underway.task\n                where task_queue_name = $1\n                  and state = $2\n                  and created_at + delay <= now()\n                order by priority desc, created_at, id\n                limit 1\n                for update skip locked\n            )\n            returning\n                id as \"id: TaskId\",\n                task_queue_name as \"queue_name\",\n                input,\n                timeout,\n                retry_policy as \"retry_policy: RetryPolicy\",\n                concurrency_key\n            ",
+  "query": "\n            select\n              id as \"id: TaskId\",\n              task_queue_name as \"queue_name\",\n              input,\n              retry_policy as \"retry_policy: RetryPolicy\",\n              timeout,\n              heartbeat,\n              concurrency_key\n            from underway.task\n            where input->>'job_id' = $1\n              and state = $2\n            ",
   "describe": {
     "columns": [
       {
@@ -20,11 +20,6 @@
       },
       {
         "ordinal": 3,
-        "name": "timeout",
-        "type_info": "Interval"
-      },
-      {
-        "ordinal": 4,
         "name": "retry_policy: RetryPolicy",
         "type_info": {
           "Custom": {
@@ -53,7 +48,17 @@
         }
       },
       {
+        "ordinal": 4,
+        "name": "timeout",
+        "type_info": "Interval"
+      },
+      {
         "ordinal": 5,
+        "name": "heartbeat",
+        "type_info": "Interval"
+      },
+      {
+        "ordinal": 6,
         "name": "concurrency_key",
         "type_info": "Text"
       }
@@ -61,20 +66,6 @@
     "parameters": {
       "Left": [
         "Text",
-        {
-          "Custom": {
-            "name": "underway.task_state",
-            "kind": {
-              "Enum": [
-                "pending",
-                "in_progress",
-                "succeeded",
-                "cancelled",
-                "failed"
-              ]
-            }
-          }
-        },
         {
           "Custom": {
             "name": "underway.task_state",
@@ -97,8 +88,9 @@
       false,
       false,
       false,
+      false,
       true
     ]
   },
-  "hash": "705e4322b77ede1818f4cda7d50141b623908a7c980a09dbe8a3ad40c84fae7e"
+  "hash": "24e7b0c00cda5634d04fe27cb833f12803108d0b4235d39fe372acd4b364d99d"
 }

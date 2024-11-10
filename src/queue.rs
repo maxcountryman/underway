@@ -107,7 +107,7 @@
 //! queue.enqueue(&pool, &task, &()).await?;
 //!
 //! let mut tx = pool.begin().await?;
-//! if let Some(task) = queue.dequeue(&mut *tx).await? {
+//! if let Some(task) = queue.dequeue().await? {
 //!     // Process the task here
 //! }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
@@ -624,7 +624,7 @@ impl<T: Task> Queue<T> {
     /// // Dequeue the enqueued task.
     /// let mut tx = pool.begin().await?;
     /// let pending_task = queue
-    ///     .dequeue(&mut *tx)
+    ///     .dequeue()
     ///     .await?
     ///     .expect("There should be a pending task.");
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -632,11 +632,15 @@ impl<T: Task> Queue<T> {
     /// # }
     /// ```
     #[instrument(
-        skip(self, conn),
+        skip(self),
         fields(queue.name = self.name, task.id = tracing::field::Empty),
         err
     )]
-    pub async fn dequeue(&self, conn: &mut PgConnection) -> Result<Option<InProgressTask>> {
+    pub async fn dequeue(&self) -> Result<Option<InProgressTask>> {
+        // Transaction scoped to finding the next task and setting its state to
+        // "in-progress".
+        let mut tx = self.pool.begin().await?;
+
         let in_progress_task = sqlx::query_as!(
             InProgressTask,
             r#"
@@ -646,9 +650,15 @@ impl<T: Task> Queue<T> {
                 select id
                 from underway.task
                 where task_queue_name = $1
-                  and state = $2
+                  and (
+                      state = $2
+                      or (state = $3 and last_heartbeat_at < now() - heartbeat)
+                    )
                   and created_at + delay <= now()
-                order by priority desc, created_at, id
+                order by
+                  priority desc,
+                  created_at,
+                  id
                 limit 1
                 for update skip locked
             )
@@ -657,6 +667,7 @@ impl<T: Task> Queue<T> {
                 task_queue_name as "queue_name",
                 input,
                 timeout,
+                heartbeat,
                 retry_policy as "retry_policy: RetryPolicy",
                 concurrency_key
             "#,
@@ -664,7 +675,7 @@ impl<T: Task> Queue<T> {
             TaskState::Pending as TaskState,
             TaskState::InProgress as TaskState
         )
-        .fetch_optional(&mut *conn)
+        .fetch_optional(&mut *tx)
         .await?;
 
         if let Some(in_progress_task) = &in_progress_task {
@@ -697,9 +708,11 @@ impl<T: Task> Queue<T> {
                 self.name,
                 TaskState::InProgress as TaskState
             )
-            .execute(&mut *conn)
+            .execute(&mut *tx)
             .await?;
         }
+
+        tx.commit().await?;
 
         Ok(in_progress_task)
     }
@@ -969,6 +982,7 @@ pub struct InProgressTask {
     pub(crate) queue_name: String,
     pub(crate) input: serde_json::Value,
     pub(crate) timeout: sqlx::postgres::types::PgInterval,
+    pub(crate) heartbeat: sqlx::postgres::types::PgInterval,
     pub(crate) retry_policy: RetryPolicy,
     pub(crate) concurrency_key: Option<String>,
 }
@@ -1259,6 +1273,27 @@ impl InProgressTask {
         )
         .fetch_one(executor)
         .await?)
+    }
+
+    pub(crate) async fn record_heartbeat<'a, E>(&self, executor: E) -> Result
+    where
+        E: PgExecutor<'a>,
+    {
+        sqlx::query!(
+            r#"
+            update underway.task
+            set updated_at = now(),
+                last_heartbeat_at = now()
+            where id = $1
+              and task_queue_name = $2
+            "#,
+            self.id as TaskId,
+            self.queue_name
+        )
+        .execute(executor)
+        .await?;
+
+        Ok(())
     }
 }
 
@@ -1753,9 +1788,8 @@ mod tests {
         let task_id = queue.enqueue(&pool, &task, &input).await?;
 
         // Dequeue the task
-        let mut conn = pool.acquire().await?;
         let in_progress_task = queue
-            .dequeue(&mut conn)
+            .dequeue()
             .await?
             .expect("There should be a task to dequeue");
 
@@ -1820,13 +1854,7 @@ mod tests {
         let handles: Vec<_> = (0..5)
             .map(|_| {
                 let queue = queue.clone();
-                let pool = pool.clone();
-                tokio::spawn(async move {
-                    let mut tx = pool.begin().await?;
-                    let ret = queue.dequeue(&mut tx).await;
-                    tx.commit().await?;
-                    ret
-                })
+                tokio::spawn(async move { queue.dequeue().await })
             })
             .collect();
 
@@ -1859,8 +1887,7 @@ mod tests {
             .await?;
 
         // Attempt to dequeue without enqueuing any tasks
-        let mut conn = pool.acquire().await?;
-        let dequeued_task = queue.dequeue(&mut conn).await?;
+        let dequeued_task = queue.dequeue().await?;
 
         assert!(dequeued_task.is_none());
 
@@ -1884,10 +1911,7 @@ mod tests {
         let mut tx = pool.begin().await?;
 
         // N.B. Task must be dequeued to ensure an attempt row is created.
-        queue
-            .dequeue(&mut tx)
-            .await?
-            .expect("A task should be dequeued");
+        queue.dequeue().await?.expect("A task should be dequeued");
 
         // Verify the task state
         let task_row = sqlx::query!(
@@ -1939,10 +1963,7 @@ mod tests {
         let delay = 1.minute();
 
         let mut conn = pool.acquire().await?;
-        let in_progress_task = queue
-            .dequeue(&mut conn)
-            .await?
-            .expect("A task should be dequeued");
+        let in_progress_task = queue.dequeue().await?.expect("A task should be dequeued");
 
         in_progress_task.retry_after(&mut conn, delay).await?;
 
@@ -1991,10 +2012,7 @@ mod tests {
         let task_id = queue.enqueue(&pool, &task, &input).await?;
 
         let mut conn = pool.acquire().await?;
-        let in_progress_task = queue
-            .dequeue(&mut conn)
-            .await?
-            .expect("A task should be dequeued");
+        let in_progress_task = queue.dequeue().await?.expect("A task should be dequeued");
 
         // Cancel the task
         in_progress_task.mark_cancelled(&mut conn).await?;
@@ -2031,10 +2049,7 @@ mod tests {
         let mut tx = pool.begin().await?;
 
         // N.B. Task must be dequeued to ensure attempt row is created.
-        let in_progress_task = queue
-            .dequeue(&mut tx)
-            .await?
-            .expect("A task should be dequeued");
+        let in_progress_task = queue.dequeue().await?.expect("A task should be dequeued");
 
         // Mark the task as succeeded
         in_progress_task.mark_succeeded(&mut tx).await?;
@@ -2071,10 +2086,7 @@ mod tests {
         let mut tx = pool.begin().await?;
 
         // N.B. We can't mark a task failed if it hasn't been dequeued.
-        let in_progress_task = queue
-            .dequeue(&mut tx)
-            .await?
-            .expect("A task should be dequeued");
+        let in_progress_task = queue.dequeue().await?.expect("A task should be dequeued");
 
         // Mark the task as failed
         in_progress_task.mark_failed(&mut tx).await?;
@@ -2115,10 +2127,7 @@ mod tests {
         let mut tx = pool.begin().await?;
 
         // N.B. Task must be dequeued to ensure attempt row is created.
-        let in_progress_task = queue
-            .dequeue(&mut tx)
-            .await?
-            .expect("A task should be dequeued");
+        let in_progress_task = queue.dequeue().await?.expect("A task should be dequeued");
 
         // Update task failure.
         in_progress_task.record_failure(&mut tx, error).await?;
@@ -2344,10 +2353,7 @@ mod tests {
 
         // Dequeue the task to ensure the attempt row is created.
         let mut conn = pool.acquire().await?;
-        let in_progress_task = queue
-            .dequeue(&mut conn)
-            .await?
-            .expect("A task should be dequeued");
+        let in_progress_task = queue.dequeue().await?.expect("A task should be dequeued");
 
         let attempt_rows = sqlx::query!(
             r#"
@@ -2396,7 +2402,7 @@ mod tests {
         }
 
         assert!(
-            queue.dequeue(&mut conn).await?.is_none(),
+            queue.dequeue().await?.is_none(),
             "The task succeeded so nothing else should be queued"
         );
 
@@ -2415,10 +2421,7 @@ mod tests {
 
         // Dequeue the task to ensure the attempt row is created.
         let mut conn = pool.acquire().await?;
-        let in_progress_task = queue
-            .dequeue(&mut conn)
-            .await?
-            .expect("A task should be dequeued");
+        let in_progress_task = queue.dequeue().await?.expect("A task should be dequeued");
 
         let attempt_rows = sqlx::query!(
             r#"
@@ -2469,7 +2472,7 @@ mod tests {
         }
 
         assert!(
-            queue.dequeue(&mut conn).await?.is_none(),
+            queue.dequeue().await?.is_none(),
             "The task failed so nothing else should be queued"
         );
 
@@ -2488,10 +2491,7 @@ mod tests {
 
         // Dequeue the task to ensure the attempt row is created.
         let mut conn = pool.acquire().await?;
-        let in_progress_task = queue
-            .dequeue(&mut conn)
-            .await?
-            .expect("A task should be dequeued");
+        let in_progress_task = queue.dequeue().await?.expect("A task should be dequeued");
 
         let attempt_rows = sqlx::query!(
             r#"
@@ -2542,7 +2542,7 @@ mod tests {
         }
 
         assert!(
-            queue.dequeue(&mut conn).await?.is_none(),
+            queue.dequeue().await?.is_none(),
             "The task is cancelled so nothing else should be queued"
         );
 
@@ -2560,10 +2560,7 @@ mod tests {
         let task_id = queue.enqueue(&pool, &TestTask, &json!("{}")).await?;
 
         let mut conn = pool.acquire().await?;
-        let mut in_progress_task = queue
-            .dequeue(&mut conn)
-            .await?
-            .expect("A task should be dequeued");
+        let mut in_progress_task = queue.dequeue().await?.expect("A task should be dequeued");
 
         async fn fetch_and_verify_attempts(
             pool: &PgPool,
@@ -2620,7 +2617,7 @@ mod tests {
         in_progress_task.retry_after(&mut conn, Span::new()).await?;
 
         in_progress_task = queue
-            .dequeue(&mut conn)
+            .dequeue()
             .await?
             .expect("Task should be dequeued again");
 
@@ -2635,7 +2632,7 @@ mod tests {
         // Simulate the task being rescheduled again.
         in_progress_task.retry_after(&mut conn, Span::new()).await?;
 
-        assert!(queue.dequeue(&mut conn).await?.is_some());
+        assert!(queue.dequeue().await?.is_some());
 
         // Third verification
         fetch_and_verify_attempts(
