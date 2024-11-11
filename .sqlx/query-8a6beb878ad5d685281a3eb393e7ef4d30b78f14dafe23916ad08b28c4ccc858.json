@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            delete from underway.task_schedule\n            where task_queue_name = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8a6beb878ad5d685281a3eb393e7ef4d30b78f14dafe23916ad08b28c4ccc858"
+}
