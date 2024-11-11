@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            update underway.task\n            set state = $3, last_attempt_at = now()\n            where id = (\n                select id\n                from underway.task\n                where task_queue_name = $1\n                  and state = $2\n                  and created_at + delay <= now()\n                order by priority desc, created_at, id\n                limit 1\n                for update skip locked\n            )\n            returning\n                id as \"id: TaskId\",\n                task_queue_name as \"queue_name\",\n                input,\n                timeout,\n                retry_policy as \"retry_policy: RetryPolicy\",\n                concurrency_key\n            ",
+  "query": "\n            update underway.task\n            set state = $3,\n                last_attempt_at = now(),\n                last_heartbeat_at = now()\n            where id = (\n                select id\n                from underway.task\n                where task_queue_name = $1\n                  and (\n                      state = $2\n                      or (state = $3 and last_heartbeat_at < now() - heartbeat)\n                    )\n                  and created_at + delay <= now()\n                order by\n                  priority desc,\n                  created_at,\n                  id\n                limit 1\n                for update skip locked\n            )\n            returning\n                id as \"id: TaskId\",\n                task_queue_name as \"queue_name\",\n                input,\n                timeout,\n                heartbeat,\n                retry_policy as \"retry_policy: RetryPolicy\",\n                concurrency_key\n            ",
   "describe": {
     "columns": [
       {
@@ -25,6 +25,11 @@
       },
       {
         "ordinal": 4,
+        "name": "heartbeat",
+        "type_info": "Interval"
+      },
+      {
+        "ordinal": 5,
         "name": "retry_policy: RetryPolicy",
         "type_info": {
           "Custom": {
@@ -53,7 +58,7 @@
         }
       },
       {
-        "ordinal": 5,
+        "ordinal": 6,
         "name": "concurrency_key",
         "type_info": "Text"
       }
@@ -97,8 +102,9 @@
       false,
       false,
       false,
+      false,
       true
     ]
   },
-  "hash": "705e4322b77ede1818f4cda7d50141b623908a7c980a09dbe8a3ad40c84fae7e"
+  "hash": "167170ec018c32a7c9238ab95490dccb8d22d4591ba8920691213829c0a11622"
 }

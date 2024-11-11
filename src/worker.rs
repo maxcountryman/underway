@@ -130,9 +130,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
 use crate::{
-    queue::{
-        acquire_advisory_xact_lock, Error as QueueError, InProgressTask, Queue, SHUTDOWN_CHANNEL,
-    },
+    queue::{Error as QueueError, InProgressTask, Queue, SHUTDOWN_CHANNEL},
     task::{Error as TaskError, RetryCount, RetryPolicy, Task, TaskId},
 };
 pub(crate) type Result<T = ()> = std::result::Result<T, Error>;
@@ -630,6 +628,7 @@ impl<T: Task + Sync> Worker<T> {
                         }
                         Ok(None) => {
                             // We tried to process a task but found none so we'll stop trying.
+                            tracing::trace!("No task found");
                             break;
                         }
                     }
@@ -709,28 +708,34 @@ impl<T: Task + Sync> Worker<T> {
         err
     )]
     pub async fn process_next_task(&self) -> Result<Option<TaskId>> {
-        let mut tx = self.queue.pool.begin().await?;
-
-        let Some(in_progress_task) = self.queue.dequeue(&mut tx).await? else {
+        let Some(in_progress_task) = self.queue.dequeue().await? else {
             return Ok(None);
         };
 
         let task_id = in_progress_task.id;
         tracing::Span::current().record("task.id", task_id.as_hyphenated().to_string());
 
-        // Ensure that only one worker may process a task of a given concurrency key at
-        // a time.
-        if let Some(concurrency_key) = &in_progress_task.concurrency_key {
-            acquire_advisory_xact_lock(&mut *tx, concurrency_key).await?;
+        // Transaction scoped to the task execution.
+        let mut tx = self.queue.pool.begin().await?;
+
+        // Acquire an advisory lock on either the concurrency key or the task ID.
+        if !in_progress_task.try_acquire_lock(&mut tx).await? {
+            return Ok(None);
         }
 
         let input: T::Input = serde_json::from_value(in_progress_task.input.clone())?;
+
+        let heartbeat = pg_interval_to_span(&in_progress_task.heartbeat)
+            .try_into()
+            .expect("Task heartbeat should be compatible with std::time");
 
         let timeout = pg_interval_to_span(&in_progress_task.timeout)
             .try_into()
             .expect("Task timeout should be compatible with std::time");
 
+        // Execute savepoint, available directly to the task execute method.
         let execute_tx = tx.begin().await?;
+
         tokio::select! {
             result = self.task.execute(execute_tx, input) => {
                 match result {
@@ -746,6 +751,14 @@ impl<T: Task + Sync> Worker<T> {
                 }
             }
 
+            // Ensure that in-progress task rows report liveness at the provided interval.
+            _ = tokio::time::sleep(heartbeat) => {
+                tracing::trace!("Sending task heartbeat");
+                // N.B.: Heartbeats are recorded outside of the transaction to ensure visibility.
+                in_progress_task.record_heartbeat(&self.queue.pool).await?
+            },
+
+            // Handle timed-out task execution.
             _ = tokio::time::sleep(timeout) => {
                 tracing::error!("Task execution timed out");
                 let retry_policy = &in_progress_task.retry_policy;
@@ -925,15 +938,14 @@ mod tests {
         // Enqueue a task.
         let task = TestTask;
         queue.enqueue(&pool, &task, &()).await?;
-        let mut conn = pool.acquire().await?;
-        assert!(queue.dequeue(&mut conn).await?.is_some());
+        assert!(queue.dequeue().await?.is_some());
 
         // Process the task.
         let worker = Worker::new(queue.clone(), task);
         worker.process_next_task().await?;
 
         // Ensure the task is no longer available on the queue.
-        assert!(queue.dequeue(&mut conn).await?.is_none());
+        assert!(queue.dequeue().await?.is_none());
 
         Ok(())
     }

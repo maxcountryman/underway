@@ -432,6 +432,47 @@ pub trait Task: Send + 'static {
         Span::new()
     }
 
+    /// Specifies interval on which the task's heartbeat timestamp should be
+    /// updated.
+    ///
+    /// This is used by workers to update the task row with the current
+    /// timestamp. Doing so makes it possible to detect tasks that may have
+    /// become stuck, for example because a worker crashed or otherwise
+    /// didn't exit cleanly.
+    ///
+    /// The default is 30 seconds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use jiff::{Span, ToSpan};
+    /// use sqlx::{Postgres, Transaction};
+    /// use underway::{task::Result as TaskResult, Task};
+    ///
+    /// struct LivelyTask;
+    ///
+    /// impl Task for LivelyTask {
+    ///     type Input = ();
+    ///     type Output = ();
+    ///
+    ///     async fn execute(
+    ///         &self,
+    ///         _tx: Transaction<'_, Postgres>,
+    ///         _input: Self::Input,
+    ///     ) -> TaskResult<Self::Output> {
+    ///         Ok(())
+    ///     }
+    ///
+    ///     // Set the heartbeat interval to 1 second.
+    ///     fn heartbeat(&self) -> Span {
+    ///         1.second()
+    ///     }
+    /// }
+    /// ```
+    fn heartbeat(&self) -> Span {
+        30.seconds()
+    }
+
     /// Provides an optional concurrency key for the task.
     ///
     /// Concurrency keys are used to limit how many tasks of a specific type are
