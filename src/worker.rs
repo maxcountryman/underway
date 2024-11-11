@@ -728,6 +728,7 @@ impl<T: Task + Sync> Worker<T> {
         let heartbeat = pg_interval_to_span(&in_progress_task.heartbeat)
             .try_into()
             .expect("Task heartbeat should be compatible with std::time");
+        let mut heartbeat_interval = tokio::time::interval(heartbeat);
 
         let timeout = pg_interval_to_span(&in_progress_task.timeout)
             .try_into()
@@ -735,6 +736,26 @@ impl<T: Task + Sync> Worker<T> {
 
         // Execute savepoint, available directly to the task execute method.
         let execute_tx = tx.begin().await?;
+
+        // Spawn a task to send heartbeats alongside task processing.
+        tokio::spawn({
+            let pool = self.queue.pool.clone();
+            let in_progress_task = in_progress_task.clone();
+            async move {
+                heartbeat_interval.tick().await;
+                loop {
+                    tracing::trace!("Recording task heartbeat");
+
+                    // N.B.: Heartbeats are recorded outside of the transaction to ensure
+                    // visibility.
+                    if let Err(err) = in_progress_task.record_heartbeat(&pool).await {
+                        tracing::error!(err = %err, "Failed to record task heartbeat");
+                    };
+
+                    heartbeat_interval.tick().await;
+                }
+            }
+        });
 
         tokio::select! {
             result = self.task.execute(execute_tx, input) => {
@@ -750,13 +771,6 @@ impl<T: Task + Sync> Worker<T> {
                     }
                 }
             }
-
-            // Ensure that in-progress task rows report liveness at the provided interval.
-            _ = tokio::time::sleep(heartbeat) => {
-                tracing::trace!("Sending task heartbeat");
-                // N.B.: Heartbeats are recorded outside of the transaction to ensure visibility.
-                in_progress_task.record_heartbeat(&self.queue.pool).await?
-            },
 
             // Handle timed-out task execution.
             _ = tokio::time::sleep(timeout) => {
