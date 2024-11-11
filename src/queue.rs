@@ -798,12 +798,12 @@ impl<T: Task> Queue<T> {
         sqlx::query!(
             r#"
             insert into underway.task_schedule (
-              name,
+              task_queue_name,
               schedule,
               timezone,
               input
             ) values ($1, $2, $3, $4)
-            on conflict (name) do update
+            on conflict (task_queue_name) do update
             set 
               schedule = excluded.schedule,
               timezone = excluded.timezone,
@@ -883,7 +883,7 @@ impl<T: Task> Queue<T> {
         sqlx::query!(
             r#"
             delete from underway.task_schedule
-            where name = $1
+            where task_queue_name = $1
             "#,
             self.name,
         )
@@ -903,7 +903,7 @@ impl<T: Task> Queue<T> {
     {
         let Some(schedule_row) = sqlx::query!(
             r#"
-            select schedule, timezone, input from underway.task_schedule where name = $1
+            select schedule, timezone, input from underway.task_schedule where task_queue_name = $1
             limit 1
             "#,
             self.name,
@@ -2214,7 +2214,7 @@ mod tests {
         // Check the schedule was actually set
         let schedule_row = sqlx::query!(
             r#"
-            select schedule, timezone, input from underway.task_schedule where name = $1
+            select schedule, timezone, input from underway.task_schedule where task_queue_name = $1
             "#,
             "schedule"
         )
@@ -2256,7 +2256,7 @@ mod tests {
             r#"
             select schedule, timezone, input
             from underway.task_schedule 
-            where name = $1
+            where task_queue_name = $1
             "#,
             queue.name
         )
@@ -2330,7 +2330,9 @@ mod tests {
         // Check the schedule was actually set
         let schedule_row = sqlx::query!(
             r#"
-            select schedule from underway.task_schedule where name = $1
+            select schedule
+            from underway.task_schedule
+            where task_queue_name = $1
             "#,
             "schedule"
         )

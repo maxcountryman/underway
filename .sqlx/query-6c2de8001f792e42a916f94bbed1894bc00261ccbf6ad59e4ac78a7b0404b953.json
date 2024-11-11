@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            select schedule, timezone, input\n            from underway.task_schedule \n            where name = $1\n            ",
+  "query": "\n            select schedule, timezone, input from underway.task_schedule where task_queue_name = $1\n            ",
   "describe": {
     "columns": [
       {
@@ -30,5 +30,5 @@
       false
     ]
   },
-  "hash": "ff45d5a6d9d8b7bc40a52aa2e471a0e665607fd01725a866c3dca0b21f25b0cb"
+  "hash": "6c2de8001f792e42a916f94bbed1894bc00261ccbf6ad59e4ac78a7b0404b953"
 }
