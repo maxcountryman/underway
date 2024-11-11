@@ -2662,4 +2662,44 @@ mod tests {
 
         Ok(())
     }
+
+    #[sqlx::test]
+    async fn dequeue_stale_task(pool: PgPool) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("dequeue_stale_task")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let task_id = queue.enqueue(&pool, &TestTask, &json!("{}")).await?;
+
+        assert!(
+            queue.dequeue().await?.is_some(),
+            "A task should be dequeued"
+        );
+
+        assert!(
+            queue.dequeue().await?.is_none(),
+            "No tasks should be dequeued since task is in-progress and not stale"
+        );
+
+        // Set a stale heartbeat.
+        sqlx::query!(
+            r#"
+            update underway.task
+            set last_heartbeat_at = now() - interval '30 seconds'
+            where id = $1
+            "#,
+            task_id as TaskId
+        )
+        .execute(&pool)
+        .await?;
+
+        assert!(
+            queue.dequeue().await?.is_some(),
+            "A stale task should be dequeued"
+        );
+
+        Ok(())
+    }
 }
