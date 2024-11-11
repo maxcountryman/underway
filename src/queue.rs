@@ -978,7 +978,7 @@ impl<T: Task> Queue<T> {
 /// manage state transitions as they process the task. In fact, all valid state
 /// transitions are encapsulated by it and this is the only interface through
 /// which task state should be altered.
-#[derive(Debug, sqlx::FromRow)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct InProgressTask {
     pub(crate) id: TaskId,
     pub(crate) queue_name: String,
