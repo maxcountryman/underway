@@ -274,6 +274,8 @@ impl<T: Task> Scheduler<T> {
         // TODO: Handle updates to schedules?
 
         for next in zoned_schedule.iter() {
+            tracing::debug!(?next, "Waiting until next scheduled task enqueue");
+
             tokio::select! {
                 notify_shutdown = shutdown_listener.recv() => {
                     match notify_shutdown {
@@ -291,7 +293,6 @@ impl<T: Task> Scheduler<T> {
                 }
 
                 _ = wait_until(&next) => {
-                    tracing::debug!(?next, "Waiting until next scheduled task enqueue");
                     self.process_next_schedule(&input).await?
                 }
             }
