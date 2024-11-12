@@ -32,3 +32,4 @@ tokio-util = "0.7.12"
 
 [dev-dependencies]
 futures = "0.3.30"
+tokio = { version = "1.40.0", features = ["test-util"] }
