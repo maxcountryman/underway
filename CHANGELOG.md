@@ -4,8 +4,9 @@
 - Breaking: Migrations have been reworked to compensate for features that will land in `sqlx` 0.9.0 #44
 - Breaking: Job enqueues now return an `EnqueuedJob` type #46
 - Breaking: Task ID is now a newtype #47
-- Breaking: Task dequeues are now encapsulated such that they are visible as they're being processed #55
+- Breaking: Task dequeues are now encapsulated such that they are visible as they're being processed #55, #59, #60
 - Breaking: Task schedule "name" column renamed to "task_queue_name" for consistency #58
+- Breaking: Scheduler iterator has been refactored to use `Zoned` directly #62
 - Task attempts are now recorded in a separate table, providing a complete log of task execution history #50
 
 # 0.0.6
