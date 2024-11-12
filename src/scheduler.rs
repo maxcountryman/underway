@@ -374,7 +374,8 @@ impl ZonedSchedule {
             .expect("iana_name should always be Some because new ensures valid time zone")
     }
 
-    /// Returns an iterator over the scheduled durations.
+    /// Returns an iterator of `Zoned` where each is a time at which the
+    /// schedule should fire.
     pub fn iter(&self) -> ZonedScheduleIterator {
         ZonedScheduleIterator {
             upcoming: self.schedule.upcoming(self.timezone.clone()),
