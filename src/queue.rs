@@ -3,10 +3,14 @@
 //! Tasks are enqueued onto the queue, using the [`Queue::enqueue`] method, and
 //! later dequeued, using the [`Queue::dequeue`] method, when they're executed.
 //!
+//! Each queue is identified by a unique name and manages a specific
+//! implementation of `Task`. In other words, a given queue always manages
+//! exactly one kind of task and only that kind of task.
+//!
 //! The semantics for retrieving a task from the queue are defined by the order
 //! of insertion, first-in, first-out (FIFO), or the priority the task defines.
-//! If a priority is defined, then it's considered before the order the task was
-//! inserted.
+//! If a priority is defined, then priority is considered before the order the
+//! task was inserted.
 //!
 //! # Dead-letter queues
 //!
@@ -106,14 +110,23 @@
 //! // Enqueue the task.
 //! queue.enqueue(&pool, &task, &()).await?;
 //!
-//! let mut tx = pool.begin().await?;
-//! if let Some(task) = queue.dequeue().await? {
+//! // Retrieve an available task for processing.
+//! if let Some(in_progress_task) = queue.dequeue().await? {
 //!     // Process the task here
 //! }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! # });
 //! # }
 //! ```
+//!
+//! Note that dequeuing a task will set its state to "in-progress" and create an
+//! associated attempt row. Once dequeued in this manner, the state of the
+//! in-progress task must be managed through the [`InProgressTask`] interface.
+//! In particular, the task should eventually reach a terminal state.
+//!
+//! Only tasks which are in the "pending" state or are otherwise considered
+//! stale (i.e. they have not updated their heartbeat within the expected time
+//! frame) and with remaining retries can be dequeued.
 //!
 //! # Scheduling tasks
 //!
