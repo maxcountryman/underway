@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            select delay \n            from underway.task\n            where id = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "delay",
+        "type_info": "Interval"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "1174e23b60bd4457c8a8e01f7c94b6f0bda5f2e586e7bb2b6ff3edc7d7d02648"
+}

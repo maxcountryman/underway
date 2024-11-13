@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            select timeout \n            from underway.task\n            where id = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "timeout",
+        "type_info": "Interval"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "4ff1463f0b262754a66e35e3b55037d9da622cb38961924d38f4c87fbcf1b169"
+}
