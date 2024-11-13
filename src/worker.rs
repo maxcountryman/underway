@@ -6,11 +6,16 @@
 //! input to an invocation of its execute method.
 //!
 //! As a task is being processed, the worker will assign various state
-//! transitions to the task. Eventually the task will either be completed or
-//! failed.
+//! transitions to the task. Eventually the task will either succeed or fail.
 //!
 //! Also note that workers retry failed tasks in accordance with their
-//! configured retry policies.
+//! configured retry policies. When a task has remaining retries, it will be
+//! requeued in a "pending" state.
+//!
+//! To ensure that only a single worker can process a task at a time, a
+//! [transaction-level advisory lock][advisory-locks] is held over either the
+//! task ID or concurrency key, if one is provided. In the case of the latter,
+//! this ensures a serial processing property of the task.
 //!
 //! # Running workers
 //!
@@ -116,6 +121,8 @@
 //!
 //! For cases where it's unimportant to wait for tasks to complete, this routine
 //! can be ignored.
+//!
+//! [advisory-locks]: https://www.postgresql.org/docs/current/explicit-locking.html#ADVISORY-LOCKS
 
 use std::{sync::Arc, time::Duration};
 
