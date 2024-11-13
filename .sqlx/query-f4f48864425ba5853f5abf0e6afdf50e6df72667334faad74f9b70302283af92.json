@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            select heartbeat \n            from underway.task\n            where id = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "heartbeat",
+        "type_info": "Interval"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "f4f48864425ba5853f5abf0e6afdf50e6df72667334faad74f9b70302283af92"
+}

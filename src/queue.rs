@@ -527,6 +527,7 @@ impl<T: Task> Queue<T> {
 
         let retry_policy = task.retry_policy();
         let timeout = task.timeout();
+        let heartbeat = task.heartbeat();
         let ttl = task.ttl();
         let concurrency_key = task.concurrency_key();
         let priority = task.priority();
@@ -540,17 +541,19 @@ impl<T: Task> Queue<T> {
               task_queue_name,
               input,
               timeout,
+              heartbeat,
               ttl,
               delay,
               retry_policy,
               concurrency_key,
               priority
-            ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             "#,
-            id as _,
+            id as TaskId,
             self.name,
             input_value,
             StdDuration::try_from(timeout)? as _,
+            StdDuration::try_from(heartbeat)? as _,
             StdDuration::try_from(ttl)? as _,
             StdDuration::try_from(delay)? as _,
             retry_policy as RetryPolicy,
@@ -1698,7 +1701,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::{collections::HashSet, path::PathBuf};
 
     use serde_json::json;
     use sqlx::{Postgres, Transaction};
@@ -1799,6 +1802,350 @@ mod tests {
 
         assert_eq!(in_progress_task.concurrency_key, task.concurrency_key());
         assert_eq!(in_progress_task.priority, task.priority());
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn enqueue_task_with_retry(pool: PgPool) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("test_enqueue_with_retry")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        struct MyCustomRetryTask;
+
+        impl Task for MyCustomRetryTask {
+            type Input = ();
+            type Output = ();
+
+            async fn execute(
+                &self,
+                _tx: Transaction<'_, Postgres>,
+                _input: Self::Input,
+            ) -> TaskResult<Self::Output> {
+                Ok(())
+            }
+
+            // Specify our own retry policy for the task.
+            fn retry_policy(&self) -> RetryPolicy {
+                RetryPolicy::builder()
+                    .max_attempts(20)
+                    .initial_interval_ms(2_500)
+                    .max_interval_ms(300_000)
+                    .backoff_coefficient(1.5)
+                    .build()
+            }
+        }
+        let task_id = queue.enqueue(&pool, &MyCustomRetryTask, &()).await?;
+
+        let in_progress_task = sqlx::query!(
+            r#"
+            select retry_policy as "retry_policy: RetryPolicy" 
+            from underway.task
+            where id = $1
+            "#,
+            task_id as TaskId
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        // Ensure the retry policy was set
+        assert_eq!(in_progress_task.retry_policy.max_attempts, 20);
+        assert_eq!(in_progress_task.retry_policy.initial_interval_ms, 2_500);
+        assert_eq!(in_progress_task.retry_policy.max_interval_ms, 300_000);
+        assert_eq!(in_progress_task.retry_policy.backoff_coefficient, 1.5);
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn enqueue_task_with_timeout(pool: PgPool) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("test_enqueue_with_timeout")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        struct MyImpatientTask;
+
+        impl Task for MyImpatientTask {
+            type Input = ();
+            type Output = ();
+
+            async fn execute(
+                &self,
+                _tx: Transaction<'_, Postgres>,
+                _input: Self::Input,
+            ) -> TaskResult<Self::Output> {
+                Ok(())
+            }
+
+            fn timeout(&self) -> Span {
+                1.second()
+            }
+        }
+
+        let task_id = queue.enqueue(&pool, &MyImpatientTask, &()).await?;
+
+        let in_progress_task = sqlx::query!(
+            r#"
+            select timeout 
+            from underway.task
+            where id = $1
+            "#,
+            task_id as TaskId
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        // Ensure the timeout was set
+        assert_eq!(
+            pg_interval_to_span(&in_progress_task.timeout).compare(1.second())?,
+            std::cmp::Ordering::Equal
+        );
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn enqueue_task_with_ttl(pool: PgPool) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("test_enqueue_with_ttl")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        struct MyLongLivedTask;
+
+        impl Task for MyLongLivedTask {
+            type Input = ();
+            type Output = ();
+
+            async fn execute(
+                &self,
+                _tx: Transaction<'_, Postgres>,
+                _input: Self::Input,
+            ) -> TaskResult<Self::Output> {
+                Ok(())
+            }
+
+            fn ttl(&self) -> Span {
+                15.days()
+            }
+        }
+
+        let task_id = queue.enqueue(&pool, &MyLongLivedTask, &()).await?;
+
+        let in_progress_task = sqlx::query!(
+            r#"
+            select ttl 
+            from underway.task
+            where id = $1
+            "#,
+            task_id as TaskId
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        // Ensure the TTL was set
+        assert_eq!(
+            pg_interval_to_span(&in_progress_task.ttl).compare(15.days())?,
+            std::cmp::Ordering::Equal
+        );
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn enqueue_task_with_delay(pool: PgPool) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("test_enqueue_with_delay")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        struct MyDelayedTask;
+
+        impl Task for MyDelayedTask {
+            type Input = ();
+            type Output = ();
+
+            async fn execute(
+                &self,
+                _tx: Transaction<'_, Postgres>,
+                _input: Self::Input,
+            ) -> TaskResult<Self::Output> {
+                Ok(())
+            }
+
+            fn delay(&self) -> Span {
+                1.hour()
+            }
+        }
+        let task_id = queue.enqueue(&pool, &MyDelayedTask, &()).await?;
+
+        let in_progress_task = sqlx::query!(
+            r#"
+            select delay 
+            from underway.task
+            where id = $1
+            "#,
+            task_id as TaskId
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        // Ensure the delay was set
+        assert_eq!(
+            pg_interval_to_span(&in_progress_task.delay).compare(1.hour())?,
+            std::cmp::Ordering::Equal
+        );
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn enqueue_task_with_heartbeat(pool: PgPool) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("test_enqueue_with_heartbeat")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        struct MyLivelyTask;
+
+        impl Task for MyLivelyTask {
+            type Input = ();
+            type Output = ();
+
+            async fn execute(
+                &self,
+                _tx: Transaction<'_, Postgres>,
+                _input: Self::Input,
+            ) -> TaskResult<Self::Output> {
+                Ok(())
+            }
+
+            fn heartbeat(&self) -> Span {
+                1.second()
+            }
+        }
+        let task_id = queue.enqueue(&pool, &MyLivelyTask, &()).await?;
+
+        let in_progress_task = sqlx::query!(
+            r#"
+            select heartbeat 
+            from underway.task
+            where id = $1
+            "#,
+            task_id as TaskId
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        // Ensure the heartbeat was set
+        assert_eq!(
+            pg_interval_to_span(&in_progress_task.heartbeat).compare(1.second())?,
+            std::cmp::Ordering::Equal
+        );
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn enqueue_task_with_concurrency_key(pool: PgPool) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("enqueue_task_with_concurrency_key")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        struct MyUniqueTask(PathBuf);
+
+        impl Task for MyUniqueTask {
+            type Input = ();
+            type Output = ();
+
+            async fn execute(
+                &self,
+                _tx: Transaction<'_, Postgres>,
+                _input: Self::Input,
+            ) -> TaskResult<Self::Output> {
+                Ok(())
+            }
+
+            // Use the path buf as our concurrency key.
+            fn concurrency_key(&self) -> Option<String> {
+                Some(self.0.display().to_string())
+            }
+        }
+        let task_id = queue
+            .enqueue(&pool, &MyUniqueTask(PathBuf::from("/foo/bar")), &())
+            .await?;
+
+        let in_progress_task = sqlx::query!(
+            r#"
+            select concurrency_key
+            from underway.task
+            where id = $1
+            "#,
+            task_id as TaskId
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        // Ensure the concurrency key was set
+        assert_eq!(
+            in_progress_task.concurrency_key,
+            Some("/foo/bar".to_string())
+        );
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn enqueue_task_with_priority(pool: PgPool) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("enqueue_task_with_priority")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        struct MyHighPriorityTask;
+
+        impl Task for MyHighPriorityTask {
+            type Input = ();
+            type Output = ();
+
+            async fn execute(
+                &self,
+                _tx: Transaction<'_, Postgres>,
+                _input: Self::Input,
+            ) -> TaskResult<Self::Output> {
+                Ok(())
+            }
+
+            fn priority(&self) -> i32 {
+                10
+            }
+        }
+        let task_id = queue.enqueue(&pool, &MyHighPriorityTask, &()).await?;
+
+        let in_progress_task = sqlx::query!(
+            r#"
+            select priority
+            from underway.task
+            where id = $1
+            "#,
+            task_id as TaskId
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        // Ensure the priority was set
+        assert_eq!(in_progress_task.priority, 10);
 
         Ok(())
     }
