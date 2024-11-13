@@ -900,7 +900,10 @@ pub(crate) fn pg_interval_to_span(
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration as StdDuration};
+    use std::{
+        sync::Arc,
+        time::{Duration as StdDuration, Instant},
+    };
 
     use sqlx::{PgPool, Postgres, Transaction};
     use tokio::sync::Mutex;
@@ -1094,6 +1097,132 @@ mod tests {
 
         // Succeeded count remains the same since workers have been shutdown
         assert_eq!(succeeded, Some(5));
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn heartbeat_stops_after_task_completion(pool: PgPool) -> sqlx::Result<(), Error> {
+        // Define a task that sleeps for a short duration
+        struct SleepTask;
+
+        impl Task for SleepTask {
+            type Input = ();
+            type Output = ();
+
+            async fn execute(
+                &self,
+                _: Transaction<'_, Postgres>,
+                _: Self::Input,
+            ) -> TaskResult<Self::Output> {
+                // Simulate work by sleeping
+                tokio::time::sleep(StdDuration::from_secs(5)).await;
+                Ok(())
+            }
+
+            fn heartbeat(&self) -> Span {
+                1.second()
+            }
+        }
+
+        let queue = Queue::builder()
+            .name("heartbeat_stops_after_task_completion")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        // Enqueue the sleep task
+        let task_id = queue.enqueue(&pool, &SleepTask, &()).await?;
+
+        // Start the worker
+        let worker = Worker::new(queue.clone(), SleepTask);
+        let worker_handle = tokio::spawn(async move { worker.run_every(1.second()).await });
+
+        // Ensure the worker has time to dequeue the task
+        tokio::time::sleep(StdDuration::from_secs(1)).await;
+
+        // Monitor last_heartbeat_at during task execution
+        let mut last_heartbeat_at = None;
+        let start_time = Instant::now();
+
+        while start_time.elapsed() < StdDuration::from_secs(6) {
+            // Fetch last_heartbeat_at from the database
+            let task_row = sqlx::query!(
+                r#"
+                select last_heartbeat_at as "last_heartbeat_at: i64"
+                from underway.task
+                where id = $1
+                  and task_queue_name = $2
+                "#,
+                task_id as TaskId,
+                queue.name
+            )
+            .fetch_one(&pool)
+            .await?;
+
+            let current_heartbeat = task_row
+                .last_heartbeat_at
+                .expect("A heartbeat should be set");
+
+            if let Some(prev_heartbeat) = last_heartbeat_at {
+                // Ensure last_heartbeat_at is being updated
+                assert!(current_heartbeat > prev_heartbeat);
+            }
+            last_heartbeat_at = Some(current_heartbeat);
+
+            // Sleep before the next check
+            tokio::time::sleep(StdDuration::from_secs(1)).await;
+        }
+
+        // Wait for the task to complete
+        worker_handle.abort(); // Ensure the worker task is stopped
+
+        // Record the last heartbeat timestamp after task completion
+        let final_task_row = sqlx::query!(
+            r#"
+            select last_heartbeat_at as "last_heartbeat_at: i64"
+            from underway.task
+            where id = $1
+            "#,
+            task_id as TaskId
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        // Wait for a duration longer than the heartbeat interval
+        tokio::time::sleep(StdDuration::from_secs(2)).await;
+
+        // Check if last_heartbeat_at has not been updated after task completion
+        let post_completion_task_row = sqlx::query!(
+            r#"
+            select last_heartbeat_at as "last_heartbeat_at: i64"
+            from underway.task
+            where id = $1
+            "#,
+            task_id as TaskId
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        // Assert that last_heartbeat_at did not change after task completion
+        assert_eq!(
+            final_task_row.last_heartbeat_at,
+            post_completion_task_row.last_heartbeat_at
+        );
+
+        // Confirm that the task has succeeded
+        let task_state = sqlx::query_scalar!(
+            r#"
+            select state as "state: TaskState"
+            from underway.task
+            where id = $1
+            "#,
+            task_id as TaskId
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(task_state, TaskState::Succeeded);
 
         Ok(())
     }
