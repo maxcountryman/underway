@@ -963,12 +963,24 @@ mod tests {
 
         // Enqueue a task.
         let task = TestTask;
-        queue.enqueue(&pool, &task, &()).await?;
-        assert!(queue.dequeue().await?.is_some());
+        let task_id = queue.enqueue(&pool, &task, &()).await?;
 
         // Process the task.
         let worker = Worker::new(queue.clone(), task);
-        worker.process_next_task().await?;
+        let processed_task_id = worker
+            .process_next_task()
+            .await?
+            .expect("A task should be processed");
+        assert_eq!(task_id, processed_task_id);
+
+        // Check that the task was processed successfully.
+        let task_row = sqlx::query!(
+            r#"select state as "state: TaskState" from underway.task where id = $1"#,
+            task_id as TaskId
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(task_row.state, TaskState::Succeeded);
 
         // Ensure the task is no longer available on the queue.
         assert!(queue.dequeue().await?.is_none());
@@ -979,7 +991,7 @@ mod tests {
     #[sqlx::test]
     async fn process_retries(pool: PgPool) -> sqlx::Result<(), Error> {
         let queue = Queue::builder()
-            .name("retry_test_queue")
+            .name("process_retries")
             .pool(pool.clone())
             .build()
             .await?;
@@ -997,7 +1009,11 @@ mod tests {
         for retries in 0..3 {
             let delay = task.retry_policy().calculate_delay(retries);
             tokio::time::sleep(delay.try_into()?).await;
-            worker.process_next_task().await?;
+            let processed_task_id = worker
+                .process_next_task()
+                .await?
+                .expect("A task should be processed");
+            assert_eq!(task_id, processed_task_id);
         }
 
         // Verify that the fail_times counter has reached zero
@@ -1011,7 +1027,7 @@ mod tests {
             from underway.task
             where id = $1
             "#,
-            task_id as _
+            task_id as TaskId
         )
         .fetch_one(&pool)
         .await?;
