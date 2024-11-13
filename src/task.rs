@@ -449,9 +449,9 @@ pub trait Task: Send + 'static {
     /// use sqlx::{Postgres, Transaction};
     /// use underway::{task::Result as TaskResult, Task};
     ///
-    /// struct LivelyTask;
+    /// struct MyLivelyTask;
     ///
-    /// impl Task for LivelyTask {
+    /// impl Task for MyLivelyTask {
     ///     type Input = ();
     ///     type Output = ();
     ///
@@ -534,9 +534,9 @@ pub trait Task: Send + 'static {
     /// use sqlx::{Postgres, Transaction};
     /// use underway::{task::Result as TaskResult, Task};
     ///
-    /// struct HighPriorityTask;
+    /// struct MyHighPriorityTask;
     ///
-    /// impl Task for HighPriorityTask {
+    /// impl Task for MyHighPriorityTask {
     ///     type Input = ();
     ///     type Output = ();
     ///
