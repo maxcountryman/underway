@@ -778,13 +778,9 @@ impl<T: Task + Sync> Worker<T> {
                 let retry_policy = &in_progress_task.retry_policy;
                 self.handle_task_timeout(&mut tx, &in_progress_task, retry_policy, timeout).await?;
             }
-
-            // Select the heartbeat task so that it'll be cancelled after execution or timeout.
-            _ = heartbeat_task => {
-                tracing::error!("Heartbeat task failed unexpectedly (this is a critical error!)");
-            }
-
         }
+
+        heartbeat_task.abort();
 
         tx.commit().await?;
 
