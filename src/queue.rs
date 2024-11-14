@@ -660,13 +660,14 @@ impl<T: Task> Queue<T> {
         let in_progress_task = sqlx::query_as!(
             InProgressTask,
             r#"
-            with selected_task as (
+            with available_task as (
                 select id
                 from underway.task
                 where task_queue_name = $1
                   and (
+                      -- Find pending tasks...
                       state = $2
-                      -- See if there are any available stalled tasks.
+                      -- ...Or look for stalled tasks.
                       or (
                           state = $3
                           -- Has heartbeat stalled?
@@ -688,14 +689,14 @@ impl<T: Task> Queue<T> {
                 limit 1
                 for update skip locked
             )
-            update underway.task
+            update underway.task t
             set state = $3,
                 last_attempt_at = now(),
                 last_heartbeat_at = now()
-            from selected_task
-            where underway.task.id = selected_task.id
+            from available_task
+            where t.id = available_task.id
             returning
-                underway.task.id as "id: TaskId",
+                t.id as "id: TaskId",
                 task_queue_name as "queue_name",
                 input,
                 timeout,
