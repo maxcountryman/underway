@@ -1,7 +1,7 @@
 [package]
 name = "underway"
 description = "⏳ Durable step functions via Postgres"
-version = "0.0.6"
+version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 keywords = ["background-jobs", "job-queue", "work-queue", "sqlx", "web"]
