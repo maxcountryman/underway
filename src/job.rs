@@ -906,6 +906,7 @@ impl<T: Task> EnqueuedJob<T> {
             from underway.task
             where input->>'job_id' = $1
               and state = $2
+            for update skip locked
             "#,
             self.id.to_string(),
             TaskState::Pending as TaskState
