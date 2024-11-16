@@ -676,8 +676,8 @@ impl<T: Task> Queue<T> {
                           and (retry_policy).max_attempts > (
                               select count(*)
                               from underway.task_attempt
-                              where task_id = id
-                                and task_queue_name = $1
+                              where task_queue_name = $1
+                                and task_id = id
                           )
                       )
                   )
