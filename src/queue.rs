@@ -363,7 +363,7 @@ impl<T: Task> Queue<T> {
     /// to the task and returned upon successful enqueue.
     ///
     /// **Note:** If you pass a transactional executor and the transaction is
-    /// rolled back, the returned tasl ID will not correspond to any persisted
+    /// rolled back, the returned task ID will not correspond to any persisted
     /// task.
     ///
     /// # Errors
@@ -569,7 +569,7 @@ impl<T: Task> Queue<T> {
     /// Dequeues the next available task.
     ///
     /// This method uses the `FOR UPDATE SKIP LOCKED` clause to ensure efficient
-    /// retrievial of pending task rows.
+    /// retrieval of pending task rows.
     ///
     /// If an available task is found, it's marked as "in progress".
     ///

@@ -10,7 +10,7 @@
 //!
 //! Also note that workers retry failed tasks in accordance with their
 //! configured retry policies. When a task has remaining retries, it will be
-//! requeued in a "pending" state.
+//! re-enqueued in a "pending" state.
 //!
 //! To ensure that only a single worker can process a task at a time, a
 //! [transaction-level advisory lock][advisory-locks] is held over either the
@@ -648,7 +648,7 @@ impl<T: Task + Sync> Worker<T> {
     /// Processes the next available task in the queue.
     ///
     /// When a task is found, its execute method will be invoked with the
-    /// deqeued input.
+    /// dequeued input.
     ///
     /// If the execution exceeds the task's timeout then the execute future is
     /// cancelled. This can also result in the task being marked failed if its

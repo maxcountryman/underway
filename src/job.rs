@@ -251,7 +251,7 @@
 //! # Atomicity
 //!
 //! Apart from state, context also provides another useful field: a transaction
-//! that's shared wtih the worker.
+//! that's shared with the worker.
 //!
 //! Access to this transaction means we can make updates to the database that
 //! are only visible if the execution itself succeeds and the transaction is
@@ -293,7 +293,7 @@
 //! # Retry policies
 //!
 //! Steps being tasks also have associated retry policies. This policy inherits
-//! the default but can be providied for each step.
+//! the default but can be provided for each step.
 //!
 //! ```rust
 //! use serde::{Deserialize, Serialize};
@@ -487,7 +487,7 @@
 //! # }
 //! ```
 //!
-//! # Runnning jobs
+//! # Running jobs
 //!
 //! Jobs are run via workers and schedulers, where the former processes tasks
 //! and the latter processes schedules for enqueuing tasks. Starting both is
@@ -1415,7 +1415,7 @@ where
         worker.run().await
     }
 
-    /// Contructs a worker which then immediately runs schedule processing.
+    /// Constructs a worker which then immediately runs schedule processing.
     ///
     /// # Errors
     ///

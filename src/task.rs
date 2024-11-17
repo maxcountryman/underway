@@ -575,7 +575,7 @@ pub enum State {
     /// Execute cancelled.
     Cancelled,
 
-    /// Execute completed unsucessfully.
+    /// Execute completed unsuccessfully.
     Failed,
 }
 
