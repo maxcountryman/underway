@@ -262,7 +262,47 @@
 //! tasks, and when found, try to invoke the task's execute routine.
 //!
 //! See [`worker`] for more details about workers.
-
+//!
+//! ## Strata
+//!
+//! The Underway system is split into a **lower-level** and a **higher-level**
+//! system, where the latter is the **job** abstraction and the former is
+//! everything else. More specifically the lower-level components are the
+//! **queue**, **worker**, **scheduler**, and **task**. The locus of the
+//! composite system is the task, with all components being built with or around
+//! it.
+//!
+//! ```text
+//!                        ╭───────────────╮
+//!                        │      Job      │
+//!                        │  (impl Task)  │
+//!                        ╰───────────────╯
+//!                                ┆
+//!                                ▼
+//!                        ╭───────────────╮
+//!                     ┏━━│     Queue     │◀━┓
+//!                     ┃  ╰───────────────╯  ┃
+//!  ╭───────────────╮  ┃          ◊          ┃  ╭───────────────╮
+//!  │    Worker     │◀━┩          │          ┡━━│   Scheduler   │
+//!  ╰───────────────╯  │  ╭───────────────╮  │  ╰───────────────╯
+//!                     └─▶│     Task      │◀─┘
+//!                        ╰───────────────╯
+//! ```
+//!
+//! These components are designed to promote clear [separation of
+//! concerns][SoC], with each having a well-defined purpose and clear boundary
+//! in relationship to the other components.
+//!
+//! For example, queues manage task life cycle, encapsulating state transitions
+//! and persisiting the task's canonical state in the database. Whereas workers
+//! and schedulers interface with the queue to process tasks or enqueue tasks
+//! for execution, respectively.
+//!
+//! At the uppermost layer, jobs are built on top of this subsystem, and are an
+//! implementation of the `Task` trait. Put another way, the lower-level system
+//! is unawre of the concept of a "job" and treats it like any other task.
+//!
+//! [SoC]: https://en.wikipedia.org/wiki/Separation_of_concerns
 #![warn(clippy::all, nonstandard_style, future_incompatible, missing_docs)]
 
 use sqlx::{migrate::Migrator, Acquire, Postgres};
