@@ -1,5 +1,9 @@
 # Unreleased
 
+# 0.1.1
+
+- Fix: Job cancellation should lock rows to be cancelled #67
+
 # 0.1.0
 
 - Breaking: Worker and scheduler setters have been renamed #42
