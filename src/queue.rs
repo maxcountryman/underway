@@ -676,8 +676,8 @@ impl<T: Task> Queue<T> {
                           and (retry_policy).max_attempts > (
                               select count(*)
                               from underway.task_attempt
-                              where task_id = id
-                                and task_queue_name = $1
+                              where task_queue_name = $1
+                                and task_id = id
                           )
                       )
                   )
@@ -694,15 +694,16 @@ impl<T: Task> Queue<T> {
                 last_attempt_at = now(),
                 last_heartbeat_at = now()
             from available_task
-            where t.id = available_task.id
+            where t.task_queue_name = $1
+              and t.id = available_task.id
             returning
                 t.id as "id: TaskId",
-                task_queue_name as "queue_name",
-                input,
-                timeout,
-                heartbeat,
-                retry_policy as "retry_policy: RetryPolicy",
-                concurrency_key
+                t.task_queue_name as "queue_name",
+                t.input,
+                t.timeout,
+                t.heartbeat,
+                t.retry_policy as "retry_policy: RetryPolicy",
+                t.concurrency_key
             "#,
             self.name,
             TaskState::Pending as TaskState,
