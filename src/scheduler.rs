@@ -254,6 +254,7 @@ impl<T: Task> Scheduler<T> {
     /// # });
     /// # }
     /// ```
+    #[instrument(skip(self), fields(queue.name = self.queue.name), err)]
     pub async fn run(&self) -> Result {
         let conn = self.queue.pool.acquire().await?;
         let Some(_guard) = try_acquire_advisory_lock(conn, &self.queue_lock).await? else {
@@ -301,15 +302,7 @@ impl<T: Task> Scheduler<T> {
         Ok(())
     }
 
-    #[instrument(
-        skip_all,
-        fields(
-            queue.name = self.queue.name,
-            task.id = tracing::field::Empty,
-            until_next
-        ),
-        err
-    )]
+    #[instrument(skip_all, fields(task.id = tracing::field::Empty), err)]
     async fn process_next_schedule(&self, input: &T::Input) -> Result {
         let task_id = self
             .queue
