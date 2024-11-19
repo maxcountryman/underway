@@ -501,6 +501,7 @@ impl<T: Task + Sync> Worker<T> {
     /// # });
     /// # }
     /// ```
+    #[instrument(skip(self), fields(queue.name = self.queue.name), err)]
     pub async fn run_every(&self, period: Span) -> Result {
         let mut polling_interval = tokio::time::interval(period.try_into()?);
 
@@ -610,6 +611,13 @@ impl<T: Task + Sync> Worker<T> {
         Ok(())
     }
 
+    #[instrument(
+        skip_all,
+        fields(
+            processing = processing_tasks.len(),
+            permits = concurrency_limit.available_permits()
+        )
+    )]
     async fn trigger_task_processing(
         &self,
         concurrency_limit: Arc<Semaphore>,
