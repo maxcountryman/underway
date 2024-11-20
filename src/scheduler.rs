@@ -257,7 +257,7 @@ impl<T: Task> Scheduler<T> {
     #[instrument(skip(self), fields(queue.name = self.queue.name), err)]
     pub async fn run(&self) -> Result {
         let conn = self.queue.pool.acquire().await?;
-        let Some(_guard) = try_acquire_advisory_lock(conn, &self.queue_lock).await? else {
+        let Some(guard) = try_acquire_advisory_lock(conn, &self.queue_lock).await? else {
             tracing::debug!("Scheduler could not acquire lock, exiting");
             return Ok(());
         };
@@ -290,6 +290,7 @@ impl<T: Task> Scheduler<T> {
                 }
 
                 _ = self.shutdown_token.cancelled() => {
+                    guard.release_now().await?;
                     break
                 }
 
