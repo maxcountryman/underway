@@ -1,5 +1,10 @@
 # Unreleased
 
+
+# 0.1.2
+
+- Provide additional worker and scheduler tracing instrumentation
+
 # 0.1.1
 
 - Fix: Job cancellation should lock rows to be cancelled #67
