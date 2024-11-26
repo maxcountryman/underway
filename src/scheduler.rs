@@ -258,7 +258,7 @@ impl<T: Task> Scheduler<T> {
     pub async fn run(&self) -> Result {
         let conn = self.queue.pool.acquire().await?;
         let Some(guard) = try_acquire_advisory_lock(conn, &self.queue_lock).await? else {
-            tracing::debug!("Scheduler could not acquire lock, exiting");
+            tracing::trace!("Scheduler could not acquire lock, exiting");
             return Ok(());
         };
 
