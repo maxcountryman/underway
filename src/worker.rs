@@ -560,7 +560,7 @@ impl<T: Task + Sync> Worker<T> {
     async fn handle_shutdown(&self, processing_tasks: &mut JoinSet<()>) -> Result {
         let task_timeout = self.task.timeout();
 
-        tracing::info!(
+        tracing::debug!(
             task.timeout = ?task_timeout,
             "Waiting for all processing tasks or timeout"
         );
@@ -624,7 +624,7 @@ impl<T: Task + Sync> Worker<T> {
         processing_tasks: &mut JoinSet<()>,
     ) {
         let Ok(permit) = concurrency_limit.try_acquire_owned() else {
-            tracing::debug!("Concurrency limit reached");
+            tracing::trace!("Concurrency limit reached");
             return;
         };
 
@@ -860,7 +860,7 @@ impl<T: Task + Sync> Worker<T> {
         retry_count: RetryCount,
         retry_policy: &RetryPolicy,
     ) -> Result {
-        tracing::info!("Retry policy available, scheduling retry");
+        tracing::debug!("Retry policy available, scheduling retry");
 
         let delay = retry_policy.calculate_delay(retry_count);
         in_progress_task.retry_after(&mut *conn, delay).await?;
@@ -873,7 +873,7 @@ impl<T: Task + Sync> Worker<T> {
         conn: &mut PgConnection,
         in_progress_task: &InProgressTask,
     ) -> Result {
-        tracing::info!("Retry policy exhausted, handling failed task");
+        tracing::debug!("Retry policy exhausted, handling failed task");
 
         in_progress_task.mark_failed(&mut *conn).await?;
 
