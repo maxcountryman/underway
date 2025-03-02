@@ -572,7 +572,7 @@ impl<T: Task> Queue<T> {
         fields(queue.name = self.name, task.id = tracing::field::Empty),
         err
     )]
-    async fn enqueue_multi<'a, E>(
+    pub async fn enqueue_multi<'a, E>(
         &self,
         executor: E,
         task: &T,
@@ -2060,6 +2060,57 @@ mod tests {
             }
         }
         let task_id = queue.enqueue(&pool, &MyDelayedTask, &()).await?;
+
+        let in_progress_task = sqlx::query!(
+            r#"
+            select delay
+            from underway.task
+            where id = $1
+            "#,
+            task_id as TaskId
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        // Ensure the delay was set
+        assert_eq!(
+            pg_interval_to_span(&in_progress_task.delay).compare(1.hour())?,
+            std::cmp::Ordering::Equal
+        );
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn enqueue_multi_with_delay(pool: PgPool) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("test_enqueue_multi")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        struct MyDelayedTask;
+
+        impl Task for MyDelayedTask {
+            type Input = ();
+            type Output = ();
+
+            async fn execute(
+                &self,
+                _tx: Transaction<'_, Postgres>,
+                _input: Self::Input,
+            ) -> TaskResult<Self::Output> {
+                Ok(())
+            }
+
+            fn delay(&self) -> Span {
+                1.hour()
+            }
+        }
+        let [task_id] = queue
+            .enqueue_multi(&pool, &MyDelayedTask, &[()])
+            .await?
+            .as_slice();
 
         let in_progress_task = sqlx::query!(
             r#"
