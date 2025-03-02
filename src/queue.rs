@@ -581,19 +581,15 @@ impl<T: Task> Queue<T> {
     where
         E: PgExecutor<'a>,
     {
-        let (ids, input_values, delays) = inputs.iter().try_fold(
-            (
-                Vec::with_capacity(inputs.len()),
-                Vec::with_capacity(inputs.len()),
-                Vec::with_capacity(inputs.len()),
-            ),
-            |(mut ids, mut input_values, delays), input| {
-                ids.push(TaskId::new());
-                input_values.push(serde_json::to_value(input)?);
-                delays.push(StdDuration::try_from(task.delay())?);
-                Ok((ids, input_values, delays))
-            },
-        )?;
+        let mut ids = Vec::with_capacity(inputs.len());
+        let mut input_values = Vec::with_capacity(inputs.len());
+        let mut delays = Vec::with_capacity(inputs.len());
+
+        for input in inputs {
+            ids.push(TaskId::new());
+            input_values.push(serde_json::to_value(input)?);
+            delays.push(StdDuration::try_from(task.delay())?);
+        }
 
         let timeout = task.timeout();
         let heartbeat = task.heartbeat();
@@ -630,9 +626,9 @@ impl<T: Task> Queue<T> {
             concurrency_key,
             priority,
 
-            ids,
-            input_values,
-            delays,
+            &ids as _,
+            &input_values,
+            delays as _,
         )
         .execute(executor)
         .await?;
