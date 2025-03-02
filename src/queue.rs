@@ -568,7 +568,7 @@ impl<T: Task> Queue<T> {
 
     #[instrument(
         name = "enqueue",
-        skip(self, executor, task, input),
+        skip(self, executor, task, inputs),
         fields(queue.name = self.name, task.id = tracing::field::Empty),
         err
     )]
