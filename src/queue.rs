@@ -602,7 +602,8 @@ impl<T: Task> Queue<T> {
         let concurrency_key = task.concurrency_key();
         let priority = task.priority();
 
-        tracing::Span::current().record("task.id", id.as_hyphenated().to_string());
+        // what use here? dont trace?
+        //tracing::Span::current().record("task.id", id.as_hyphenated().to_string());
 
         sqlx::query!(
             r#"
