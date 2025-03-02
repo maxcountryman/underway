@@ -590,7 +590,7 @@ impl<T: Task> Queue<T> {
             |(mut ids, mut input_values, delays), input| {
                 ids.push(TaskId::new());
                 input_values.push(serde_json::to_value(input)?);
-                delays.push(task.delay());
+                delays.push(StdDuration::try_from(task.delay())?);
                 Ok((ids, input_values, delays))
             },
         )?;
