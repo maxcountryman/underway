@@ -2103,10 +2103,7 @@ mod tests {
                 1.hour()
             }
         }
-        let [task_id] = queue
-            .enqueue_multi(&pool, &MyDelayedTask, &[()])
-            .await?
-            .as_slice();
+        let task_ids = queue.enqueue_multi(&pool, &MyDelayedTask, &[()]).await?;
 
         let in_progress_task = sqlx::query!(
             r#"
@@ -2114,7 +2111,7 @@ mod tests {
             from underway.task
             where id = $1
             "#,
-            task_id as TaskId
+            task_ids[0] as TaskId
         )
         .fetch_one(&pool)
         .await?;
