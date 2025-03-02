@@ -566,6 +566,79 @@ impl<T: Task> Queue<T> {
         Ok(id)
     }
 
+    #[instrument(
+        name = "enqueue",
+        skip(self, executor, task, input),
+        fields(queue.name = self.name, task.id = tracing::field::Empty),
+        err
+    )]
+    async fn enqueue_multi<'a, E>(
+        &self,
+        executor: E,
+        task: &T,
+        inputs: &[T::Input],
+    ) -> Result<Vec<TaskId>>
+    where
+        E: PgExecutor<'a>,
+    {
+        let (ids, input_values, delays) = inputs.iter().try_fold(
+            (
+                Vec::with_capacity(inputs.len()),
+                Vec::with_capacity(inputs.len()),
+                Vec::with_capacity(inputs.len()),
+            ),
+            |(mut ids, mut input_values, delays), input| {
+                ids.push(TaskId::new());
+                input_values.push(serde_json::to_value(input)?);
+                delays.push(task.delay());
+                Ok((ids, input_values, delays))
+            },
+        )?;
+
+        let timeout = task.timeout();
+        let heartbeat = task.heartbeat();
+        let ttl = task.ttl();
+        let retry_policy = task.retry_policy();
+        let concurrency_key = task.concurrency_key();
+        let priority = task.priority();
+
+        tracing::Span::current().record("task.id", id.as_hyphenated().to_string());
+
+        sqlx::query!(
+            r#"
+            insert into underway.task (
+              id,
+              task_queue_name,
+              input,
+              timeout,
+              heartbeat,
+              ttl,
+              delay,
+              retry_policy,
+              concurrency_key,
+              priority
+            )
+            select t.id, $1 as task_queue_name, t.input, $2 as timeout, $3 as heartbeat, $4 as ttl, t.delay, $5 as retry_policy, $6 as concurrency_key, $7 as priority
+            from unnest($8::uuid[], $9::jsonb[], $10::interval[]) as t(id, input, delay)
+            "#,
+            self.name,
+            StdDuration::try_from(timeout)? as _,
+            StdDuration::try_from(heartbeat)? as _,
+            StdDuration::try_from(ttl)? as _,
+            retry_policy as RetryPolicy,
+            concurrency_key,
+            priority,
+
+            ids,
+            input_values,
+            delays,
+        )
+        .execute(executor)
+        .await?;
+
+        Ok(ids)
+    }
+
     /// Dequeues the next available task.
     ///
     /// This method uses the `FOR UPDATE SKIP LOCKED` clause to ensure efficient
@@ -750,10 +823,10 @@ impl<T: Task> Queue<T> {
                     task_queue_name,
                     state,
                     attempt_number
-                ) 
+                )
                 values (
-                    $1, 
-                    $2, 
+                    $1,
+                    $2,
                     $3,
                     (select attempt_number from next_attempt)
                 )
@@ -856,7 +929,7 @@ impl<T: Task> Queue<T> {
               input
             ) values ($1, $2, $3, $4)
             on conflict (task_queue_name) do update
-            set 
+            set
               schedule = excluded.schedule,
               timezone = excluded.timezone,
               input = excluded.input
@@ -1059,7 +1132,7 @@ impl InProgressTask {
                     and task_queue_name = $2
                   order by attempt_number desc
                   limit 1
-              ) 
+              )
             "#,
             self.id as TaskId,
             self.queue_name,
@@ -1114,7 +1187,7 @@ impl InProgressTask {
                     and state < $4
                   order by attempt_number desc
                   limit 1
-              ) 
+              )
             "#,
             self.id as TaskId,
             self.queue_name,
@@ -1168,7 +1241,7 @@ impl InProgressTask {
                     and task_queue_name = $2
                   order by attempt_number desc
                   limit 1
-              ) 
+              )
             "#,
             self.id as TaskId,
             self.queue_name,
@@ -1223,7 +1296,7 @@ impl InProgressTask {
                     and task_queue_name = $2
                   order by attempt_number desc
                   limit 1
-              ) 
+              )
             "#,
             self.id as TaskId,
             self.queue_name,
@@ -1241,8 +1314,8 @@ impl InProgressTask {
             r#"
             update underway.task
             set updated_at = now()
-            where id = $1 
-              and task_queue_name = $2 
+            where id = $1
+              and task_queue_name = $2
             "#,
             self.id as TaskId,
             self.queue_name,
@@ -1274,7 +1347,7 @@ impl InProgressTask {
                     and task_queue_name = $2
                   order by attempt_number desc
                   limit 1
-              ) 
+              )
             "#,
             self.id as TaskId,
             self.queue_name,
@@ -1844,7 +1917,7 @@ mod tests {
 
         let in_progress_task = sqlx::query!(
             r#"
-            select retry_policy as "retry_policy: RetryPolicy" 
+            select retry_policy as "retry_policy: RetryPolicy"
             from underway.task
             where id = $1
             "#,
@@ -1893,7 +1966,7 @@ mod tests {
 
         let in_progress_task = sqlx::query!(
             r#"
-            select timeout 
+            select timeout
             from underway.task
             where id = $1
             "#,
@@ -1942,7 +2015,7 @@ mod tests {
 
         let in_progress_task = sqlx::query!(
             r#"
-            select ttl 
+            select ttl
             from underway.task
             where id = $1
             "#,
@@ -1990,7 +2063,7 @@ mod tests {
 
         let in_progress_task = sqlx::query!(
             r#"
-            select delay 
+            select delay
             from underway.task
             where id = $1
             "#,
@@ -2038,7 +2111,7 @@ mod tests {
 
         let in_progress_task = sqlx::query!(
             r#"
-            select heartbeat 
+            select heartbeat
             from underway.task
             where id = $1
             "#,
@@ -2654,7 +2727,7 @@ mod tests {
         let schedule_row = sqlx::query!(
             r#"
             select schedule, timezone, input
-            from underway.task_schedule 
+            from underway.task_schedule
             where task_queue_name = $1
             "#,
             queue.name
