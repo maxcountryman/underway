@@ -2102,7 +2102,9 @@ mod tests {
                 1.hour()
             }
         }
-        let task_ids = queue.enqueue_multi(&pool, &MyDelayedTask, &[()]).await?;
+        let task_ids = queue
+            .enqueue_multi(&pool, &MyDelayedTask, &[(), (), ()])
+            .await?;
 
         let in_progress_task = sqlx::query!(
             r#"
@@ -2114,6 +2116,8 @@ mod tests {
         )
         .fetch_one(&pool)
         .await?;
+
+        assert_eq!(3, task_ids.len());
 
         // Ensure the delay was set
         assert_eq!(
