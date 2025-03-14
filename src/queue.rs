@@ -566,7 +566,8 @@ impl<T: Task> Queue<T> {
         Ok(id)
     }
 
-    /// Enqueues tasks in batches (max 5000 per batch) within a single transaction.
+    /// Enqueues tasks in batches (max 5000 per batch) within a single
+    /// transaction.
     ///
     /// # Example
     ///
