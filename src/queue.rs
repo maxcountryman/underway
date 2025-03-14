@@ -566,6 +566,56 @@ impl<T: Task> Queue<T> {
         Ok(id)
     }
 
+    /// Enqueues tasks in batches (max 5000 per batch) within a single transaction.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::{PgPool, Transaction, Postgres};
+    /// # use underway::{Task, task::Result as TaskResult};
+    /// # use underway::Queue;
+    ///
+    /// # struct ExampleTask;
+    /// # impl Task for ExampleTask {
+    /// #     type Input = ();
+    /// #     type Output = ();
+    /// #     async fn execute(
+    /// #         &self,
+    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: Self::Input,
+    /// #     ) -> TaskResult<Self::Output> {
+    /// #         Ok(())
+    /// #     }
+    /// # }
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # /*
+    /// let pool = { /* A `PgPool`. */ };
+    /// # */
+    /// # let queue = Queue::builder()
+    /// #     .name("example")
+    /// #     .pool(pool.clone())
+    /// #     .build()
+    /// #     .await?;
+    /// # /*
+    /// let queue = { /* A `Queue`. */ };
+    /// # */
+    /// # let task = ExampleTask;
+    /// # /*
+    /// let task = { /* An implementer of `Task`. */ };
+    /// # */
+    /// #
+    ///
+    /// // Enqueue a new task with input after five minutes.
+    /// let _ = queue.enqueue_multi(&pool, &task, &[(), ()]).await?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
+
     #[instrument(
         name = "enqueue_multi",
         skip(self, executor, task, inputs),
@@ -577,19 +627,13 @@ impl<T: Task> Queue<T> {
         executor: E,
         task: &T,
         inputs: &[T::Input],
-    ) -> Result<Vec<TaskId>>
+    ) -> Result<usize>
     where
-        E: PgExecutor<'a>,
+        E: PgExecutor<'a> + sqlx::Acquire<'a, Database = sqlx::Postgres>,
     {
-        let mut ids = Vec::with_capacity(inputs.len());
-        let mut input_values = Vec::with_capacity(inputs.len());
-        let mut delays = Vec::with_capacity(inputs.len());
+        let tasks_number = inputs.len();
 
-        for input in inputs {
-            ids.push(TaskId::new());
-            input_values.push(serde_json::to_value(input)?);
-            delays.push(StdDuration::try_from(task.delay())?);
-        }
+        tracing::Span::current().record("tasks_numbers", tasks_number.to_string());
 
         let timeout = task.timeout();
         let heartbeat = task.heartbeat();
@@ -598,9 +642,20 @@ impl<T: Task> Queue<T> {
         let concurrency_key = task.concurrency_key();
         let priority = task.priority();
 
-        tracing::Span::current().record("tasks_numbers", inputs.len().to_string());
+        let mut tx = executor.begin().await?;
 
-        sqlx::query!(
+        for chunk in inputs.chunks(5000) {
+            let mut ids = Vec::with_capacity(chunk.len());
+            let mut input_values = Vec::with_capacity(chunk.len());
+            let mut delays = Vec::with_capacity(chunk.len());
+
+            for input in chunk {
+                ids.push(TaskId::new());
+                input_values.push(serde_json::to_value(input)?);
+                delays.push(StdDuration::try_from(task.delay())?);
+            }
+
+            sqlx::query!(
             r#"
             insert into underway.task (
               id,
@@ -629,10 +684,13 @@ impl<T: Task> Queue<T> {
             &input_values,
             delays as _,
         )
-        .execute(executor)
+        .execute(tx.as_mut())
         .await?;
+        }
 
-        Ok(ids)
+        tx.commit().await?;
+
+        Ok(tasks_number)
     }
 
     /// Dequeues the next available task.
@@ -2102,26 +2160,26 @@ mod tests {
                 1.hour()
             }
         }
-        let task_ids = queue
+        let tasks_number = queue
             .enqueue_multi(&pool, &MyDelayedTask, &[(), (), ()])
             .await?;
 
-        let in_progress_task = sqlx::query!(
+        assert_eq!(3, tasks_number);
+
+        let scheduled_tasks = sqlx::query!(
             r#"
             select delay
             from underway.task
-            where id = $1
-            "#,
-            task_ids[0] as TaskId
+            "#
         )
-        .fetch_one(&pool)
+        .fetch_all(&pool)
         .await?;
 
-        assert_eq!(3, task_ids.len());
+        assert_eq!(3, scheduled_tasks.len());
 
         // Ensure the delay was set
         assert_eq!(
-            pg_interval_to_span(&in_progress_task.delay).compare(1.hour())?,
+            pg_interval_to_span(scheduled_tasks[0].delay).compare(1.hour())?,
             std::cmp::Ordering::Equal
         );
 
