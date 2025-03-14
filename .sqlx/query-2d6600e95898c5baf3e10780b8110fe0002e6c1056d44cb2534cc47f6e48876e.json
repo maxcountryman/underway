@@ -1,0 +1,47 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            insert into underway.task (\n              id,\n              task_queue_name,\n              input,\n              timeout,\n              heartbeat,\n              ttl,\n              delay,\n              retry_policy,\n              concurrency_key,\n              priority\n            )\n            select t.id, $1 as task_queue_name, t.input, $2 as timeout, $3 as heartbeat, $4 as ttl, t.delay, $5 as retry_policy, $6 as concurrency_key, $7 as priority\n            from unnest($8::uuid[], $9::jsonb[], $10::interval[]) as t(id, input, delay)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Interval",
+        "Interval",
+        "Interval",
+        {
+          "Custom": {
+            "name": "underway.task_retry_policy",
+            "kind": {
+              "Composite": [
+                [
+                  "max_attempts",
+                  "Int4"
+                ],
+                [
+                  "initial_interval_ms",
+                  "Int4"
+                ],
+                [
+                  "max_interval_ms",
+                  "Int4"
+                ],
+                [
+                  "backoff_coefficient",
+                  "Float8"
+                ]
+              ]
+            }
+          }
+        },
+        "Text",
+        "Int4",
+        "UuidArray",
+        "JsonbArray",
+        "IntervalArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2d6600e95898c5baf3e10780b8110fe0002e6c1056d44cb2534cc47f6e48876e"
+}
