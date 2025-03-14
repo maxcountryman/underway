@@ -567,7 +567,7 @@ impl<T: Task> Queue<T> {
     }
 
     #[instrument(
-        name = "enqueue",
+        name = "enqueue_multi",
         skip(self, executor, task, inputs),
         fields(queue.name = self.name, task.id = tracing::field::Empty),
         err
@@ -598,8 +598,7 @@ impl<T: Task> Queue<T> {
         let concurrency_key = task.concurrency_key();
         let priority = task.priority();
 
-        // what use here? dont trace?
-        //tracing::Span::current().record("task.id", id.as_hyphenated().to_string());
+        tracing::Span::current().record("tasks_numbers", inputs.len().to_string());
 
         sqlx::query!(
             r#"
