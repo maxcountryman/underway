@@ -2180,7 +2180,7 @@ mod tests {
 
         // Ensure the delay was set
         assert_eq!(
-            pg_interval_to_span(scheduled_tasks[0].delay).compare(1.hour())?,
+            pg_interval_to_span(&scheduled_tasks[0].delay).compare(1.hour())?,
             std::cmp::Ordering::Equal
         );
 
