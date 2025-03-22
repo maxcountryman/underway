@@ -632,6 +632,28 @@ impl<T: Task> Queue<T> {
     where
         E: PgExecutor<'a> + sqlx::Acquire<'a, Database = sqlx::Postgres>,
     {
+        self.enqueue_multi_wth_chunk_size(executor, task, inputs, 5000)
+            .await
+    }
+
+    // Same as `enqueue_multi`, but allows you to specify `chunk_size`
+    //
+    #[instrument(
+        name = "enqueue_multi",
+        skip(self, executor, task, inputs),
+        fields(queue.name = self.name, task.id = tracing::field::Empty),
+        err
+    )]
+    pub async fn enqueue_multi_wth_chunk_size<'a, E>(
+        &self,
+        executor: E,
+        task: &T,
+        inputs: &[T::Input],
+        chunk_size: usize,
+    ) -> Result<usize>
+    where
+        E: PgExecutor<'a> + sqlx::Acquire<'a, Database = sqlx::Postgres>,
+    {
         let tasks_number = inputs.len();
 
         tracing::Span::current().record("tasks_numbers", tasks_number.to_string());
@@ -645,7 +667,7 @@ impl<T: Task> Queue<T> {
 
         let mut tx = executor.begin().await?;
 
-        for chunk in inputs.chunks(5000) {
+        for chunk in inputs.chunks(chunk_size) {
             let mut ids = Vec::with_capacity(chunk.len());
             let mut input_values = Vec::with_capacity(chunk.len());
             let mut delays = Vec::with_capacity(chunk.len());
