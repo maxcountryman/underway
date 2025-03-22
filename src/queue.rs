@@ -566,7 +566,7 @@ impl<T: Task> Queue<T> {
         Ok(id)
     }
 
-    /// Enqueues tasks in batches (max 5000 per batch) within a single
+    /// Enqueues tasks in chunks (max 5000 per batch) within a single
     /// transaction.
     ///
     /// # Example
@@ -616,7 +616,6 @@ impl<T: Task> Queue<T> {
     /// # });
     /// # }
     /// ```
-
     #[instrument(
         name = "enqueue_multi",
         skip(self, executor, task, inputs),
@@ -636,8 +635,8 @@ impl<T: Task> Queue<T> {
             .await
     }
 
-    // Same as `enqueue_multi`, but allows you to specify `chunk_size`
-    //
+    /// Same as `enqueue_multi`, but allows you to specify `chunk_size`
+    ///
     #[instrument(
         name = "enqueue_multi",
         skip(self, executor, task, inputs),
