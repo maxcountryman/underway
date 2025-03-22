@@ -636,7 +636,7 @@ impl<T: Task> Queue<T> {
     }
 
     /// Same as `enqueue_multi`, but allows you to specify `chunk_size`
-    ///
+
     #[instrument(
         name = "enqueue_multi",
         skip(self, executor, task, inputs),
