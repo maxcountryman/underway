@@ -933,7 +933,7 @@ where
     I: Sync + Send + 'static,
     S: Clone + Sync + Send + 'static,
 {
-    queue: JobQueue<I, S>,
+    pub(crate) queue: JobQueue<I, S>,
     steps: Arc<Vec<StepConfig<S>>>,
     state: S,
     current_index: Arc<AtomicUsize>,
@@ -3115,6 +3115,26 @@ mod tests {
 
         // Should return `false` since the job is already cancelled.
         assert!(!enqueued_job.cancel().await?);
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn into_worker_and_into_scheduler(pool: PgPool) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("into_worker_queue")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let job = Job::builder()
+            .step(|_cx, _: ()| async move { To::done() })
+            .queue(queue.clone())
+            .build();
+
+        // Ensure it compiles
+        let _: Worker<Job<(), ()>> = job.clone().into();
+        let _: Scheduler<Job<(), ()>> = job.into();
 
         Ok(())
     }
