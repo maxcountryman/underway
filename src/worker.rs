@@ -137,7 +137,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
 use crate::{
-    queue::{Error as QueueError, InProgressTask, Queue, SHUTDOWN_CHANNEL},
+    queue::{shutdown_channel, Error as QueueError, InProgressTask, Queue},
     task::{Error as TaskError, RetryCount, RetryPolicy, Task, TaskId},
 };
 pub(crate) type Result<T = ()> = std::result::Result<T, Error>;
@@ -507,7 +507,8 @@ impl<T: Task + Sync> Worker<T> {
 
         // Set up a listener for shutdown notifications
         let mut shutdown_listener = PgListener::connect_with(&self.queue.pool).await?;
-        shutdown_listener.listen(SHUTDOWN_CHANNEL).await?;
+        let chan = shutdown_channel();
+        shutdown_listener.listen(chan).await?;
 
         // Set up a listener for task change notifications
         let mut task_change_listener = PgListener::connect_with(&self.queue.pool).await?;
