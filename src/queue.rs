@@ -233,7 +233,7 @@
 //! # }
 //! ```
 
-use std::{borrow::Cow, marker::PhantomData, time::Duration as StdDuration};
+use std::{borrow::Cow, marker::PhantomData, sync::OnceLock, time::Duration as StdDuration};
 
 use builder_states::{Initial, NameSet, PoolSet};
 use jiff::{Span, ToSpan};
@@ -242,6 +242,7 @@ use sqlx::{
     Acquire, PgConnection, PgExecutor, PgPool, Postgres, Transaction,
 };
 use tracing::instrument;
+use uuid::Uuid;
 
 use crate::{
     task::{Error as TaskError, RetryPolicy, State as TaskState, Task, TaskId},
@@ -1828,7 +1829,11 @@ impl<T: Task> Builder<T, PoolSet> {
     }
 }
 
-pub(crate) const SHUTDOWN_CHANNEL: &str = "underway_shutdown";
+static SHUTDOWN_CHANNEL: OnceLock<String> = OnceLock::new();
+
+pub(crate) fn shutdown_channel() -> &'static str {
+    SHUTDOWN_CHANNEL.get_or_init(|| format!("underway_shutdown_{}", Uuid::new_v4()))
+}
 
 /// Initiates a graceful shutdown by sending a `NOTIFY` to the
 /// `underway_shutdown` channel via the `pg_notify` function.
@@ -1843,7 +1848,8 @@ pub async fn graceful_shutdown<'a, E>(executor: E) -> Result
 where
     E: PgExecutor<'a>,
 {
-    sqlx::query!("select pg_notify($1, $2)", SHUTDOWN_CHANNEL, "")
+    let chan = shutdown_channel();
+    sqlx::query!("select pg_notify($1, $2)", chan, "")
         .execute(executor)
         .await?;
 

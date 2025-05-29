@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
 use crate::{
-    queue::{try_acquire_advisory_lock, Error as QueueError, SHUTDOWN_CHANNEL},
+    queue::{shutdown_channel, try_acquire_advisory_lock, Error as QueueError},
     Queue, Task,
 };
 
@@ -270,7 +270,8 @@ impl<T: Task> Scheduler<T> {
 
         // Set up a listener for shutdown notifications
         let mut shutdown_listener = PgListener::connect_with(&self.queue.pool).await?;
-        shutdown_listener.listen(SHUTDOWN_CHANNEL).await?;
+        let chan = shutdown_channel();
+        shutdown_listener.listen(chan).await?;
 
         // TODO: Handle updates to schedules?
 
