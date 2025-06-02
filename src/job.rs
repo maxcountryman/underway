@@ -717,6 +717,25 @@ pub struct Context<S> {
     /// Put another way, this savepoint is derived from the same transaction
     /// that holds the lock on the underlying task row.
     pub tx: Transaction<'static, Postgres>,
+
+    /// Current index of the step being executed zero-based.
+    ///
+    /// In multi-step job definitions, this points to the current step the job
+    /// is processing currently.
+    pub step_index: usize,
+
+    /// Total steps count.
+    ///
+    /// The number of steps in this job definition.
+    pub step_count: usize,
+
+    /// This `JobId`.
+    pub job_id: JobId,
+
+    /// Queue name.
+    ///
+    /// Name of the queue the current step is currently running on.
+    pub queue_name: String,
 }
 
 type StepConfig<S> = (Box<dyn StepExecutor<S>>, RetryPolicy);
@@ -822,7 +841,7 @@ impl Future for JobHandle {
 /// tasks on the queue. This means that each task related to a job will have
 /// the same job ID.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
-pub(crate) struct JobId(Uuid);
+pub struct JobId(Uuid);
 
 impl JobId {
     fn new() -> Self {
@@ -1646,6 +1665,10 @@ where
         let cx = Context {
             state: self.state.clone(),
             tx: step_tx,
+            step_index,
+            job_id,
+            step_count: self.steps.len(),
+            queue_name: self.queue.name.clone(),
         };
 
         // Execute the step and handle any errors.
@@ -2643,6 +2666,31 @@ mod tests {
                 .parse()
                 .expect("A valid zoned scheduled should be provided")
         );
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn one_step_context_attributes(pool: PgPool) -> sqlx::Result<(), Error> {
+        let job = Job::builder()
+            .step(|ctx, _| async move {
+                assert_eq!(ctx.step_index, 0);
+                assert_eq!(ctx.step_count, 1);
+                assert_eq!(ctx.queue_name.as_str(), "one_step_context_attributes");
+                To::done()
+            })
+            .name("one_step_context_attributes")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        job.enqueue(&()).await?;
+        let worker = Worker::new(job.queue.clone(), job.clone());
+
+        // Process the first task.
+        let task_id = worker.process_next_task().await?;
+
+        assert!(task_id.is_some());
 
         Ok(())
     }
