@@ -9,7 +9,7 @@ use tracing::instrument;
 
 use crate::{
     queue::{shutdown_channel, try_acquire_advisory_lock, Error as QueueError},
-    Queue, Task,
+    Job, Queue, Task,
 };
 
 pub(crate) type Result<T = ()> = std::result::Result<T, Error>;
@@ -50,6 +50,17 @@ pub struct Scheduler<T: Task> {
 
     // When this token is cancelled the queue has been shutdown.
     shutdown_token: CancellationToken,
+}
+
+impl<I, S> From<Job<I, S>> for Scheduler<Job<I, S>>
+where
+    I: Sync + Send + 'static,
+    S: Clone + Send + Sync + 'static,
+{
+    fn from(job: Job<I, S>) -> Self {
+        let q = job.queue.clone();
+        Self::new(q, job.clone())
+    }
 }
 
 impl<T: Task> Scheduler<T> {
@@ -429,8 +440,10 @@ mod tests {
     use std::time::SystemTime;
 
     use jiff::ToSpan;
+    use sqlx::PgPool;
 
     use super::*;
+    use crate::To;
 
     #[test]
     fn zoned_schedule_creation_valid() {
@@ -526,5 +539,26 @@ mod tests {
             elapsed < StdDuration::from_millis(10),
             "Expected immediate return"
         );
+    }
+
+    #[sqlx::test]
+    async fn from_job(pool: PgPool) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("into_worker_queue")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let job = Job::builder()
+            .step(|_cx, _: ()| async move { To::done() })
+            .queue(queue.clone())
+            .build();
+
+        // Ensure it compiles
+        let s: Scheduler<Job<(), ()>> = Scheduler::from(job);
+
+        assert_eq!(s.queue.name, queue.name);
+
+        Ok(())
     }
 }

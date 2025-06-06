@@ -139,6 +139,7 @@ use tracing::instrument;
 use crate::{
     queue::{shutdown_channel, Error as QueueError, InProgressTask, Queue},
     task::{Error as TaskError, RetryCount, RetryPolicy, Task, TaskId},
+    Job,
 };
 pub(crate) type Result<T = ()> = std::result::Result<T, Error>;
 
@@ -188,6 +189,17 @@ impl<T: Task> Clone for Worker<T> {
             concurrency_limit: self.concurrency_limit,
             shutdown_token: self.shutdown_token.clone(),
         }
+    }
+}
+
+impl<I, S> From<Job<I, S>> for Worker<Job<I, S>>
+where
+    I: Sync + Send + 'static,
+    S: Clone + Send + Sync + 'static,
+{
+    fn from(job: Job<I, S>) -> Self {
+        let q = job.queue.clone();
+        Self::new(q, job.clone())
     }
 }
 
@@ -921,6 +933,7 @@ mod tests {
     use crate::{
         queue::graceful_shutdown,
         task::{Result as TaskResult, State as TaskState},
+        To,
     };
 
     struct TestTask;
@@ -1248,6 +1261,27 @@ mod tests {
         .await?;
 
         assert_eq!(task_state, TaskState::Succeeded);
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn from_job(pool: PgPool) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("into_worker_queue")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let job = Job::builder()
+            .step(|_cx, _: ()| async move { To::done() })
+            .queue(queue.clone())
+            .build();
+
+        // Ensure it compiles
+        let w: Worker<Job<(), ()>> = Worker::from(job);
+
+        assert_eq!(w.queue.name, queue.name);
 
         Ok(())
     }
