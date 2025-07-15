@@ -44,8 +44,9 @@ pub enum Error {
 ///
 /// [advisory-lock]: https://www.postgresql.org/docs/current/explicit-locking.html#ADVISORY-LOCKS
 pub struct Scheduler<T: Task> {
-    queue: Queue<T>,
+    queue: Arc<Queue<T>>,
     queue_lock: PgAdvisoryLock,
+
     task: Arc<T>,
 
     // When this token is cancelled the queue has been shutdown.
@@ -93,17 +94,18 @@ impl<T: Task> Scheduler<T> {
     /// # */
     /// #
     ///
-    /// Scheduler::new(queue, task);
+    /// Scheduler::new(queue.into(), task);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
     /// # }
     /// ```
-    pub fn new(queue: Queue<T>, task: T) -> Self {
+    pub fn new(queue: Arc<Queue<T>>, task: T) -> Self {
+        let task = Arc::new(task);
         let queue_lock = queue_scheduler_lock(&queue.name);
         Self {
             queue,
             queue_lock,
-            task: Arc::new(task),
+            task,
             shutdown_token: CancellationToken::new(),
         }
     }
@@ -140,7 +142,7 @@ impl<T: Task> Scheduler<T> {
     /// #    .build()
     /// #    .await?;
     /// # let task = ExampleTask;
-    /// # let mut scheduler = Scheduler::new(queue, task);
+    /// # let mut scheduler = Scheduler::new(queue.into(), task);
     /// # /*
     /// let mut scheduler = { /* A `Scheduler`. */ };
     /// # */
@@ -187,7 +189,7 @@ impl<T: Task> Scheduler<T> {
     /// #    .build()
     /// #    .await?;
     /// # let task = ExampleTask;
-    /// # let scheduler = Scheduler::new(queue, task);
+    /// # let scheduler = Scheduler::new(queue.into(), task);
     /// # /*
     /// let scheduler = { /* A `Scheduler`. */ };
     /// # */
@@ -242,7 +244,7 @@ impl<T: Task> Scheduler<T> {
     /// #    .build()
     /// #    .await?;
     /// # let task = ExampleTask;
-    /// # let scheduler = Scheduler::new(queue, task);
+    /// # let scheduler = Scheduler::new(queue.into(), task);
     /// # /*
     /// let scheduler = { /* A `Scheduler`. */ };
     /// # */

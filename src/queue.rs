@@ -134,9 +134,8 @@
 //! the scheduler can be run.
 //!
 //! As with task processing, jobs provide an interface for scheduling. For
-//! example, the [`schedule`](crate::Job::schedule) method along with
-//! [`run_scheduler`](crate::Job::run_scheduler) are often what you want to use.
-//! Use these to set the schedule and run the scheduler, respectively.
+//! example, the [`schedule`](crate::Job::schedule) method schedules the job.
+//! Once scheduled, a scheduler must be run to ensure exeuction.
 //!
 //! Of course it's also possible to interface directly with the queue to achieve
 //! the same if desired. Schedules can be set with the
@@ -180,7 +179,7 @@
 //! let task = { /* A type that implements `Task`. */ };
 //! # */
 //! # let task = MyTask;
-//! let scheduler = Scheduler::new(queue, task);
+//! let scheduler = Scheduler::new(queue.into(), task);
 //!
 //! // Run a scheduler based on our configured schedule.
 //! scheduler.run().await?;
