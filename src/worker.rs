@@ -58,7 +58,7 @@
 //! # let task = MyTask;
 //!
 //! // Create a new worker from the queue and task.
-//! let worker = Worker::new(queue, task);
+//! let worker = Worker::new(queue.into(), task);
 //!
 //! // Run the worker.
 //! worker.run().await?;
@@ -98,7 +98,7 @@
 //! #    .build()
 //! #    .await?;
 //! # let task = MyTask;
-//! # let worker = Worker::new(queue, task);
+//! # let worker = Worker::new(queue.into(), task);
 //! // Spin up a number of workers to process tasks concurrently.
 //! for _ in 0..4 {
 //!     let task_worker = worker.clone();
@@ -170,7 +170,7 @@ pub enum Error {
 /// A worker that's generic over the task it processes.
 #[derive(Debug)]
 pub struct Worker<T: Task> {
-    queue: Queue<T>,
+    queue: Arc<Queue<T>>,
     task: Arc<T>,
 
     // Limits the number of concurrent `Task::execute` invocations this worker will be allowed.
@@ -183,8 +183,8 @@ pub struct Worker<T: Task> {
 impl<T: Task> Clone for Worker<T> {
     fn clone(&self) -> Self {
         Self {
-            queue: self.queue.clone(),
-            task: self.task.clone(),
+            queue: Arc::clone(&self.queue),
+            task: Arc::clone(&self.task),
             concurrency_limit: self.concurrency_limit,
             shutdown_token: self.shutdown_token.clone(),
         }
@@ -232,15 +232,16 @@ impl<T: Task + Sync> Worker<T> {
     /// # */
     /// #
     ///
-    /// Worker::new(queue, task);
+    /// Worker::new(queue.into(), task);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
     /// # }
     /// ```
-    pub fn new(queue: Queue<T>, task: T) -> Self {
+    pub fn new(queue: Arc<Queue<T>>, task: T) -> Self {
+        let task = Arc::new(task);
         Self {
             queue,
-            task: Arc::new(task),
+            task,
             concurrency_limit: num_cpus::get(),
             shutdown_token: CancellationToken::new(),
         }
@@ -278,7 +279,7 @@ impl<T: Task + Sync> Worker<T> {
     /// #    .build()
     /// #    .await?;
     /// # let task = ExampleTask;
-    /// # let mut worker = Worker::new(queue, task);
+    /// # let mut worker = Worker::new(queue.into(), task);
     /// # /*
     /// let mut worker = { /* A `Worker`. */ };
     /// # */
@@ -326,7 +327,7 @@ impl<T: Task + Sync> Worker<T> {
     /// #    .build()
     /// #    .await?;
     /// # let task = ExampleTask;
-    /// # let mut worker = Worker::new(queue, task);
+    /// # let mut worker = Worker::new(queue.into(), task);
     /// # /*
     /// let mut worker = { /* A `Worker`. */ };
     /// # */
@@ -377,7 +378,7 @@ impl<T: Task + Sync> Worker<T> {
     /// #    .build()
     /// #    .await?;
     /// # let task = ExampleTask;
-    /// # let worker = Worker::new(queue, task);
+    /// # let worker = Worker::new(queue.into(), task);
     /// # /*
     /// let worker = { /* A `Worker`. */ };
     /// # */
@@ -436,7 +437,7 @@ impl<T: Task + Sync> Worker<T> {
     /// #    .build()
     /// #    .await?;
     /// # let task = ExampleTask;
-    /// # let worker = Worker::new(queue, task);
+    /// # let worker = Worker::new(queue.into(), task);
     /// # /*
     /// let worker = { /* A `Worker`. */ };
     /// # */
@@ -489,7 +490,7 @@ impl<T: Task + Sync> Worker<T> {
     /// #    .build()
     /// #    .await?;
     /// # let task = ExampleTask;
-    /// # let worker = Worker::new(queue, task);
+    /// # let worker = Worker::new(queue.into(), task);
     /// # /*
     /// let worker = { /* A `Worker`. */ };
     /// # */
@@ -704,7 +705,7 @@ impl<T: Task + Sync> Worker<T> {
     /// #    .build()
     /// #    .await?;
     /// # let task = ExampleTask;
-    /// # let worker = Worker::new(queue, task);
+    /// # let worker = Worker::new(queue.into(), task);
     /// # /*
     /// let worker = { /* A `Worker`. */ };
     /// # */
@@ -975,6 +976,7 @@ mod tests {
         let task_id = queue.enqueue(&pool, &task, &()).await?;
 
         // Process the task.
+        let queue = Arc::new(queue);
         let worker = Worker::new(queue.clone(), task);
         let processed_task_id = worker
             .process_next_task()
@@ -1009,6 +1011,7 @@ mod tests {
         let task = FailingTask {
             fail_times: fail_times.clone(),
         };
+        let queue = Arc::new(queue);
         let worker = Worker::new(queue.clone(), task.clone());
 
         // Enqueue the task
@@ -1071,6 +1074,7 @@ mod tests {
             .await?;
 
         // Start workers before queuing tasks
+        let queue = Arc::new(queue);
         let worker = Worker::new(queue.clone(), LongRunningTask);
         for _ in 0..2 {
             let worker = worker.clone();
@@ -1160,6 +1164,7 @@ mod tests {
         let task_id = queue.enqueue(&pool, &SleepTask, &()).await?;
 
         // Start the worker
+        let queue = Arc::new(queue);
         let worker = Worker::new(queue.clone(), SleepTask);
         let worker_handle = tokio::spawn(async move { worker.run_every(1.second()).await });
 

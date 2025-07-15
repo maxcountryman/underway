@@ -568,19 +568,15 @@
 //! # */
 //! #
 //!
-//! let queue = Queue::builder()
+//! let job = Job::builder()
+//!     .step(|_cx, _: ()| async move { To::done() })
 //!     .name("example-job")
 //!     .pool(pool)
 //!     .build()
 //!     .await?;
 //!
-//! let job = Job::builder()
-//!     .step(|_cx, _: ()| async move { To::done() })
-//!     .queue(queue.clone())
-//!     .build();
-//!
-//! let worker = Worker::new(queue.clone(), job.clone());
-//! let scheduler = Scheduler::new(queue, job);
+//! let worker = job.worker();
+//! let scheduler = job.scheduler();
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! # });
 //! # }
@@ -655,11 +651,11 @@ use uuid::Uuid;
 
 use crate::{
     queue::{Error as QueueError, InProgressTask, Queue},
-    scheduler::{Error as SchedulerError, Result as SchedulerResult, Scheduler, ZonedSchedule},
+    scheduler::{Error as SchedulerError, Scheduler, ZonedSchedule},
     task::{
         Error as TaskError, Result as TaskResult, RetryPolicy, State as TaskState, Task, TaskId,
     },
-    worker::{Error as WorkerError, Result as WorkerResult, Worker},
+    worker::{Error as WorkerError, Worker},
 };
 
 type Result<T = ()> = std::result::Result<T, Error>;
@@ -862,7 +858,7 @@ impl Deref for JobId {
 /// This handle allows for manipulating the state of the job in the queue.
 pub struct EnqueuedJob<T: Task> {
     id: JobId,
-    queue: Queue<T>,
+    queue: Arc<Queue<T>>,
 }
 
 impl<T: Task> EnqueuedJob<T> {
@@ -952,7 +948,7 @@ where
     I: Sync + Send + 'static,
     S: Clone + Sync + Send + 'static,
 {
-    queue: JobQueue<I, S>,
+    queue: Arc<JobQueue<I, S>>,
     steps: Arc<Vec<StepConfig<S>>>,
     state: S,
     current_index: Arc<AtomicUsize>,
@@ -1396,11 +1392,7 @@ where
         Ok(())
     }
 
-    /// Constructs a worker which then immediately runs task processing.
-    ///
-    /// # Errors
-    ///
-    /// This has the same error conditions as [`Worker::run`].
+    /// Returns this job's `Queue`.
     ///
     /// # Example
     ///
@@ -1423,23 +1415,15 @@ where
     /// # */
     /// #
     ///
-    /// job.run_worker().await?;
+    /// let job_queue = job.queue();
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
     /// # }
-    /// ```
-    pub async fn run_worker(self) -> WorkerResult {
-        let queue = self.queue.clone();
-        let job = self.clone();
-        let worker = Worker::new(queue, job);
-        worker.run().await
+    pub fn queue(&self) -> Arc<Queue<Self>> {
+        Arc::clone(&self.queue)
     }
 
-    /// Constructs a worker which then immediately runs schedule processing.
-    ///
-    /// # Errors
-    ///
-    /// This has the same error conditions as [`Scheduler::run`].
+    /// Creates a `Worker` for this job.
     ///
     /// # Example
     ///
@@ -1462,16 +1446,45 @@ where
     /// # */
     /// #
     ///
-    /// job.run_scheduler().await?;
+    /// let job_worker = job.worker();
+    /// job_worker.run().await?; // Run the worker directly.
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
     /// # }
-    /// ```
-    pub async fn run_scheduler(self) -> SchedulerResult {
-        let queue = self.queue.clone();
-        let job = self.clone();
-        let scheduler = Scheduler::new(queue, job);
-        scheduler.run().await
+    pub fn worker(&self) -> Worker<Self> {
+        Worker::new(self.queue(), self.clone())
+    }
+
+    /// Creates a `Scheduler` for this job.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::PgPool;
+    /// # use underway::{Job, To};
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # let job = Job::<(), _>::builder()
+    /// #     .step(|_cx, _| async move { To::done() })
+    /// #     .name("example")
+    /// #     .pool(pool)
+    /// #     .build()
+    /// #     .await?;
+    /// # /*
+    /// let job = { /* A `Job`. */ };
+    /// # */
+    /// #
+    ///
+    /// let job_scheduler = job.scheduler();
+    /// job_scheduler.run().await?; // Run the scheduler directly.
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    pub fn scheduler(&self) -> Scheduler<Self> {
+        Scheduler::new(self.queue(), self.clone())
     }
 
     /// Runs both a worker and scheduler for the job.
@@ -1508,12 +1521,9 @@ where
     /// # });
     /// # }
     /// ```
-    pub async fn run(self) -> Result {
-        let queue = self.queue.clone();
-        let job = self.clone();
-
-        let worker = Worker::new(queue.clone(), job.clone());
-        let scheduler = Scheduler::new(queue, job);
+    pub async fn run(&self) -> Result {
+        let worker = self.worker();
+        let scheduler = self.scheduler();
 
         let mut workers = JoinSet::new();
         workers.spawn(async move { worker.run().await.map_err(Error::from) });
@@ -1567,17 +1577,13 @@ where
     /// # });
     /// # }
     /// ```
-    pub fn start(self) -> JobHandle {
+    pub fn start(&self) -> JobHandle {
         let shutdown_token = CancellationToken::new();
         let mut workers = JoinSet::new();
 
-        let queue = self.queue.clone();
-        let job = self.clone();
-
-        let mut worker = Worker::new(queue.clone(), job.clone());
+        let mut worker = self.worker();
         worker.set_shutdown_token(shutdown_token.clone());
-
-        let mut scheduler = Scheduler::new(queue, job);
+        let mut scheduler = self.scheduler();
         scheduler.set_shutdown_token(shutdown_token.clone());
 
         // Spawn the tasks using `tokio::spawn` to decouple them from polling the
@@ -2261,7 +2267,7 @@ where
         } = self.builder_state;
         let queue = Queue::builder().name(queue_name).pool(pool).build().await?;
         Ok(Job {
-            queue,
+            queue: Arc::new(queue),
             steps: Arc::new(self.steps),
             state,
             current_index: Arc::new(AtomicUsize::new(0)),
@@ -2353,7 +2359,7 @@ where
     pub fn build(self) -> Job<I, S> {
         let QueueSet { state, queue } = self.builder_state;
         Job {
-            queue,
+            queue: Arc::new(queue),
             steps: Arc::new(self.steps),
             state,
             current_index: Arc::new(AtomicUsize::new(0)),
@@ -2685,7 +2691,7 @@ mod tests {
             .await?;
 
         job.enqueue(&()).await?;
-        let worker = Worker::new(job.queue.clone(), job.clone());
+        let worker = Worker::new(job.queue(), job);
 
         // Process the first task.
         let task_id = worker.process_next_task().await?;
@@ -2733,7 +2739,7 @@ mod tests {
             message: "Hello, world!".to_string(),
         };
         job.enqueue(&input).await?;
-        let worker = Worker::new(queue.clone(), job.clone());
+        let worker = Worker::new(job.queue(), job);
 
         // Process the first task.
         worker.process_next_task().await?;
@@ -2829,10 +2835,7 @@ mod tests {
         .await?;
 
         // Process the task to ensure the next task is enqueued.
-        let worker = {
-            let worker_job = job.clone();
-            Worker::new(queue.clone(), worker_job)
-        };
+        let worker = { Worker::new(job.queue(), job) };
         worker.process_next_task().await?;
 
         // Dequeue the second task.
@@ -2897,7 +2900,7 @@ mod tests {
             message: "Hello, world!".to_string(),
         };
         job.enqueue(&input).await?;
-        let worker = Worker::new(queue.clone(), job.clone());
+        let worker = Worker::new(job.queue(), job);
 
         // Process the first task.
         worker.process_next_task().await?;
@@ -2994,10 +2997,7 @@ mod tests {
         .await?;
 
         // Process the task to ensure the next task is enqueued.
-        let worker = {
-            let worker_job = job.clone();
-            Worker::new(queue.clone(), worker_job)
-        };
+        let worker = { Worker::new(job.queue(), job) };
         worker.process_next_task().await?;
 
         // Dequeue the second task.
