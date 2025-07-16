@@ -1,5 +1,7 @@
 # Unreleased
 
+# 0.2.0
+
 - Breaking: Queues are now stored and passed as `Arc<Queue<_>>`;
   `Worker::new` and `Scheduler::new` take `Arc<Queue<_>>` instead of `Queue<_>`. #100
 - Breaking: `Job::run_worker` and `Job::run_scheduler` have been removed. #100
