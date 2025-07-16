@@ -1,5 +1,13 @@
 # Unreleased
 
+- Breaking: Queues are now stored and passed as `Arc<Queue<_>>`;
+  `Worker::new` and `Scheduler::new` take `Arc<Queue<_>>` instead of `Queue<_>`. #100
+- Breaking: `Job::run_worker` and `Job::run_scheduler` have been removed. #100
+- Breaking: `Job::run` and `Job::start` now take `&self` rather than consuming `self`. #100
+- Fix: Shutdown channels are now unique. #97
+- Add: `Job::queue`, `Job::worker`, and `Job::scheduler` helpers for
+  zero‑boilerplate executor creation. #100
+- Add: `enqueue_multi` et al, allowing batched enqueue. #79
 
 # 0.1.2
 
