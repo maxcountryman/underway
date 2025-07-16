@@ -2691,10 +2691,9 @@ mod tests {
             .await?;
 
         job.enqueue(&()).await?;
-        let worker = Worker::new(job.queue(), job);
 
         // Process the first task.
-        let task_id = worker.process_next_task().await?;
+        let task_id = job.worker().process_next_task().await?;
 
         assert!(task_id.is_some());
 
@@ -2739,10 +2738,9 @@ mod tests {
             message: "Hello, world!".to_string(),
         };
         job.enqueue(&input).await?;
-        let worker = Worker::new(job.queue(), job);
 
         // Process the first task.
-        worker.process_next_task().await?;
+        job.worker().process_next_task().await?;
 
         // Inspect the second task.
         let pending_task = queue
@@ -2835,8 +2833,7 @@ mod tests {
         .await?;
 
         // Process the task to ensure the next task is enqueued.
-        let worker = { Worker::new(job.queue(), job) };
-        worker.process_next_task().await?;
+        job.worker().process_next_task().await?;
 
         // Dequeue the second task.
         let Some(dequeued_task) = queue.dequeue().await? else {
@@ -2900,10 +2897,9 @@ mod tests {
             message: "Hello, world!".to_string(),
         };
         job.enqueue(&input).await?;
-        let worker = Worker::new(job.queue(), job);
 
         // Process the first task.
-        worker.process_next_task().await?;
+        job.worker().process_next_task().await?;
 
         // Inspect the second task.
         let pending_task = queue
@@ -2997,8 +2993,7 @@ mod tests {
         .await?;
 
         // Process the task to ensure the next task is enqueued.
-        let worker = { Worker::new(job.queue(), job) };
-        worker.process_next_task().await?;
+        job.worker().process_next_task().await?;
 
         // Dequeue the second task.
         let Some(dequeued_task) = queue.dequeue().await? else {
