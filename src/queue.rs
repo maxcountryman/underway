@@ -1506,7 +1506,7 @@ impl InProgressTask {
         try_acquire_advisory_xact_lock(tx, &self.lock_key()).await
     }
 
-    fn lock_key(&self) -> Cow<str> {
+    fn lock_key(&self) -> Cow<'_, str> {
         match &self.concurrency_key {
             Some(concurrency_key) => Cow::Borrowed(concurrency_key),
             None => Cow::Owned(self.id.to_string()),

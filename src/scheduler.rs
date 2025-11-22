@@ -373,7 +373,7 @@ impl ZonedSchedule {
 
     /// Returns an iterator of `Zoned` where each is a time at which the
     /// schedule should fire.
-    pub fn iter(&self) -> ZonedScheduleIterator {
+    pub fn iter(&self) -> ZonedScheduleIterator<'_> {
         ZonedScheduleIterator {
             upcoming: self.schedule.upcoming(self.timezone.clone()),
         }
