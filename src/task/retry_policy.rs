@@ -1,4 +1,5 @@
 use jiff::{Span, ToSpan};
+use rand::Rng;
 
 /// Configuration of a policy for retries in case of task failure.
 ///
@@ -19,6 +20,7 @@ pub struct RetryPolicy {
     pub(crate) initial_interval_ms: i32,
     pub(crate) max_interval_ms: i32,
     pub(crate) backoff_coefficient: f64,
+    pub(crate) jitter_factor: f64,
 }
 
 pub(crate) type RetryCount = i32;
@@ -40,7 +42,8 @@ impl RetryPolicy {
     pub(crate) fn calculate_delay(&self, retry_count: RetryCount) -> Span {
         let base_delay = self.initial_interval_ms as f64;
         let backoff_delay = base_delay * self.backoff_coefficient.powi(retry_count - 1);
-        let delay = backoff_delay.min(self.max_interval_ms as f64) as i64;
+        let target_delay = backoff_delay.min(self.max_interval_ms as f64);
+        let delay=(target_delay * (1.0 - self.jitter_factor)+rand::thread_rng().gen_range(0.0..=(target_delay * self.jitter_factor))) as i64;
         delay.milliseconds()
     }
 }
@@ -50,6 +53,7 @@ const DEFAULT_RETRY_POLICY: RetryPolicy = RetryPolicy {
     initial_interval_ms: 1_000,
     max_interval_ms: 60_000,
     backoff_coefficient: 2.0,
+    jitter_factor: 0.5,
 };
 
 impl Default for RetryPolicy {
@@ -143,6 +147,26 @@ impl Builder {
     /// ```
     pub const fn backoff_coefficient(mut self, backoff_coefficient: f64) -> Self {
         self.inner.backoff_coefficient = backoff_coefficient;
+        self
+    }
+
+    /// The jitter_factor is a coefficient (typically between 0.0 and 1.0)
+    /// that determines what percentage of the backoff duration should
+    /// be randomized. It controls the balance between predictability
+    /// and collision avoidance.
+    ///
+    /// Default value is `0.5`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use underway::task::RetryPolicy;
+    ///
+    /// // Set a backoff coefficient of one point five.
+    /// let retry_policy_builder = RetryPolicy::builder().jitter_factor(0.5);
+    /// ```
+    pub const fn jitter_factor(mut self, jitter_factor: f64) -> Self {
+        self.inner.jitter_factor=jitter_factor;
         self
     }
 
