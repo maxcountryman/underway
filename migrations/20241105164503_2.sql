@@ -18,12 +18,13 @@ create type underway.task_retry_policy as (
     max_attempts         int,
     initial_interval_ms  int,
     max_interval_ms      int,
-    backoff_coefficient  float
+    backoff_coefficient  float,
+    jitter_factor        float
 );
 
 alter table underway.task
     add column if not exists retry_policy underway.task_retry_policy not null 
-    default row(5, 1000, 60000, 2.0)::underway.task_retry_policy;
+    default row(5, 1000, 60000, 2.0, 0.5)::underway.task_retry_policy;
 
 alter table underway.task
 add column if not exists completed_at timestamp with time zone;
