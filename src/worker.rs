@@ -133,6 +133,7 @@ use sqlx::{
     Acquire, PgConnection,
 };
 use tokio::{sync::Semaphore, task::JoinSet};
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
@@ -176,6 +177,9 @@ pub struct Worker<T: Task> {
     // Limits the number of concurrent `Task::execute` invocations this worker will be allowed.
     concurrency_limit: usize,
 
+    // Policy for reconnection backoff when PostgreSQL connection is lost.
+    reconnection_policy: RetryPolicy,
+
     // When this token is cancelled the queue has been shutdown.
     shutdown_token: CancellationToken,
 }
@@ -186,6 +190,7 @@ impl<T: Task> Clone for Worker<T> {
             queue: Arc::clone(&self.queue),
             task: Arc::clone(&self.task),
             concurrency_limit: self.concurrency_limit,
+            reconnection_policy: self.reconnection_policy,
             shutdown_token: self.shutdown_token.clone(),
         }
     }
@@ -243,6 +248,7 @@ impl<T: Task + Sync> Worker<T> {
             queue,
             task,
             concurrency_limit: num_cpus::get(),
+            reconnection_policy: RetryPolicy::default(),
             shutdown_token: CancellationToken::new(),
         }
     }
@@ -342,6 +348,68 @@ impl<T: Task + Sync> Worker<T> {
     /// ```
     pub fn set_shutdown_token(&mut self, shutdown_token: CancellationToken) {
         self.shutdown_token = shutdown_token;
+    }
+
+    /// Sets the reconnection policy for PostgreSQL connection failures.
+    ///
+    /// This policy controls how the worker retries connecting when the PostgreSQL
+    /// connection is lost. Uses exponential backoff to avoid overwhelming the database.
+    ///
+    /// Defaults to 1 second initial interval, 60 second max interval, 2.0 coefficient and 0.5 jitter_factor.
+    ///
+    /// **Note**: The `max_attempts` field is ignored for reconnection - the worker will
+    /// keep retrying until successful or until shutdown.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::{PgPool, Transaction, Postgres};
+    /// # use underway::{Task, task::Result as TaskResult, Queue, Worker};
+    /// use underway::task::RetryPolicy;
+    ///
+    /// # struct ExampleTask;
+    /// # impl Task for ExampleTask {
+    /// #     type Input = ();
+    /// #     type Output = ();
+    /// #     async fn execute(
+    /// #         &self,
+    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: Self::Input,
+    /// #     ) -> TaskResult<Self::Output> {
+    /// #         Ok(())
+    /// #     }
+    /// # }
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # let queue = Queue::builder()
+    /// #    .name("example")
+    /// #    .pool(pool.clone())
+    /// #    .build()
+    /// #    .await?;
+    /// # let task = ExampleTask;
+    /// # let mut worker = Worker::new(queue.into(), task);
+    /// # /*
+    /// let mut worker = { /* A `Worker`. */ };
+    /// # */
+    /// #
+    ///
+    /// // Set a custom reconnection policy using RetryPolicy.
+    /// let policy = RetryPolicy::builder()
+    ///     .initial_interval_ms(2_000)  // 2 seconds
+    ///     .max_interval_ms(60_000)      // 1 minute
+    ///     .backoff_coefficient(2.5)
+    ///     .jitter_factor(0.5)
+    ///     .build();
+    /// worker.set_reconnection_policy(policy);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
+    pub fn set_reconnection_policy(&mut self, reconnection_policy: RetryPolicy) {
+        self.reconnection_policy = reconnection_policy;
     }
 
     /// Cancels the shutdown token and begins a graceful shutdown of in-progress
@@ -505,58 +573,106 @@ impl<T: Task + Sync> Worker<T> {
     #[instrument(skip(self), fields(queue.name = self.queue.name), err)]
     pub async fn run_every(&self, period: Span) -> Result {
         let mut polling_interval = tokio::time::interval(period.try_into()?);
-
-        // Set up a listener for shutdown notifications
-        let mut shutdown_listener = PgListener::connect_with(&self.queue.pool).await?;
         let chan = shutdown_channel();
-        shutdown_listener.listen(chan).await?;
-
-        // Set up a listener for task change notifications
-        let mut task_change_listener = PgListener::connect_with(&self.queue.pool).await?;
-        task_change_listener.listen("task_change").await?;
-
         let concurrency_limit = Arc::new(Semaphore::new(self.concurrency_limit));
         let mut processing_tasks = JoinSet::new();
 
-        loop {
-            tokio::select! {
-                notify_shutdown = shutdown_listener.recv() => {
-                    match notify_shutdown {
-                        Ok(_) => {
-                            self.shutdown_token.cancel();
-                        },
+        let mut retry_count: RetryCount = 1;
 
-                        Err(err) => {
-                            tracing::error!(%err, "Postgres shutdown notification error");
+        // Outer loop: handle reconnection logic
+        'reconnect: loop {
+            // Compute current reconnect backoff
+            let reconnect_backoff_span = self.reconnection_policy.calculate_delay(retry_count);
+            let reconnect_backoff: Duration = reconnect_backoff_span.try_into()?;
+
+            // Try to establish shutdown listener connection
+            let mut shutdown_listener = match PgListener::connect_with(&self.queue.pool).await {
+                Ok(listener) => listener,
+                Err(err) => {
+                    tracing::error!(%err, backoff_secs = reconnect_backoff.as_secs(), 
+                        attempt = retry_count,
+                        "Failed to connect shutdown listener, retrying after backoff");
+                    sleep(reconnect_backoff).await;
+                    retry_count = retry_count.saturating_add(1);
+                    continue 'reconnect;
+                }
+            };
+
+            if let Err(err) = shutdown_listener.listen(chan).await {
+                tracing::error!(%err, backoff_secs = reconnect_backoff.as_secs(), 
+                    attempt = retry_count,
+                    "Failed to listen on shutdown channel, retrying after backoff");
+                sleep(reconnect_backoff).await;
+                retry_count = retry_count.saturating_add(1);
+                continue 'reconnect;
+            }
+
+            // Try to establish task change listener connection
+            let mut task_change_listener = match PgListener::connect_with(&self.queue.pool).await {
+                Ok(listener) => listener,
+                Err(err) => {
+                    tracing::error!(%err, backoff_secs = reconnect_backoff.as_secs(), 
+                        attempt = retry_count,
+                        "Failed to connect task change listener, retrying after backoff");
+                    sleep(reconnect_backoff).await;
+                    retry_count = retry_count.saturating_add(1);
+                    continue 'reconnect;
+                }
+            };
+
+            if let Err(err) = task_change_listener.listen("task_change").await {
+                tracing::error!(%err, backoff_secs = reconnect_backoff.as_secs(), 
+                    attempt = retry_count,
+                    "Failed to listen on task_change channel, retrying after backoff");
+                sleep(reconnect_backoff).await;
+                retry_count = retry_count.saturating_add(1);
+                continue 'reconnect;
+            }
+
+            // Connection succeeded, reset retry counter
+            tracing::info!("PostgreSQL listeners connected successfully");
+            retry_count = 1;
+
+            // Inner loop: handle normal events
+            loop {
+                tokio::select! {
+                    notify_shutdown = shutdown_listener.recv() => {
+                        match notify_shutdown {
+                            Ok(_) => {
+                                self.shutdown_token.cancel();
+                            },
+                            Err(err) => {
+                                tracing::warn!(%err, "Shutdown listener connection lost, reconnecting");
+                                continue 'reconnect;
+                            }
                         }
                     }
-                }
 
-                _ = self.shutdown_token.cancelled() => {
-                    self.handle_shutdown(&mut processing_tasks).await?;
-                    break
-                }
+                    _ = self.shutdown_token.cancelled() => {
+                        self.handle_shutdown(&mut processing_tasks).await?;
+                        return Ok(());
+                    }
 
-                // Listen for new pending tasks.
-                notify_task_change = task_change_listener.recv() => {
-                    match notify_task_change {
-                        Ok(task_change) => self.handle_task_change(task_change, concurrency_limit.clone(), &mut processing_tasks).await?,
-
-                        Err(err) => {
-                            tracing::error!(%err, "Postgres task change notification error");
+                    // Listen for new pending tasks
+                    notify_task_change = task_change_listener.recv() => {
+                        match notify_task_change {
+                            Ok(task_change) => {
+                                self.handle_task_change(task_change, concurrency_limit.clone(), &mut processing_tasks).await?;
+                            },
+                            Err(err) => {
+                                tracing::warn!(%err, "Task change listener connection lost, reconnecting");
+                                continue 'reconnect;
+                            }
                         }
-                    };
+                    }
 
-                }
-
-                // Pending task polling fallback.
-                _ = polling_interval.tick() => {
-                    self.trigger_task_processing(concurrency_limit.clone(), &mut processing_tasks).await;
+                    // Pending task polling fallback
+                    _ = polling_interval.tick() => {
+                        self.trigger_task_processing(concurrency_limit.clone(), &mut processing_tasks).await;
+                    }
                 }
             }
         }
-
-        Ok(())
     }
 
     async fn handle_shutdown(&self, processing_tasks: &mut JoinSet<()>) -> Result {
