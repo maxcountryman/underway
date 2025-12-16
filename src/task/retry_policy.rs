@@ -43,7 +43,7 @@ impl RetryPolicy {
         let base_delay = self.initial_interval_ms as f64;
         let backoff_delay = base_delay * self.backoff_coefficient.powi(retry_count - 1);
         let target_delay = backoff_delay.min(self.max_interval_ms as f64);
-        let delay=(target_delay * (1.0 - self.jitter_factor)+rand::thread_rng().gen_range(0.0..=(target_delay * self.jitter_factor))) as i64;
+        let delay=(target_delay * (1.0 - self.jitter_factor)+rand::rng().random_range(0.0..=(target_delay * self.jitter_factor))) as i64;
         delay.milliseconds()
     }
 }
