@@ -3,12 +3,13 @@ use std::{result::Result as StdResult, str::FromStr, sync::Arc, time::Duration a
 use jiff::{tz::TimeZone, Zoned};
 use jiff_cron::{Schedule, ScheduleIterator};
 use sqlx::postgres::{PgAdvisoryLock, PgListener};
-use tokio::time::Instant;
+use tokio::time::{sleep, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
 use crate::{
     queue::{shutdown_channel, try_acquire_advisory_lock, Error as QueueError},
+    task::{RetryCount, RetryPolicy},
     Queue, Task,
 };
 
@@ -51,6 +52,9 @@ pub struct Scheduler<T: Task> {
 
     // When this token is cancelled the queue has been shutdown.
     shutdown_token: CancellationToken,
+
+    // Policy for reconnection backoff when PostgreSQL connection is lost.
+    reconnection_policy: RetryPolicy,
 }
 
 impl<T: Task> Scheduler<T> {
@@ -107,6 +111,7 @@ impl<T: Task> Scheduler<T> {
             queue_lock,
             task,
             shutdown_token: CancellationToken::new(),
+            reconnection_policy: RetryPolicy::default(),
         }
     }
 
@@ -157,6 +162,68 @@ impl<T: Task> Scheduler<T> {
     /// ```
     pub fn set_shutdown_token(&mut self, shutdown_token: CancellationToken) {
         self.shutdown_token = shutdown_token;
+    }
+
+    /// Sets the reconnection policy for PostgreSQL connection failures.
+    ///
+    /// This policy controls how the scheduler retries connecting when the PostgreSQL
+    /// connection is lost. Uses exponential backoff to avoid overwhelming the database.
+    ///
+    /// Defaults to 1 second initial interval, 60 second max interval, 2.0 coefficient and 0.5 jitter_factor.
+    ///
+    /// **Note**: The `max_attempts` field is ignored for reconnection - the scheduler will
+    /// keep retrying until successful or until shutdown.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::{PgPool, Transaction, Postgres};
+    /// # use underway::{Task, task::Result as TaskResult, Queue, Scheduler};
+    /// use underway::task::RetryPolicy;
+    ///
+    /// # struct ExampleTask;
+    /// # impl Task for ExampleTask {
+    /// #     type Input = ();
+    /// #     type Output = ();
+    /// #     async fn execute(
+    /// #         &self,
+    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: Self::Input,
+    /// #     ) -> TaskResult<Self::Output> {
+    /// #         Ok(())
+    /// #     }
+    /// # }
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # let queue = Queue::builder()
+    /// #    .name("example")
+    /// #    .pool(pool.clone())
+    /// #    .build()
+    /// #    .await?;
+    /// # let task = ExampleTask;
+    /// # let mut scheduler = Scheduler::new(queue.into(), task);
+    /// # /*
+    /// let mut scheduler = { /* A `Scheduler`. */ };
+    /// # */
+    /// #
+    ///
+    /// // Set a custom reconnection policy using RetryPolicy.
+    /// let policy = RetryPolicy::builder()
+    ///     .initial_interval_ms(2_000)  // 2 seconds
+    ///     .max_interval_ms(60_000)      // 1 minute
+    ///     .backoff_coefficient(2.5)
+    ///     .jitter_factor(0.5)
+    ///     .build();
+    /// scheduler.set_reconnection_policy(policy);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
+    pub fn set_reconnection_policy(&mut self, reconnection_policy: RetryPolicy) {
+        self.reconnection_policy = reconnection_policy;
     }
 
     /// Cancels the shutdown token causing the scheduler to exit.
@@ -258,49 +325,105 @@ impl<T: Task> Scheduler<T> {
     /// ```
     #[instrument(skip(self), fields(queue.name = self.queue.name), err)]
     pub async fn run(&self) -> Result {
-        let conn = self.queue.pool.acquire().await?;
-        let Some(guard) = try_acquire_advisory_lock(conn, &self.queue_lock).await? else {
-            tracing::trace!("Scheduler could not acquire lock, exiting");
-            return Ok(());
-        };
+        let mut retry_count: RetryCount = 1;
 
-        let Some((zoned_schedule, input)) = self.queue.task_schedule(&self.queue.pool).await?
-        else {
-            // No schedule configured, so we'll exit.
-            return Ok(());
-        };
+        // Outer loop: handle reconnection logic for the scheduler's Postgres listener.
+        'reconnect: loop {
+            // Compute current reconnect backoff
+            let reconnect_backoff_span = self.reconnection_policy.calculate_delay(retry_count);
+            let reconnect_backoff: StdDuration = reconnect_backoff_span.try_into()?;
 
-        // Set up a listener for shutdown notifications
-        let mut shutdown_listener = PgListener::connect_with(&self.queue.pool).await?;
-        let chan = shutdown_channel();
-        shutdown_listener.listen(chan).await?;
+            let conn = match self.queue.pool.acquire().await {
+                Ok(conn) => conn,
+                Err(err) => {
+                    tracing::error!(
+                        %err,
+                        backoff_secs = reconnect_backoff.as_secs(),
+                        attempt = retry_count,
+                        "Failed to acquire database connection for scheduler, retrying after backoff"
+                    );
+                    sleep(reconnect_backoff).await;
+                    retry_count = retry_count.saturating_add(1);
+                    continue 'reconnect;
+                }
+            };
 
-        // TODO: Handle updates to schedules?
+            let Some(guard) = try_acquire_advisory_lock(conn, &self.queue_lock).await? else {
+                tracing::trace!("Scheduler could not acquire lock, exiting");
+                return Ok(());
+            };
 
-        for next in zoned_schedule.iter() {
-            tracing::debug!(?next, "Waiting until next scheduled task enqueue");
+            let Some((zoned_schedule, input)) = self.queue.task_schedule(&self.queue.pool).await?
+            else {
+                // No schedule configured, so we'll exit.
+                return Ok(());
+            };
 
-            tokio::select! {
-                notify_shutdown = shutdown_listener.recv() => {
-                    match notify_shutdown {
-                        Ok(_) => {
-                            self.shutdown_token.cancel();
-                        },
-                        Err(err) => {
-                            tracing::error!(%err, "Postgres shutdown notification error");
+            // Set up a listener for shutdown notifications
+            let mut shutdown_listener = match PgListener::connect_with(&self.queue.pool).await {
+                Ok(listener) => listener,
+                Err(err) => {
+                    tracing::error!(
+                        %err,
+                        backoff_secs = reconnect_backoff.as_secs(),
+                        attempt = retry_count,
+                        "Failed to connect scheduler shutdown listener, retrying after backoff"
+                    );
+                    sleep(reconnect_backoff).await;
+                    retry_count = retry_count.saturating_add(1);
+                    continue 'reconnect;
+                }
+            };
+
+            let chan = shutdown_channel();
+            if let Err(err) = shutdown_listener.listen(chan).await {
+                tracing::error!(
+                    %err,
+                    backoff_secs = reconnect_backoff.as_secs(),
+                    attempt = retry_count,
+                    "Failed to listen on scheduler shutdown channel, retrying after backoff"
+                );
+                sleep(reconnect_backoff).await;
+                retry_count = retry_count.saturating_add(1);
+                continue 'reconnect;
+            }
+
+            // Connection succeeded, reset retry counter
+            tracing::info!("Scheduler PostgreSQL listener connected successfully");
+            retry_count = 1;
+
+            // TODO: Handle updates to schedules?
+
+            for next in zoned_schedule.iter() {
+                tracing::debug!(?next, "Waiting until next scheduled task enqueue");
+
+                tokio::select! {
+                    notify_shutdown = shutdown_listener.recv() => {
+                        match notify_shutdown {
+                            Ok(_) => {
+                                self.shutdown_token.cancel();
+                            },
+                            Err(err) => {
+                                tracing::warn!(%err, "Scheduler shutdown listener connection lost, reconnecting");
+                                continue 'reconnect;
+                            }
                         }
                     }
-                }
 
-                _ = self.shutdown_token.cancelled() => {
-                    guard.release_now().await?;
-                    break
-                }
+                    _ = self.shutdown_token.cancelled() => {
+                        break;
+                    }
 
-                _ = wait_until(&next) => {
-                    self.process_next_schedule(&input).await?
+                    _ = wait_until(&next) => {
+                        self.process_next_schedule(&input).await?
+                    }
                 }
             }
+
+            guard.release_now().await?;
+
+            // Exit the reconnect loop once we have completed the schedule iteration.
+            break;
         }
 
         Ok(())
