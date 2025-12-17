@@ -132,8 +132,7 @@ use sqlx::{
     postgres::{types::PgInterval, PgListener, PgNotification},
     Acquire, PgConnection,
 };
-use tokio::{sync::Semaphore, task::JoinSet};
-use tokio::time::sleep;
+use tokio::{sync::Semaphore, task::JoinSet, time::sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
@@ -352,13 +351,15 @@ impl<T: Task + Sync> Worker<T> {
 
     /// Sets the reconnection policy for PostgreSQL connection failures.
     ///
-    /// This policy controls how the worker retries connecting when the PostgreSQL
-    /// connection is lost. Uses exponential backoff to avoid overwhelming the database.
+    /// This policy controls how the worker retries connecting when the
+    /// PostgreSQL connection is lost. Uses exponential backoff to avoid
+    /// overwhelming the database.
     ///
-    /// Defaults to 1 second initial interval, 60 second max interval, 2.0 coefficient and 0.5 jitter_factor.
+    /// Defaults to 1 second initial interval, 60 second max interval, 2.0
+    /// coefficient and 0.5 jitter_factor.
     ///
-    /// **Note**: The `max_attempts` field is ignored for reconnection - the worker will
-    /// keep retrying until successful or until shutdown.
+    /// **Note**: The `max_attempts` field is ignored for reconnection - the
+    /// worker will keep retrying until successful or until shutdown.
     ///
     /// # Example
     ///
@@ -398,8 +399,8 @@ impl<T: Task + Sync> Worker<T> {
     ///
     /// // Set a custom reconnection policy using RetryPolicy.
     /// let policy = RetryPolicy::builder()
-    ///     .initial_interval_ms(2_000)  // 2 seconds
-    ///     .max_interval_ms(60_000)      // 1 minute
+    ///     .initial_interval_ms(2_000) // 2 seconds
+    ///     .max_interval_ms(60_000) // 1 minute
     ///     .backoff_coefficient(2.5)
     ///     .jitter_factor(0.5)
     ///     .build();
@@ -589,7 +590,7 @@ impl<T: Task + Sync> Worker<T> {
             let mut shutdown_listener = match PgListener::connect_with(&self.queue.pool).await {
                 Ok(listener) => listener,
                 Err(err) => {
-                    tracing::error!(%err, backoff_secs = reconnect_backoff.as_secs(), 
+                    tracing::error!(%err, backoff_secs = reconnect_backoff.as_secs(),
                         attempt = retry_count,
                         "Failed to connect shutdown listener, retrying after backoff");
                     sleep(reconnect_backoff).await;
@@ -599,7 +600,7 @@ impl<T: Task + Sync> Worker<T> {
             };
 
             if let Err(err) = shutdown_listener.listen(chan).await {
-                tracing::error!(%err, backoff_secs = reconnect_backoff.as_secs(), 
+                tracing::error!(%err, backoff_secs = reconnect_backoff.as_secs(),
                     attempt = retry_count,
                     "Failed to listen on shutdown channel, retrying after backoff");
                 sleep(reconnect_backoff).await;
@@ -611,7 +612,7 @@ impl<T: Task + Sync> Worker<T> {
             let mut task_change_listener = match PgListener::connect_with(&self.queue.pool).await {
                 Ok(listener) => listener,
                 Err(err) => {
-                    tracing::error!(%err, backoff_secs = reconnect_backoff.as_secs(), 
+                    tracing::error!(%err, backoff_secs = reconnect_backoff.as_secs(),
                         attempt = retry_count,
                         "Failed to connect task change listener, retrying after backoff");
                     sleep(reconnect_backoff).await;
@@ -621,7 +622,7 @@ impl<T: Task + Sync> Worker<T> {
             };
 
             if let Err(err) = task_change_listener.listen("task_change").await {
-                tracing::error!(%err, backoff_secs = reconnect_backoff.as_secs(), 
+                tracing::error!(%err, backoff_secs = reconnect_backoff.as_secs(),
                     attempt = retry_count,
                     "Failed to listen on task_change channel, retrying after backoff");
                 sleep(reconnect_backoff).await;

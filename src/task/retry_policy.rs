@@ -43,7 +43,9 @@ impl RetryPolicy {
         let base_delay = self.initial_interval_ms as f64;
         let backoff_delay = base_delay * self.backoff_coefficient.powi(retry_count - 1);
         let target_delay = backoff_delay.min(self.max_interval_ms as f64);
-        let delay=(target_delay * (1.0 - self.jitter_factor)+rand::rng().random_range(0.0..=(target_delay * self.jitter_factor))) as i64;
+        let delay = (target_delay * (1.0 - self.jitter_factor)
+            + rand::rng().random_range(0.0..=(target_delay * self.jitter_factor)))
+            as i64;
         delay.milliseconds()
     }
 }
@@ -166,7 +168,7 @@ impl Builder {
     /// let retry_policy_builder = RetryPolicy::builder().jitter_factor(0.5);
     /// ```
     pub const fn jitter_factor(mut self, jitter_factor: f64) -> Self {
-        self.inner.jitter_factor=jitter_factor;
+        self.inner.jitter_factor = jitter_factor;
         self
     }
 
