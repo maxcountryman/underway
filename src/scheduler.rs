@@ -166,13 +166,15 @@ impl<T: Task> Scheduler<T> {
 
     /// Sets the reconnection policy for PostgreSQL connection failures.
     ///
-    /// This policy controls how the scheduler retries connecting when the PostgreSQL
-    /// connection is lost. Uses exponential backoff to avoid overwhelming the database.
+    /// This policy controls how the scheduler retries connecting when the
+    /// PostgreSQL connection is lost. Uses exponential backoff to avoid
+    /// overwhelming the database.
     ///
-    /// Defaults to 1 second initial interval, 60 second max interval, 2.0 coefficient and 0.5 jitter_factor.
+    /// Defaults to 1 second initial interval, 60 second max interval, 2.0
+    /// coefficient and 0.5 jitter_factor.
     ///
-    /// **Note**: The `max_attempts` field is ignored for reconnection - the scheduler will
-    /// keep retrying until successful or until shutdown.
+    /// **Note**: The `max_attempts` field is ignored for reconnection - the
+    /// scheduler will keep retrying until successful or until shutdown.
     ///
     /// # Example
     ///
@@ -212,8 +214,8 @@ impl<T: Task> Scheduler<T> {
     ///
     /// // Set a custom reconnection policy using RetryPolicy.
     /// let policy = RetryPolicy::builder()
-    ///     .initial_interval_ms(2_000)  // 2 seconds
-    ///     .max_interval_ms(60_000)      // 1 minute
+    ///     .initial_interval_ms(2_000) // 2 seconds
+    ///     .max_interval_ms(60_000) // 1 minute
     ///     .backoff_coefficient(2.5)
     ///     .jitter_factor(0.5)
     ///     .build();
