@@ -2,13 +2,16 @@ use std::{result::Result as StdResult, str::FromStr, sync::Arc, time::Duration a
 
 use jiff::{tz::TimeZone, Zoned};
 use jiff_cron::{Schedule, ScheduleIterator};
-use sqlx::postgres::{PgAdvisoryLock, PgListener};
+use sqlx::postgres::PgAdvisoryLock;
 use tokio::time::{sleep, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
 use crate::{
-    queue::{shutdown_channel, try_acquire_advisory_lock, Error as QueueError},
+    queue::{
+        connect_listeners_with_retry, shutdown_channel, try_acquire_advisory_lock,
+        Error as QueueError,
+    },
     task::{RetryCount, RetryPolicy},
     Queue, Task,
 };
@@ -53,8 +56,8 @@ pub struct Scheduler<T: Task> {
     // When this token is cancelled the queue has been shutdown.
     shutdown_token: CancellationToken,
 
-    // Policy for reconnection backoff when PostgreSQL connection is lost.
-    reconnection_policy: RetryPolicy,
+    // Backoff policy for reconnecting when PostgreSQL connection is lost.
+    reconnect_backoff: RetryPolicy,
 }
 
 impl<T: Task> Scheduler<T> {
@@ -111,7 +114,7 @@ impl<T: Task> Scheduler<T> {
             queue_lock,
             task,
             shutdown_token: CancellationToken::new(),
-            reconnection_policy: RetryPolicy::default(),
+            reconnect_backoff: RetryPolicy::default(),
         }
     }
 
@@ -164,11 +167,12 @@ impl<T: Task> Scheduler<T> {
         self.shutdown_token = shutdown_token;
     }
 
-    /// Sets the reconnection policy for PostgreSQL connection failures.
+    /// Sets the backoff policy for PostgreSQL reconnection attempts.
     ///
-    /// This policy controls how the scheduler retries connecting when the
-    /// PostgreSQL connection is lost. Uses exponential backoff to avoid
-    /// overwhelming the database.
+    /// This policy controls the exponential backoff behavior when the
+    /// scheduler's PostgreSQL listener connection is lost and needs to
+    /// reconnect. This helps avoid overwhelming the database during
+    /// connection issues.
     ///
     /// Defaults to 1 second initial interval, 60 second max interval, 2.0
     /// coefficient and 0.5 jitter_factor.
@@ -212,20 +216,20 @@ impl<T: Task> Scheduler<T> {
     /// # */
     /// #
     ///
-    /// // Set a custom reconnection policy using RetryPolicy.
-    /// let policy = RetryPolicy::builder()
+    /// // Set a custom backoff policy for reconnection.
+    /// let backoff = RetryPolicy::builder()
     ///     .initial_interval_ms(2_000) // 2 seconds
     ///     .max_interval_ms(60_000) // 1 minute
     ///     .backoff_coefficient(2.5)
     ///     .jitter_factor(0.5)
     ///     .build();
-    /// scheduler.set_reconnection_policy(policy);
+    /// scheduler.set_reconnect_backoff(backoff);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
     /// # }
     /// ```
-    pub fn set_reconnection_policy(&mut self, reconnection_policy: RetryPolicy) {
-        self.reconnection_policy = reconnection_policy;
+    pub fn set_reconnect_backoff(&mut self, backoff: RetryPolicy) {
+        self.reconnect_backoff = backoff;
     }
 
     /// Cancels the shutdown token causing the scheduler to exit.
@@ -332,7 +336,7 @@ impl<T: Task> Scheduler<T> {
         // Outer loop: handle reconnection logic for the scheduler's Postgres listener.
         'reconnect: loop {
             // Compute current reconnect backoff
-            let reconnect_backoff_span = self.reconnection_policy.calculate_delay(retry_count);
+            let reconnect_backoff_span = self.reconnect_backoff.calculate_delay(retry_count);
             let reconnect_backoff: StdDuration = reconnect_backoff_span.try_into()?;
 
             let conn = match self.queue.pool.acquire().await {
@@ -362,35 +366,13 @@ impl<T: Task> Scheduler<T> {
             };
 
             // Set up a listener for shutdown notifications
-            let mut shutdown_listener = match PgListener::connect_with(&self.queue.pool).await {
-                Ok(listener) => listener,
-                Err(err) => {
-                    tracing::error!(
-                        %err,
-                        backoff_secs = reconnect_backoff.as_secs(),
-                        attempt = retry_count,
-                        "Failed to connect scheduler shutdown listener, retrying after backoff"
-                    );
-                    sleep(reconnect_backoff).await;
-                    retry_count = retry_count.saturating_add(1);
-                    continue 'reconnect;
-                }
-            };
-
             let chan = shutdown_channel();
-            if let Err(err) = shutdown_listener.listen(chan).await {
-                tracing::error!(
-                    %err,
-                    backoff_secs = reconnect_backoff.as_secs(),
-                    attempt = retry_count,
-                    "Failed to listen on scheduler shutdown channel, retrying after backoff"
-                );
-                sleep(reconnect_backoff).await;
-                retry_count = retry_count.saturating_add(1);
-                continue 'reconnect;
-            }
+            let mut listeners =
+                connect_listeners_with_retry(&self.queue.pool, &[chan], &self.reconnect_backoff)
+                    .await?;
 
-            // Connection succeeded, reset retry counter
+            let mut shutdown_listener = listeners.remove(0);
+
             tracing::info!("Scheduler PostgreSQL listener connected successfully");
             retry_count = 1;
 
