@@ -1834,6 +1834,102 @@ pub(crate) fn shutdown_channel() -> &'static str {
     SHUTDOWN_CHANNEL.get_or_init(|| format!("underway_shutdown_{}", Uuid::new_v4()))
 }
 
+/// Helper function to connect a PostgreSQL listener with retry logic.
+///
+/// This function attempts to establish a connection to a PostgreSQL listener
+/// and subscribe to the specified channel. If the connection or subscription
+/// fails, it will log the error and return None, allowing the caller to
+/// handle the retry logic (including backoff delays).
+///
+/// Returns `Some(listener)` on success, or `None` if connection/subscription
+/// fails.
+pub(crate) async fn try_connect_listener(
+    pool: &PgPool,
+    channel: &str,
+) -> std::result::Result<sqlx::postgres::PgListener, sqlx::Error> {
+    let mut listener = sqlx::postgres::PgListener::connect_with(pool).await?;
+    listener.listen(channel).await?;
+    Ok(listener)
+}
+
+/// Retry an operation with exponential backoff.
+///
+/// This function encapsulates the retry logic with exponential backoff,
+/// including error logging and delay calculation. It will keep retrying
+/// until the operation succeeds.
+///
+/// # Arguments
+///
+/// * `backoff_policy` - The retry policy defining backoff behavior
+/// * `operation` - The async operation to retry, receives the current retry
+///   count
+/// * `operation_name` - A descriptive name for logging purposes
+pub(crate) async fn retry_with_backoff<F, Fut, T>(
+    backoff_policy: &RetryPolicy,
+    operation: F,
+    operation_name: &str,
+) -> std::result::Result<T, Error>
+where
+    F: Fn(i32) -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, sqlx::Error>>,
+{
+    let mut retry_count: i32 = 1;
+
+    loop {
+        let backoff_span = backoff_policy.calculate_delay(retry_count);
+        let backoff: StdDuration = backoff_span.try_into()?;
+
+        match operation(retry_count).await {
+            Ok(result) => return Ok(result),
+            Err(err) => {
+                tracing::error!(
+                    %err,
+                    backoff_secs = backoff.as_secs(),
+                    attempt = retry_count,
+                    "Failed to {}, retrying after backoff",
+                    operation_name
+                );
+                tokio::time::sleep(backoff).await;
+                retry_count = retry_count.saturating_add(1);
+            }
+        }
+    }
+}
+
+/// Connect multiple PostgreSQL listeners with retry logic.
+///
+/// This function attempts to establish connections to multiple PostgreSQL
+/// listeners with exponential backoff retry logic. All listeners must connect
+/// successfully or the entire operation will be retried.
+///
+/// # Arguments
+///
+/// * `pool` - The PostgreSQL connection pool
+/// * `channels` - Slice of channel names to listen on
+/// * `backoff_policy` - The retry policy defining backoff behavior
+///
+/// # Returns
+///
+/// A vector of connected listeners in the same order as the input channels.
+pub(crate) async fn connect_listeners_with_retry(
+    pool: &PgPool,
+    channels: &[&str],
+    backoff_policy: &RetryPolicy,
+) -> std::result::Result<Vec<sqlx::postgres::PgListener>, Error> {
+    retry_with_backoff(
+        backoff_policy,
+        |_| async {
+            let mut listeners = Vec::new();
+            for channel in channels {
+                listeners.push(try_connect_listener(pool, channel).await?);
+            }
+            Ok(listeners)
+        },
+        "connect PostgreSQL listeners",
+    )
+    .await
+}
+
 /// Initiates a graceful shutdown by sending a `NOTIFY` to the
 /// `underway_shutdown` channel via the `pg_notify` function.
 ///

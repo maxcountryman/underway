@@ -129,15 +129,17 @@ use std::{sync::Arc, time::Duration};
 use jiff::{Span, ToSpan};
 use serde::Deserialize;
 use sqlx::{
-    postgres::{types::PgInterval, PgListener, PgNotification},
+    postgres::{types::PgInterval, PgNotification},
     Acquire, PgConnection,
 };
-use tokio::{sync::Semaphore, task::JoinSet, time::sleep};
+use tokio::{sync::Semaphore, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
 use crate::{
-    queue::{shutdown_channel, Error as QueueError, InProgressTask, Queue},
+    queue::{
+        connect_listeners_with_retry, shutdown_channel, Error as QueueError, InProgressTask, Queue,
+    },
     task::{Error as TaskError, RetryCount, RetryPolicy, Task, TaskId},
 };
 pub(crate) type Result<T = ()> = std::result::Result<T, Error>;
@@ -176,8 +178,8 @@ pub struct Worker<T: Task> {
     // Limits the number of concurrent `Task::execute` invocations this worker will be allowed.
     concurrency_limit: usize,
 
-    // Policy for reconnection backoff when PostgreSQL connection is lost.
-    reconnection_policy: RetryPolicy,
+    // Backoff policy for reconnecting when PostgreSQL connection is lost.
+    reconnect_backoff: RetryPolicy,
 
     // When this token is cancelled the queue has been shutdown.
     shutdown_token: CancellationToken,
@@ -189,7 +191,7 @@ impl<T: Task> Clone for Worker<T> {
             queue: Arc::clone(&self.queue),
             task: Arc::clone(&self.task),
             concurrency_limit: self.concurrency_limit,
-            reconnection_policy: self.reconnection_policy,
+            reconnect_backoff: self.reconnect_backoff,
             shutdown_token: self.shutdown_token.clone(),
         }
     }
@@ -247,7 +249,7 @@ impl<T: Task + Sync> Worker<T> {
             queue,
             task,
             concurrency_limit: num_cpus::get(),
-            reconnection_policy: RetryPolicy::default(),
+            reconnect_backoff: RetryPolicy::default(),
             shutdown_token: CancellationToken::new(),
         }
     }
@@ -349,11 +351,12 @@ impl<T: Task + Sync> Worker<T> {
         self.shutdown_token = shutdown_token;
     }
 
-    /// Sets the reconnection policy for PostgreSQL connection failures.
+    /// Sets the backoff policy for PostgreSQL reconnection attempts.
     ///
-    /// This policy controls how the worker retries connecting when the
-    /// PostgreSQL connection is lost. Uses exponential backoff to avoid
-    /// overwhelming the database.
+    /// This policy controls the exponential backoff behavior when the
+    /// worker's PostgreSQL listener connection is lost and needs to
+    /// reconnect. This helps avoid overwhelming the database during
+    /// connection issues.
     ///
     /// Defaults to 1 second initial interval, 60 second max interval, 2.0
     /// coefficient and 0.5 jitter_factor.
@@ -397,20 +400,20 @@ impl<T: Task + Sync> Worker<T> {
     /// # */
     /// #
     ///
-    /// // Set a custom reconnection policy using RetryPolicy.
-    /// let policy = RetryPolicy::builder()
+    /// // Set a custom backoff policy for reconnection.
+    /// let backoff = RetryPolicy::builder()
     ///     .initial_interval_ms(2_000) // 2 seconds
     ///     .max_interval_ms(60_000) // 1 minute
     ///     .backoff_coefficient(2.5)
     ///     .jitter_factor(0.5)
     ///     .build();
-    /// worker.set_reconnection_policy(policy);
+    /// worker.set_reconnect_backoff(backoff);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
     /// # }
     /// ```
-    pub fn set_reconnection_policy(&mut self, reconnection_policy: RetryPolicy) {
-        self.reconnection_policy = reconnection_policy;
+    pub fn set_reconnect_backoff(&mut self, backoff: RetryPolicy) {
+        self.reconnect_backoff = backoff;
     }
 
     /// Cancels the shutdown token and begins a graceful shutdown of in-progress
@@ -578,61 +581,20 @@ impl<T: Task + Sync> Worker<T> {
         let concurrency_limit = Arc::new(Semaphore::new(self.concurrency_limit));
         let mut processing_tasks = JoinSet::new();
 
-        let mut retry_count: RetryCount = 1;
-
         // Outer loop: handle reconnection logic
         'reconnect: loop {
-            // Compute current reconnect backoff
-            let reconnect_backoff_span = self.reconnection_policy.calculate_delay(retry_count);
-            let reconnect_backoff: Duration = reconnect_backoff_span.try_into()?;
+            // Connect to PostgreSQL listeners with retry logic
+            let mut listeners = connect_listeners_with_retry(
+                &self.queue.pool,
+                &[chan, "task_change"],
+                &self.reconnect_backoff,
+            )
+            .await?;
 
-            // Try to establish shutdown listener connection
-            let mut shutdown_listener = match PgListener::connect_with(&self.queue.pool).await {
-                Ok(listener) => listener,
-                Err(err) => {
-                    tracing::error!(%err, backoff_secs = reconnect_backoff.as_secs(),
-                        attempt = retry_count,
-                        "Failed to connect shutdown listener, retrying after backoff");
-                    sleep(reconnect_backoff).await;
-                    retry_count = retry_count.saturating_add(1);
-                    continue 'reconnect;
-                }
-            };
+            let mut shutdown_listener = listeners.remove(0);
+            let mut task_change_listener = listeners.remove(0);
 
-            if let Err(err) = shutdown_listener.listen(chan).await {
-                tracing::error!(%err, backoff_secs = reconnect_backoff.as_secs(),
-                    attempt = retry_count,
-                    "Failed to listen on shutdown channel, retrying after backoff");
-                sleep(reconnect_backoff).await;
-                retry_count = retry_count.saturating_add(1);
-                continue 'reconnect;
-            }
-
-            // Try to establish task change listener connection
-            let mut task_change_listener = match PgListener::connect_with(&self.queue.pool).await {
-                Ok(listener) => listener,
-                Err(err) => {
-                    tracing::error!(%err, backoff_secs = reconnect_backoff.as_secs(),
-                        attempt = retry_count,
-                        "Failed to connect task change listener, retrying after backoff");
-                    sleep(reconnect_backoff).await;
-                    retry_count = retry_count.saturating_add(1);
-                    continue 'reconnect;
-                }
-            };
-
-            if let Err(err) = task_change_listener.listen("task_change").await {
-                tracing::error!(%err, backoff_secs = reconnect_backoff.as_secs(),
-                    attempt = retry_count,
-                    "Failed to listen on task_change channel, retrying after backoff");
-                sleep(reconnect_backoff).await;
-                retry_count = retry_count.saturating_add(1);
-                continue 'reconnect;
-            }
-
-            // Connection succeeded, reset retry counter
             tracing::info!("PostgreSQL listeners connected successfully");
-            retry_count = 1;
 
             // Inner loop: handle normal events
             loop {
