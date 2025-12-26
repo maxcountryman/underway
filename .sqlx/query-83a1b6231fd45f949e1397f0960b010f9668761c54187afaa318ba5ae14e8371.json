@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            update underway.task\n            set lease_expires_at = now() - interval '30 seconds'\n            where id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "83a1b6231fd45f949e1397f0960b010f9668761c54187afaa318ba5ae14e8371"
+}

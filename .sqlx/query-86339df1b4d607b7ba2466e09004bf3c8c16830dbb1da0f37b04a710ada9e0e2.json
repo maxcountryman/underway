@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            select attempt_number, state as \"state: TaskState\"\n            from underway.task_attempt\n            where task_id = $1\n            order by attempt_number\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "attempt_number",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "state: TaskState",
+        "type_info": {
+          "Custom": {
+            "name": "underway.task_state",
+            "kind": {
+              "Enum": [
+                "pending",
+                "in_progress",
+                "succeeded",
+                "cancelled",
+                "failed"
+              ]
+            }
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "86339df1b4d607b7ba2466e09004bf3c8c16830dbb1da0f37b04a710ada9e0e2"
+}

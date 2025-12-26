@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                with next_attempt as (\n                    select coalesce(max(attempt_number) + 1, 1) as attempt_number\n                    from underway.task_attempt\n                    where task_id = $1\n                      and task_queue_name = $2\n                )\n                insert into underway.task_attempt (\n                    task_id,\n                    task_queue_name,\n                    state,\n                    attempt_number,\n                    lease_token\n                )\n                values (\n                    $1,\n                    $2,\n                    $3,\n                    (select attempt_number from next_attempt),\n                    $4\n                )\n                returning attempt_number\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "attempt_number",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        {
+          "Custom": {
+            "name": "underway.task_state",
+            "kind": {
+              "Enum": [
+                "pending",
+                "in_progress",
+                "succeeded",
+                "cancelled",
+                "failed"
+              ]
+            }
+          }
+        },
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "ce1be723263c4962f2121737d53510c0b96ff511aacfdbd22164cfe83ed49f10"
+}

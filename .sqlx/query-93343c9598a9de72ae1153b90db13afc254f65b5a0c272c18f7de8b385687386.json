@@ -1,0 +1,123 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            with available_task as (\n                select id\n                from underway.task\n                where task_queue_name = $1\n                  and (\n                      -- Find pending tasks...\n                      state = $2\n                      -- ...Or look for stalled tasks.\n                      or (\n                          state = $3\n                          -- Has heartbeat stalled?\n                          and (lease_expires_at < now() or lease_expires_at is null)\n                          -- Are there remaining retries?\n                          and (retry_policy).max_attempts > (\n                              select count(*)\n                              from underway.task_attempt\n                              where task_queue_name = $1\n                                and task_id = id\n                          )\n                      )\n                  )\n                  and created_at + delay <= now()\n                order by\n                  priority desc,\n                  created_at,\n                  id\n                limit 1\n                for update skip locked\n            )\n            update underway.task t\n            set state = $3,\n                last_attempt_at = now(),\n                last_heartbeat_at = now(),\n                lease_token = $4,\n                lease_expires_at = now() + heartbeat\n            from available_task\n            where t.task_queue_name = $1\n              and t.id = available_task.id\n            returning\n                t.id as \"id: TaskId\",\n                t.task_queue_name as \"queue_name\",\n                t.input,\n                t.timeout,\n                t.heartbeat,\n                t.retry_policy as \"retry_policy: RetryPolicy\",\n                t.concurrency_key,\n                0::int as \"attempt_number!\",\n                $4::uuid as \"lease_token!\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: TaskId",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "queue_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "input",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 3,
+        "name": "timeout",
+        "type_info": "Interval"
+      },
+      {
+        "ordinal": 4,
+        "name": "heartbeat",
+        "type_info": "Interval"
+      },
+      {
+        "ordinal": 5,
+        "name": "retry_policy: RetryPolicy",
+        "type_info": {
+          "Custom": {
+            "name": "underway.task_retry_policy",
+            "kind": {
+              "Composite": [
+                [
+                  "max_attempts",
+                  "Int4"
+                ],
+                [
+                  "initial_interval_ms",
+                  "Int4"
+                ],
+                [
+                  "max_interval_ms",
+                  "Int4"
+                ],
+                [
+                  "backoff_coefficient",
+                  "Float8"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "concurrency_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "attempt_number!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 8,
+        "name": "lease_token!",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        {
+          "Custom": {
+            "name": "underway.task_state",
+            "kind": {
+              "Enum": [
+                "pending",
+                "in_progress",
+                "succeeded",
+                "cancelled",
+                "failed"
+              ]
+            }
+          }
+        },
+        {
+          "Custom": {
+            "name": "underway.task_state",
+            "kind": {
+              "Enum": [
+                "pending",
+                "in_progress",
+                "succeeded",
+                "cancelled",
+                "failed"
+              ]
+            }
+          }
+        },
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      null,
+      null
+    ]
+  },
+  "hash": "93343c9598a9de72ae1153b90db13afc254f65b5a0c272c18f7de8b385687386"
+}

@@ -650,11 +650,9 @@ use ulid::Ulid;
 use uuid::Uuid;
 
 use crate::{
-    queue::{Error as QueueError, InProgressTask, Queue},
+    queue::{Error as QueueError, Queue},
     scheduler::{Error as SchedulerError, Scheduler, ZonedSchedule},
-    task::{
-        Error as TaskError, Result as TaskResult, RetryPolicy, State as TaskState, Task, TaskId,
-    },
+    task::{Error as TaskError, Result as TaskResult, RetryPolicy, State as TaskState, Task},
     worker::{Error as WorkerError, Worker},
 };
 
@@ -907,34 +905,25 @@ impl<T: Task> EnqueuedJob<T> {
     /// ```
     pub async fn cancel(&self) -> Result<bool> {
         let mut tx = self.queue.pool.begin().await?;
-        let in_progress_tasks = sqlx::query_as!(
-            InProgressTask,
+        let result = sqlx::query!(
             r#"
-            select
-              id as "id: TaskId",
-              task_queue_name as "queue_name",
-              input,
-              retry_policy as "retry_policy: RetryPolicy",
-              timeout,
-              heartbeat,
-              concurrency_key
-            from underway.task
+            update underway.task
+            set state = $2,
+                updated_at = now(),
+                completed_at = now(),
+                lease_token = null,
+                lease_expires_at = null
             where input->>'job_id' = $1
-              and state = $2
-            for update skip locked
+              and state = $3
             "#,
             self.id.to_string(),
+            TaskState::Cancelled as TaskState,
             TaskState::Pending as TaskState
         )
-        .fetch_all(&mut *tx)
+        .execute(&mut *tx)
         .await?;
 
-        let mut cancelled = false;
-        for in_progress_task in in_progress_tasks {
-            if in_progress_task.mark_cancelled(&mut tx).await? {
-                cancelled = true;
-            }
-        }
+        let cancelled = result.rows_affected() > 0;
         tx.commit().await?;
 
         Ok(cancelled)

@@ -1,11 +1,12 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            update underway.task\n            set state = $2,\n                updated_at = now(),\n                completed_at = now()\n            where id = $1 and state < $3\n            ",
+  "query": "\n            update underway.task_attempt\n            set state = $3,\n                updated_at = now(),\n                error_message = $4\n            where task_id = $1\n              and task_queue_name = $2\n              and attempt_number = $5\n              and state = $6\n              and lease_token = $7\n            ",
   "describe": {
     "columns": [],
     "parameters": {
       "Left": [
         "Uuid",
+        "Text",
         {
           "Custom": {
             "name": "underway.task_state",
@@ -20,6 +21,8 @@
             }
           }
         },
+        "Text",
+        "Int4",
         {
           "Custom": {
             "name": "underway.task_state",
@@ -33,10 +36,11 @@
               ]
             }
           }
-        }
+        },
+        "Uuid"
       ]
     },
     "nullable": []
   },
-  "hash": "8c5868495ee0e66b4b6869f74b06e1e3930ef6ab49a5255816564262943ae5a9"
+  "hash": "421d992a8ad72102fbed38ffb4d0b6285566abb380f9b2fdb5561446042386aa"
 }
