@@ -806,7 +806,7 @@ impl<T: Task> Queue<T> {
         // "in-progress".
         let mut tx = self.pool.begin().await?;
 
-        let in_progress_task = sqlx::query_as!(
+        let mut in_progress_task = sqlx::query_as!(
             InProgressTask,
             r#"
             with available_task as (
@@ -852,7 +852,8 @@ impl<T: Task> Queue<T> {
                 t.timeout,
                 t.heartbeat,
                 t.retry_policy as "retry_policy: RetryPolicy",
-                t.concurrency_key
+                t.concurrency_key,
+                0::int as "attempt_number!"
             "#,
             self.name,
             TaskState::Pending as TaskState,
@@ -861,7 +862,7 @@ impl<T: Task> Queue<T> {
         .fetch_optional(&mut *tx)
         .await?;
 
-        if let Some(in_progress_task) = &in_progress_task {
+        if let Some(in_progress_task) = &mut in_progress_task {
             let task_id = in_progress_task.id;
             tracing::Span::current().record("task.id", task_id.as_hyphenated().to_string());
 
@@ -886,7 +887,7 @@ impl<T: Task> Queue<T> {
             .await?;
 
             // Insert a new task attempt row
-            sqlx::query!(
+            let attempt_number = sqlx::query_scalar!(
                 r#"
                 with next_attempt as (
                     select coalesce(max(attempt_number) + 1, 1) as attempt_number
@@ -906,13 +907,16 @@ impl<T: Task> Queue<T> {
                     $3,
                     (select attempt_number from next_attempt)
                 )
+                returning attempt_number
                 "#,
                 task_id as TaskId,
                 self.name,
                 TaskState::InProgress as TaskState
             )
-            .execute(&mut *tx)
+            .fetch_one(&mut *tx)
             .await?;
+
+            in_progress_task.attempt_number = attempt_number;
         }
 
         tx.commit().await?;
@@ -1188,6 +1192,7 @@ pub struct InProgressTask {
     pub(crate) heartbeat: sqlx::postgres::types::PgInterval,
     pub(crate) retry_policy: RetryPolicy,
     pub(crate) concurrency_key: Option<String>,
+    pub(crate) attempt_number: i32,
 }
 
 impl InProgressTask {
@@ -1201,24 +1206,25 @@ impl InProgressTask {
                 completed_at = now()
             where task_id = $1
               and task_queue_name = $2
-              and attempt_number = (
-                  select attempt_number
-                  from underway.task_attempt
-                  where task_id = $1
-                    and task_queue_name = $2
-                  order by attempt_number desc
-                  limit 1
-              )
+              and attempt_number = $4
+              and state = $5
             "#,
             self.id as TaskId,
             self.queue_name,
-            TaskState::Succeeded as TaskState
+            TaskState::Succeeded as TaskState,
+            self.attempt_number,
+            TaskState::InProgress as TaskState,
         )
         .execute(&mut *conn)
         .await?;
 
         if result.rows_affected() == 0 {
-            return Err(Error::TaskNotFound(self.id));
+            tracing::warn!(
+                task.id = %self.id.as_hyphenated(),
+                attempt_number = self.attempt_number,
+                "Skipping success update for non-current task attempt"
+            );
+            return Ok(());
         }
 
         // Update the task row.
@@ -1229,15 +1235,31 @@ impl InProgressTask {
                 updated_at = now(),
                 completed_at = now()
             where id = $1
+              and task_queue_name = $3
+              and state = $4
+              and (
+                  select max(attempt_number)
+                  from underway.task_attempt
+                  where task_id = $1
+                    and task_queue_name = $3
+              ) = $5
             "#,
             self.id as TaskId,
-            TaskState::Succeeded as TaskState
+            TaskState::Succeeded as TaskState,
+            self.queue_name,
+            TaskState::InProgress as TaskState,
+            self.attempt_number,
         )
         .execute(&mut *conn)
         .await?;
 
         if result.rows_affected() == 0 {
-            return Err(Error::TaskNotFound(self.id));
+            tracing::warn!(
+                task.id = %self.id.as_hyphenated(),
+                attempt_number = self.attempt_number,
+                "Skipping success update for non-current task attempt"
+            );
+            return Ok(());
         }
 
         Ok(())
@@ -1255,20 +1277,14 @@ impl InProgressTask {
                 completed_at = now()
             where task_id = $1
               and task_queue_name = $2
-              and attempt_number = (
-                  select attempt_number
-                  from underway.task_attempt
-                  where task_id = $1
-                    and task_queue_name = $2
-                    and state < $4
-                  order by attempt_number desc
-                  limit 1
-              )
+              and attempt_number = $4
+              and state < $5
             "#,
             self.id as TaskId,
             self.queue_name,
             TaskState::Cancelled as TaskState,
-            TaskState::Succeeded as TaskState
+            self.attempt_number,
+            TaskState::Succeeded as TaskState,
         )
         .execute(&mut *conn)
         .await?;
@@ -1280,17 +1296,40 @@ impl InProgressTask {
             set state = $2,
                 updated_at = now(),
                 completed_at = now()
-            where id = $1 and state < $3
+            where id = $1
+              and task_queue_name = $3
+              and state < $4
+              and (
+                  (
+                      select max(attempt_number)
+                      from underway.task_attempt
+                      where task_id = $1
+                        and task_queue_name = $3
+                  ) = $5
+                  or not exists (
+                      select 1
+                      from underway.task_attempt
+                      where task_id = $1
+                        and task_queue_name = $3
+                  )
+              )
             "#,
             self.id as TaskId,
             TaskState::Cancelled as TaskState,
-            TaskState::Succeeded as TaskState
+            self.queue_name,
+            TaskState::Succeeded as TaskState,
+            self.attempt_number,
         )
         .execute(&mut *conn)
         .await?;
 
         if result.rows_affected() == 0 {
-            return Err(Error::TaskNotFound(self.id));
+            tracing::warn!(
+                task.id = %self.id.as_hyphenated(),
+                attempt_number = self.attempt_number,
+                "Skipping cancel update for non-current task attempt"
+            );
+            return Ok(false);
         }
 
         Ok(result.rows_affected() > 0)
@@ -1310,24 +1349,25 @@ impl InProgressTask {
                 completed_at = now()
             where task_id = $1
               and task_queue_name = $2
-              and attempt_number = (
-                  select attempt_number
-                  from underway.task_attempt
-                  where task_id = $1
-                    and task_queue_name = $2
-                  order by attempt_number desc
-                  limit 1
-              )
+              and attempt_number = $4
+              and state = $5
             "#,
             self.id as TaskId,
             self.queue_name,
-            TaskState::Failed as TaskState
+            TaskState::Failed as TaskState,
+            self.attempt_number,
+            TaskState::InProgress as TaskState,
         )
         .execute(&mut *conn)
         .await?;
 
         if result.rows_affected() == 0 {
-            return Err(Error::TaskNotFound(self.id));
+            tracing::warn!(
+                task.id = %self.id.as_hyphenated(),
+                attempt_number = self.attempt_number,
+                "Skipping retry update for non-current task attempt"
+            );
+            return Ok(());
         }
 
         let result = sqlx::query!(
@@ -1337,16 +1377,32 @@ impl InProgressTask {
                 delay = $2,
                 updated_at = now()
             where id = $1
+              and task_queue_name = $4
+              and state = $5
+              and (
+                  select max(attempt_number)
+                  from underway.task_attempt
+                  where task_id = $1
+                    and task_queue_name = $4
+              ) = $6
             "#,
             self.id as TaskId,
             StdDuration::try_from(delay)? as _,
-            TaskState::Pending as TaskState
+            TaskState::Pending as TaskState,
+            self.queue_name,
+            TaskState::InProgress as TaskState,
+            self.attempt_number,
         )
         .execute(&mut *conn)
         .await?;
 
         if result.rows_affected() == 0 {
-            return Err(Error::TaskNotFound(self.id));
+            tracing::warn!(
+                task.id = %self.id.as_hyphenated(),
+                attempt_number = self.attempt_number,
+                "Skipping retry update for non-current task attempt"
+            );
+            return Ok(());
         }
 
         Ok(())
@@ -1365,25 +1421,26 @@ impl InProgressTask {
                 error_message = $4
             where task_id = $1
               and task_queue_name = $2
-              and attempt_number = (
-                  select attempt_number
-                  from underway.task_attempt
-                  where task_id = $1
-                    and task_queue_name = $2
-                  order by attempt_number desc
-                  limit 1
-              )
+              and attempt_number = $5
+              and state = $6
             "#,
             self.id as TaskId,
             self.queue_name,
             TaskState::Failed as TaskState,
             error.to_string(),
+            self.attempt_number,
+            TaskState::InProgress as TaskState,
         )
         .execute(&mut *conn)
         .await?;
 
         if result.rows_affected() == 0 {
-            return Err(Error::TaskNotFound(self.id));
+            tracing::warn!(
+                task.id = %self.id.as_hyphenated(),
+                attempt_number = self.attempt_number,
+                "Skipping failure update for non-current task attempt"
+            );
+            return Ok(());
         }
 
         let result = sqlx::query!(
@@ -1392,15 +1449,29 @@ impl InProgressTask {
             set updated_at = now()
             where id = $1
               and task_queue_name = $2
+              and state = $3
+              and (
+                  select max(attempt_number)
+                  from underway.task_attempt
+                  where task_id = $1
+                    and task_queue_name = $2
+              ) = $4
             "#,
             self.id as TaskId,
             self.queue_name,
+            TaskState::InProgress as TaskState,
+            self.attempt_number,
         )
         .execute(&mut *conn)
         .await?;
 
         if result.rows_affected() == 0 {
-            return Err(Error::TaskNotFound(self.id));
+            tracing::warn!(
+                task.id = %self.id.as_hyphenated(),
+                attempt_number = self.attempt_number,
+                "Skipping failure update for non-current task attempt"
+            );
+            return Ok(());
         }
 
         Ok(())
@@ -1416,24 +1487,25 @@ impl InProgressTask {
                 completed_at = now()
             where task_id = $1
               and task_queue_name = $2
-              and attempt_number = (
-                  select attempt_number
-                  from underway.task_attempt
-                  where task_id = $1
-                    and task_queue_name = $2
-                  order by attempt_number desc
-                  limit 1
-              )
+              and attempt_number = $4
+              and state = $5
             "#,
             self.id as TaskId,
             self.queue_name,
-            TaskState::Failed as TaskState
+            TaskState::Failed as TaskState,
+            self.attempt_number,
+            TaskState::InProgress as TaskState,
         )
         .execute(&mut *conn)
         .await?;
 
         if result.rows_affected() == 0 {
-            return Err(Error::TaskNotFound(self.id));
+            tracing::warn!(
+                task.id = %self.id.as_hyphenated(),
+                attempt_number = self.attempt_number,
+                "Skipping failed update for non-current task attempt"
+            );
+            return Ok(());
         }
 
         // Update the task row.
@@ -1444,15 +1516,31 @@ impl InProgressTask {
                 updated_at = now(),
                 completed_at = now()
             where id = $1
+              and task_queue_name = $3
+              and state = $4
+              and (
+                  select max(attempt_number)
+                  from underway.task_attempt
+                  where task_id = $1
+                    and task_queue_name = $3
+              ) = $5
             "#,
             self.id as TaskId,
-            TaskState::Failed as TaskState
+            TaskState::Failed as TaskState,
+            self.queue_name,
+            TaskState::InProgress as TaskState,
+            self.attempt_number,
         )
         .execute(&mut *conn)
         .await?;
 
         if result.rows_affected() == 0 {
-            return Err(Error::TaskNotFound(self.id));
+            tracing::warn!(
+                task.id = %self.id.as_hyphenated(),
+                attempt_number = self.attempt_number,
+                "Skipping failed update for non-current task attempt"
+            );
+            return Ok(());
         }
 
         Ok(())
@@ -1482,19 +1570,36 @@ impl InProgressTask {
     where
         E: PgExecutor<'a>,
     {
-        sqlx::query!(
+        let result = sqlx::query!(
             r#"
             update underway.task
             set updated_at = now(),
                 last_heartbeat_at = now()
             where id = $1
               and task_queue_name = $2
+              and state = $3
+              and (
+                  select max(attempt_number)
+                  from underway.task_attempt
+                  where task_id = $1
+                    and task_queue_name = $2
+              ) = $4
             "#,
             self.id as TaskId,
-            self.queue_name
+            self.queue_name,
+            TaskState::InProgress as TaskState,
+            self.attempt_number,
         )
         .execute(executor)
         .await?;
+
+        if result.rows_affected() == 0 {
+            tracing::warn!(
+                task.id = %self.id.as_hyphenated(),
+                attempt_number = self.attempt_number,
+                "Skipping heartbeat for non-current task attempt"
+            );
+        }
 
         Ok(())
     }
@@ -3336,6 +3441,70 @@ mod tests {
         .await?;
 
         assert_eq!(attempt_rows.len(), 1);
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn stale_attempt_cannot_finalize_task(pool: PgPool) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("stale_attempt_cannot_finalize_task")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let task_id = queue.enqueue(&pool, &TestTask, &json!("{}")).await?;
+
+        let mut conn = pool.acquire().await?;
+        let in_progress_task = queue.dequeue().await?.expect("A task should be dequeued");
+
+        sqlx::query!(
+            r#"
+            update underway.task
+            set last_heartbeat_at = now() - interval '30 seconds'
+            where id = $1
+            "#,
+            task_id as TaskId
+        )
+        .execute(&pool)
+        .await?;
+
+        let _new_in_progress_task = queue
+            .dequeue()
+            .await?
+            .expect("A stale task should be dequeued");
+
+        // Attempt to finalize the stale attempt; this should have no effect.
+        in_progress_task.mark_succeeded(&mut conn).await?;
+
+        let task_row = sqlx::query!(
+            r#"
+            select state as "state: TaskState"
+            from underway.task
+            where id = $1
+            "#,
+            task_id as TaskId
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(task_row.state, TaskState::InProgress);
+
+        let attempt_rows = sqlx::query!(
+            r#"
+            select attempt_number, state as "state: TaskState"
+            from underway.task_attempt
+            where task_id = $1
+            order by attempt_number
+            "#,
+            task_id as TaskId
+        )
+        .fetch_all(&pool)
+        .await?;
+
+        assert_eq!(attempt_rows.len(), 2);
+        assert_eq!(attempt_rows[0].state, TaskState::Failed);
+        assert_eq!(attempt_rows[1].state, TaskState::InProgress);
 
         Ok(())
     }
