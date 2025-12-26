@@ -1350,13 +1350,11 @@ impl InProgressTask {
             where task_id = $1
               and task_queue_name = $2
               and attempt_number = $4
-              and state = $5
             "#,
             self.id as TaskId,
             self.queue_name,
             TaskState::Failed as TaskState,
             self.attempt_number,
-            TaskState::InProgress as TaskState,
         )
         .execute(&mut *conn)
         .await?;
@@ -1488,13 +1486,11 @@ impl InProgressTask {
             where task_id = $1
               and task_queue_name = $2
               and attempt_number = $4
-              and state = $5
             "#,
             self.id as TaskId,
             self.queue_name,
             TaskState::Failed as TaskState,
             self.attempt_number,
-            TaskState::InProgress as TaskState,
         )
         .execute(&mut *conn)
         .await?;
@@ -1579,10 +1575,13 @@ impl InProgressTask {
               and task_queue_name = $2
               and state = $3
               and (
-                  select max(attempt_number)
+                  select attempt_number
                   from underway.task_attempt
                   where task_id = $1
                     and task_queue_name = $2
+                    and state = $3
+                  order by attempt_number desc
+                  limit 1
               ) = $4
             "#,
             self.id as TaskId,
