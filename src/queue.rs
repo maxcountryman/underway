@@ -1378,20 +1378,18 @@ impl InProgressTask {
                 updated_at = now()
             where id = $1
               and task_queue_name = $4
-              and state = $5
               and (
                   select max(attempt_number)
                   from underway.task_attempt
                   where task_id = $1
                     and task_queue_name = $4
-              ) = $6
+              ) = $5
             "#,
         )
         .bind(self.id)
         .bind(delay_interval)
         .bind(TaskState::Pending as TaskState)
         .bind(&self.queue_name)
-        .bind(TaskState::InProgress as TaskState)
         .bind(self.attempt_number)
         .execute(&mut *conn)
         .await?;
