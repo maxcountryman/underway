@@ -652,9 +652,7 @@ use uuid::Uuid;
 use crate::{
     queue::{Error as QueueError, InProgressTask, Queue},
     scheduler::{Error as SchedulerError, Scheduler, ZonedSchedule},
-    task::{
-        Error as TaskError, Result as TaskResult, RetryPolicy, State as TaskState, Task, TaskId,
-    },
+    task::{Error as TaskError, Result as TaskResult, RetryPolicy, State as TaskState, Task},
     worker::{Error as WorkerError, Worker},
 };
 
@@ -907,26 +905,25 @@ impl<T: Task> EnqueuedJob<T> {
     /// ```
     pub async fn cancel(&self) -> Result<bool> {
         let mut tx = self.queue.pool.begin().await?;
-        let in_progress_tasks = sqlx::query_as!(
-            InProgressTask,
+        let in_progress_tasks = sqlx::query_as::<_, InProgressTask>(
             r#"
             select
-              id as "id: TaskId",
-              task_queue_name as "queue_name",
+              id as id,
+              task_queue_name as queue_name,
               input,
-              retry_policy as "retry_policy: RetryPolicy",
+              retry_policy as retry_policy,
               timeout,
               heartbeat,
               concurrency_key,
-              0::int as "attempt_number!"
+              0::int as attempt_number
             from underway.task
             where input->>'job_id' = $1
               and state = $2
             for update skip locked
             "#,
-            self.id.to_string(),
-            TaskState::Pending as TaskState
         )
+        .bind(self.id.to_string())
+        .bind(TaskState::Pending as TaskState)
         .fetch_all(&mut *tx)
         .await?;
 
