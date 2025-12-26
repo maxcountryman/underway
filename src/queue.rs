@@ -807,7 +807,8 @@ impl<T: Task> Queue<T> {
         let mut tx = self.pool.begin().await?;
 
         let lease_token = Uuid::new_v4();
-        let mut in_progress_task = sqlx::query_as::<_, InProgressTask>(
+        let mut in_progress_task = sqlx::query_as!(
+            InProgressTask,
             r#"
             with available_task as (
                 select id
@@ -848,21 +849,21 @@ impl<T: Task> Queue<T> {
             where t.task_queue_name = $1
               and t.id = available_task.id
             returning
-                t.id as id,
-                t.task_queue_name as queue_name,
+                t.id as "id: TaskId",
+                t.task_queue_name as "queue_name",
                 t.input,
                 t.timeout,
                 t.heartbeat,
-                t.retry_policy as retry_policy,
+                t.retry_policy as "retry_policy: RetryPolicy",
                 t.concurrency_key,
-                0::int as attempt_number,
-                t.lease_token
+                0::int as "attempt_number!",
+                t.lease_token as "lease_token?"
             "#,
+            self.name,
+            TaskState::Pending as TaskState,
+            TaskState::InProgress as TaskState,
+            lease_token,
         )
-        .bind(&self.name)
-        .bind(TaskState::Pending as TaskState)
-        .bind(TaskState::InProgress as TaskState)
-        .bind(lease_token)
         .fetch_optional(&mut *tx)
         .await?;
 
@@ -874,7 +875,7 @@ impl<T: Task> Queue<T> {
             //
             // This ensures that if a stuck task was selected, we also update its attempt
             // row.
-            sqlx::query(
+            sqlx::query!(
                 r#"
                 update underway.task_attempt
                 set state = $3
@@ -882,16 +883,16 @@ impl<T: Task> Queue<T> {
                   and task_queue_name = $2
                   and state = $4
                 "#,
+                task_id as TaskId,
+                self.name,
+                TaskState::Failed as TaskState,
+                TaskState::InProgress as TaskState
             )
-            .bind(task_id)
-            .bind(&self.name)
-            .bind(TaskState::Failed as TaskState)
-            .bind(TaskState::InProgress as TaskState)
             .execute(&mut *tx)
             .await?;
 
             // Insert a new task attempt row
-            let attempt_number = sqlx::query_scalar::<_, i32>(
+            let attempt_number = sqlx::query_scalar!(
                 r#"
                 with next_attempt as (
                     select coalesce(max(attempt_number) + 1, 1) as attempt_number
@@ -915,11 +916,11 @@ impl<T: Task> Queue<T> {
                 )
                 returning attempt_number
                 "#,
+                task_id as TaskId,
+                self.name,
+                TaskState::InProgress as TaskState,
+                in_progress_task.lease_token
             )
-            .bind(task_id)
-            .bind(&self.name)
-            .bind(TaskState::InProgress as TaskState)
-            .bind(in_progress_task.lease_token)
             .fetch_one(&mut *tx)
             .await?;
 
@@ -1215,7 +1216,7 @@ impl InProgressTask {
         };
 
         // Update the task attempt row.
-        let result = sqlx::query(
+        let result = sqlx::query!(
             r#"
             update underway.task_attempt
             set state = $3,
@@ -1227,13 +1228,13 @@ impl InProgressTask {
               and state = $5
               and lease_token = $6
             "#,
+            self.id as TaskId,
+            self.queue_name,
+            TaskState::Succeeded as TaskState,
+            self.attempt_number,
+            TaskState::InProgress as TaskState,
+            lease_token
         )
-        .bind(self.id)
-        .bind(&self.queue_name)
-        .bind(TaskState::Succeeded as TaskState)
-        .bind(self.attempt_number)
-        .bind(TaskState::InProgress as TaskState)
-        .bind(lease_token)
         .execute(&mut *conn)
         .await?;
 
@@ -1247,7 +1248,7 @@ impl InProgressTask {
         }
 
         // Update the task row.
-        let result = sqlx::query(
+        let result = sqlx::query!(
             r#"
             update underway.task
             set state = $2,
@@ -1260,12 +1261,12 @@ impl InProgressTask {
               and state = $4
               and lease_token = $5
             "#,
+            self.id as TaskId,
+            TaskState::Succeeded as TaskState,
+            self.queue_name,
+            TaskState::InProgress as TaskState,
+            lease_token
         )
-        .bind(self.id)
-        .bind(TaskState::Succeeded as TaskState)
-        .bind(&self.queue_name)
-        .bind(TaskState::InProgress as TaskState)
-        .bind(lease_token)
         .execute(&mut *conn)
         .await?;
 
@@ -1287,7 +1288,7 @@ impl InProgressTask {
         // Update task attempt row if one exists.
         //
         // N.B.: A task may be cancelled before an attempt row has been created.
-        sqlx::query(
+        sqlx::query!(
             r#"
             update underway.task_attempt
             set state = $3,
@@ -1302,18 +1303,18 @@ impl InProgressTask {
                   or (lease_token is null and $6 is null)
               )
             "#,
+            self.id as TaskId,
+            self.queue_name,
+            TaskState::Cancelled as TaskState,
+            self.attempt_number,
+            TaskState::Succeeded as TaskState,
+            lease_token
         )
-        .bind(self.id)
-        .bind(&self.queue_name)
-        .bind(TaskState::Cancelled as TaskState)
-        .bind(self.attempt_number)
-        .bind(TaskState::Succeeded as TaskState)
-        .bind(lease_token)
         .execute(&mut *conn)
         .await?;
 
         // Update task row.
-        let result = sqlx::query(
+        let result = sqlx::query!(
             r#"
             update underway.task
             set state = $2,
@@ -1329,12 +1330,12 @@ impl InProgressTask {
                   or (lease_token is null and $5 is null)
               )
             "#,
+            self.id as TaskId,
+            TaskState::Cancelled as TaskState,
+            self.queue_name,
+            TaskState::Succeeded as TaskState,
+            lease_token
         )
-        .bind(self.id)
-        .bind(TaskState::Cancelled as TaskState)
-        .bind(&self.queue_name)
-        .bind(TaskState::Succeeded as TaskState)
-        .bind(lease_token)
         .execute(&mut *conn)
         .await?;
 
@@ -1365,7 +1366,7 @@ impl InProgressTask {
             return Ok(());
         };
 
-        let result = sqlx::query(
+        let result = sqlx::query!(
             r#"
             update underway.task_attempt
             set state = $3,
@@ -1376,12 +1377,12 @@ impl InProgressTask {
               and attempt_number = $4
               and lease_token = $5
             "#,
+            self.id as TaskId,
+            self.queue_name,
+            TaskState::Failed as TaskState,
+            self.attempt_number,
+            lease_token
         )
-        .bind(self.id)
-        .bind(&self.queue_name)
-        .bind(TaskState::Failed as TaskState)
-        .bind(self.attempt_number)
-        .bind(lease_token)
         .execute(&mut *conn)
         .await?;
 
@@ -1397,7 +1398,7 @@ impl InProgressTask {
         let delay_duration = StdDuration::try_from(delay)?;
         let delay_interval = sqlx::postgres::types::PgInterval::try_from(delay_duration)
             .map_err(sqlx::Error::Decode)?;
-        let result = sqlx::query(
+        let result = sqlx::query!(
             r#"
             update underway.task
             set state = $3,
@@ -1409,12 +1410,12 @@ impl InProgressTask {
               and task_queue_name = $4
               and lease_token = $5
             "#,
+            self.id as TaskId,
+            delay_interval,
+            TaskState::Pending as TaskState,
+            self.queue_name,
+            lease_token
         )
-        .bind(self.id)
-        .bind(delay_interval)
-        .bind(TaskState::Pending as TaskState)
-        .bind(&self.queue_name)
-        .bind(lease_token)
         .execute(&mut *conn)
         .await?;
 
@@ -1444,7 +1445,7 @@ impl InProgressTask {
             return Ok(());
         };
 
-        let result = sqlx::query(
+        let result = sqlx::query!(
             r#"
             update underway.task_attempt
             set state = $3,
@@ -1456,14 +1457,14 @@ impl InProgressTask {
               and state = $6
               and lease_token = $7
             "#,
+            self.id as TaskId,
+            self.queue_name,
+            TaskState::Failed as TaskState,
+            error.to_string(),
+            self.attempt_number,
+            TaskState::InProgress as TaskState,
+            lease_token
         )
-        .bind(self.id)
-        .bind(&self.queue_name)
-        .bind(TaskState::Failed as TaskState)
-        .bind(error.to_string())
-        .bind(self.attempt_number)
-        .bind(TaskState::InProgress as TaskState)
-        .bind(lease_token)
         .execute(&mut *conn)
         .await?;
 
@@ -1476,7 +1477,7 @@ impl InProgressTask {
             return Ok(());
         }
 
-        let result = sqlx::query(
+        let result = sqlx::query!(
             r#"
             update underway.task
             set updated_at = now()
@@ -1485,11 +1486,11 @@ impl InProgressTask {
               and state = $3
               and lease_token = $4
             "#,
+            self.id as TaskId,
+            self.queue_name,
+            TaskState::InProgress as TaskState,
+            lease_token
         )
-        .bind(self.id)
-        .bind(&self.queue_name)
-        .bind(TaskState::InProgress as TaskState)
-        .bind(lease_token)
         .execute(&mut *conn)
         .await?;
 
@@ -1516,7 +1517,7 @@ impl InProgressTask {
         };
 
         // Update the task attempt row.
-        let result = sqlx::query(
+        let result = sqlx::query!(
             r#"
             update underway.task_attempt
             set state = $3,
@@ -1527,12 +1528,12 @@ impl InProgressTask {
               and attempt_number = $4
               and lease_token = $5
             "#,
+            self.id as TaskId,
+            self.queue_name,
+            TaskState::Failed as TaskState,
+            self.attempt_number,
+            lease_token
         )
-        .bind(self.id)
-        .bind(&self.queue_name)
-        .bind(TaskState::Failed as TaskState)
-        .bind(self.attempt_number)
-        .bind(lease_token)
         .execute(&mut *conn)
         .await?;
 
@@ -1546,7 +1547,7 @@ impl InProgressTask {
         }
 
         // Update the task row.
-        let result = sqlx::query(
+        let result = sqlx::query!(
             r#"
             update underway.task
             set state = $2,
@@ -1559,12 +1560,12 @@ impl InProgressTask {
               and state = $4
               and lease_token = $5
             "#,
+            self.id as TaskId,
+            TaskState::Failed as TaskState,
+            self.queue_name,
+            TaskState::InProgress as TaskState,
+            lease_token
         )
-        .bind(self.id)
-        .bind(TaskState::Failed as TaskState)
-        .bind(&self.queue_name)
-        .bind(TaskState::InProgress as TaskState)
-        .bind(lease_token)
         .execute(&mut *conn)
         .await?;
 
@@ -1613,7 +1614,7 @@ impl InProgressTask {
             return Ok(());
         };
 
-        let result = sqlx::query(
+        let result = sqlx::query!(
             r#"
             update underway.task
             set updated_at = now(),
@@ -1626,11 +1627,11 @@ impl InProgressTask {
                   lease_token = $4
               )
             "#,
+            self.id as TaskId,
+            self.queue_name,
+            TaskState::InProgress as TaskState,
+            lease_token
         )
-        .bind(self.id)
-        .bind(&self.queue_name)
-        .bind(TaskState::InProgress as TaskState)
-        .bind(lease_token)
         .execute(executor)
         .await?;
 
@@ -2006,7 +2007,7 @@ mod tests {
     use std::{collections::HashSet, path::PathBuf};
 
     use serde_json::json;
-    use sqlx::{Postgres, Row, Transaction};
+    use sqlx::{Postgres, Transaction};
 
     use super::*;
     use crate::{task::Result as TaskResult, worker::pg_interval_to_span};
@@ -3452,14 +3453,14 @@ mod tests {
         assert_eq!(attempt_rows.len(), 1);
 
         // Set a stale heartbeat.
-        sqlx::query(
+        sqlx::query!(
             r#"
             update underway.task
             set lease_expires_at = now() - interval '30 seconds'
             where id = $1
             "#,
+            task_id as TaskId
         )
-        .bind(task_id)
         .execute(&pool)
         .await?;
 
@@ -3518,37 +3519,34 @@ mod tests {
         // Attempt to finalize the stale attempt; this should have no effect.
         in_progress_task.mark_succeeded(&mut conn).await?;
 
-        let task_row = sqlx::query(
+        let task_row = sqlx::query!(
             r#"
-            select state
+            select state as "state: TaskState"
             from underway.task
             where id = $1
             "#,
+            task_id as TaskId
         )
-        .bind(task_id)
         .fetch_one(&pool)
         .await?;
 
-        let task_state: TaskState = task_row.try_get("state")?;
-        assert_eq!(task_state, TaskState::InProgress);
+        assert_eq!(task_row.state, TaskState::InProgress);
 
-        let attempt_rows = sqlx::query(
+        let attempt_rows = sqlx::query!(
             r#"
-            select attempt_number, state
+            select attempt_number, state as "state: TaskState"
             from underway.task_attempt
             where task_id = $1
             order by attempt_number
             "#,
+            task_id as TaskId
         )
-        .bind(task_id)
         .fetch_all(&pool)
         .await?;
 
         assert_eq!(attempt_rows.len(), 2);
-        let first_state: TaskState = attempt_rows[0].try_get("state")?;
-        let second_state: TaskState = attempt_rows[1].try_get("state")?;
-        assert_eq!(first_state, TaskState::Failed);
-        assert_eq!(second_state, TaskState::InProgress);
+        assert_eq!(attempt_rows[0].state, TaskState::Failed);
+        assert_eq!(attempt_rows[1].state, TaskState::InProgress);
 
         Ok(())
     }

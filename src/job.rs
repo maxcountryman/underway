@@ -905,26 +905,27 @@ impl<T: Task> EnqueuedJob<T> {
     /// ```
     pub async fn cancel(&self) -> Result<bool> {
         let mut tx = self.queue.pool.begin().await?;
-        let in_progress_tasks = sqlx::query_as::<_, InProgressTask>(
+        let in_progress_tasks = sqlx::query_as!(
+            InProgressTask,
             r#"
             select
-              id as id,
-              task_queue_name as queue_name,
+              id as "id: TaskId",
+              task_queue_name as "queue_name",
               input,
-              retry_policy as retry_policy,
+              retry_policy as "retry_policy: RetryPolicy",
               timeout,
               heartbeat,
               concurrency_key,
-              0::int as attempt_number,
-              lease_token
+              0::int as "attempt_number!",
+              lease_token as "lease_token?"
             from underway.task
             where input->>'job_id' = $1
               and state = $2
             for update skip locked
             "#,
+            self.id.to_string(),
+            TaskState::Pending as TaskState
         )
-        .bind(self.id.to_string())
-        .bind(TaskState::Pending as TaskState)
         .fetch_all(&mut *tx)
         .await?;
 
