@@ -1203,6 +1203,37 @@ where
         Ok(enqueue)
     }
 
+    /// Smiliar to [`Queue::enqueue_multi`]
+    /// # Errors
+    ///
+    /// This has the same error conditions as [`Queue::enqueue_multi`].
+    pub async fn enqueue_multi(&self, inputs: &[I]) -> Result<usize> {
+        self.enqueue_multi_with_chunk_size(inputs, 5000).await
+    }
+
+    /// Smiliar to [`Queue::enqueue_multi_with_chunk_size`]
+    /// # Errors
+    ///
+    /// This has the same error conditions as [`Queue::enqueue_multi_with_chunk_size`].
+    pub async fn enqueue_multi_with_chunk_size(
+        &self,
+        inputs: &[I],
+        chunk_size: usize,
+    ) -> Result<usize> {
+        let mut conn = self.queue.pool.acquire().await?;
+
+        let mut job_inputs = Vec::new();
+
+        for input in inputs {
+            job_inputs.push(self.first_job_input(input)?);
+        }
+
+        Ok(self
+            .queue
+            .enqueue_multi_wth_chunk_size(&mut *conn, self, &job_inputs, chunk_size)
+            .await?)
+    }
+
     /// Schedule the job using a connection from the queue's pool.
     ///
     /// # Errors
