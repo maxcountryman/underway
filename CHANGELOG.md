@@ -1,6 +1,7 @@
 # Unreleased
 
 - Fix: Pending retry delays now respect the last attempt time when re-queuing tasks
+- Fix: Reap completed worker processing tasks to avoid unbounded memory growth
 
 # 0.2.0
 

@@ -599,6 +599,15 @@ impl<T: Task + Sync> Worker<T> {
             // Inner loop: handle normal events
             loop {
                 tokio::select! {
+                    // Reap completed processing tasks so JoinSet doesn't grow unbounded.
+                    Some(completed) = processing_tasks.join_next(), if !processing_tasks.is_empty() => {
+                        if let Err(err) = completed {
+                            tracing::error!(%err, "A processing task failed");
+                        }
+
+                        reap_completed(&mut processing_tasks);
+                    }
+
                     notify_shutdown = shutdown_listener.recv() => {
                         match notify_shutdown {
                             Ok(_) => {
@@ -968,6 +977,14 @@ impl<T: Task + Sync> Worker<T> {
     }
 }
 
+fn reap_completed(processing_tasks: &mut JoinSet<()>) {
+    while let Some(res) = processing_tasks.try_join_next() {
+        if let Err(err) = res {
+            tracing::error!(%err, "A processing task failed");
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct TaskChange {
     #[serde(rename = "task_queue_name")]
@@ -1334,5 +1351,24 @@ mod tests {
         assert_eq!(task_state, TaskState::Succeeded);
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn reap_completed_drains_joinset() {
+        let mut processing_tasks = JoinSet::new();
+
+        for _ in 0..3 {
+            processing_tasks.spawn(async {
+                tokio::time::sleep(StdDuration::from_millis(10)).await;
+            });
+        }
+
+        tokio::time::sleep(StdDuration::from_millis(25)).await;
+
+        assert!(!processing_tasks.is_empty());
+
+        reap_completed(&mut processing_tasks);
+
+        assert!(processing_tasks.is_empty());
     }
 }
