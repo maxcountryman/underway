@@ -3550,4 +3550,108 @@ mod tests {
 
         Ok(())
     }
+
+    #[sqlx::test]
+    async fn task_row_update_fenced_after_reclaim(pool: PgPool) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("task_row_update_fenced_after_reclaim")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let task_id = queue.enqueue(&pool, &TestTask, &json!({})).await?;
+
+        let in_progress_task = queue
+            .dequeue()
+            .await?
+            .expect("A task should be dequeued");
+
+        let attempt_update = sqlx::query!(
+            r#"
+            update underway.task_attempt
+            set state = $3,
+                updated_at = now(),
+                completed_at = now()
+            where task_id = $1
+              and task_queue_name = $2
+              and attempt_number = $4
+              and attempt_number = (
+                  select max(attempt_number)
+                  from underway.task_attempt
+                  where task_id = $1
+                    and task_queue_name = $2
+              )
+            "#,
+            task_id as TaskId,
+            queue.name.as_str(),
+            TaskState::Succeeded as TaskState,
+            in_progress_task.attempt_number
+        )
+        .execute(&pool)
+        .await?;
+
+        assert_eq!(attempt_update.rows_affected(), 1);
+
+        sqlx::query!(
+            r#"
+            update underway.task
+            set last_heartbeat_at = now() - interval '1 minute'
+            where id = $1
+              and task_queue_name = $2
+            "#,
+            task_id as TaskId,
+            queue.name.as_str()
+        )
+        .execute(&pool)
+        .await?;
+
+        let reclaimed_task = queue
+            .dequeue()
+            .await?
+            .expect("A stale task should be dequeued");
+
+        assert!(reclaimed_task.attempt_number > in_progress_task.attempt_number);
+
+        let task_update = sqlx::query!(
+            r#"
+            update underway.task
+            set state = $2,
+                updated_at = now(),
+                completed_at = now()
+            where id = $1
+              and task_queue_name = $3
+              and $4 = (
+                  select max(attempt_number)
+                  from underway.task_attempt
+                  where task_id = $1
+                    and task_queue_name = $3
+              )
+            "#,
+            task_id as TaskId,
+            TaskState::Succeeded as TaskState,
+            queue.name.as_str(),
+            in_progress_task.attempt_number
+        )
+        .execute(&pool)
+        .await?;
+
+        assert_eq!(task_update.rows_affected(), 0);
+
+        let task_state = sqlx::query_scalar!(
+            r#"
+            select state as "state: TaskState"
+            from underway.task
+            where id = $1
+              and task_queue_name = $2
+            "#,
+            task_id as TaskId,
+            queue.name.as_str()
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(task_state, TaskState::InProgress);
+
+        Ok(())
+    }
 }
