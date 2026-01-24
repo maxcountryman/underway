@@ -3561,10 +3561,7 @@ mod tests {
 
         let task_id = queue.enqueue(&pool, &TestTask, &json!({})).await?;
 
-        let in_progress_task = queue
-            .dequeue()
-            .await?
-            .expect("A task should be dequeued");
+        let in_progress_task = queue.dequeue().await?.expect("A task should be dequeued");
 
         let attempt_update = sqlx::query!(
             r#"
