@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            update underway.task\n            set state = $2,\n                updated_at = now(),\n                completed_at = now()\n            where id = $1 and state < $3\n            ",
+  "query": "\n            update underway.task\n            set state = $2,\n                updated_at = now(),\n                completed_at = now()\n            where id = $1\n              and task_queue_name = $4\n              and state < $3\n              and (\n                  $5 = 0\n                  or $5 = (\n                      select max(attempt_number)\n                      from underway.task_attempt\n                      where task_id = $1\n                        and task_queue_name = $4\n                  )\n              )\n            ",
   "describe": {
     "columns": [],
     "parameters": {
@@ -33,10 +33,12 @@
               ]
             }
           }
-        }
+        },
+        "Text",
+        "Int4"
       ]
     },
     "nullable": []
   },
-  "hash": "8c5868495ee0e66b4b6869f74b06e1e3930ef6ab49a5255816564262943ae5a9"
+  "hash": "c7b2fe56c0a4614bcc78cef6c943f155bc710171895f2ec44ae06cd889f2dae5"
 }

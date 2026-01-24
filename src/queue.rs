@@ -1245,9 +1245,18 @@ impl InProgressTask {
                 updated_at = now(),
                 completed_at = now()
             where id = $1
+              and task_queue_name = $3
+              and $4 = (
+                  select max(attempt_number)
+                  from underway.task_attempt
+                  where task_id = $1
+                    and task_queue_name = $3
+              )
             "#,
             self.id as TaskId,
-            TaskState::Succeeded as TaskState
+            TaskState::Succeeded as TaskState,
+            self.queue_name,
+            self.attempt_number
         )
         .execute(&mut *conn)
         .await?;
@@ -1290,11 +1299,24 @@ impl InProgressTask {
             set state = $2,
                 updated_at = now(),
                 completed_at = now()
-            where id = $1 and state < $3
+            where id = $1
+              and task_queue_name = $4
+              and state < $3
+              and (
+                  $5 = 0
+                  or $5 = (
+                      select max(attempt_number)
+                      from underway.task_attempt
+                      where task_id = $1
+                        and task_queue_name = $4
+                  )
+              )
             "#,
             self.id as TaskId,
             TaskState::Cancelled as TaskState,
-            TaskState::Succeeded as TaskState
+            TaskState::Succeeded as TaskState,
+            self.queue_name,
+            self.attempt_number
         )
         .execute(&mut *conn)
         .await?;
@@ -1350,10 +1372,19 @@ impl InProgressTask {
                 last_attempt_at = now(),
                 updated_at = now()
             where id = $1
+              and task_queue_name = $4
+              and $5 = (
+                  select max(attempt_number)
+                  from underway.task_attempt
+                  where task_id = $1
+                    and task_queue_name = $4
+              )
             "#,
             self.id as TaskId,
             StdDuration::try_from(delay)? as _,
-            TaskState::Pending as TaskState
+            TaskState::Pending as TaskState,
+            self.queue_name,
+            self.attempt_number
         )
         .execute(&mut *conn)
         .await?;
@@ -1407,9 +1438,16 @@ impl InProgressTask {
             set updated_at = now()
             where id = $1
               and task_queue_name = $2
+              and $3 = (
+                  select max(attempt_number)
+                  from underway.task_attempt
+                  where task_id = $1
+                    and task_queue_name = $2
+              )
             "#,
             self.id as TaskId,
             self.queue_name,
+            self.attempt_number
         )
         .execute(&mut *conn)
         .await?;
@@ -1461,9 +1499,18 @@ impl InProgressTask {
                 updated_at = now(),
                 completed_at = now()
             where id = $1
+              and task_queue_name = $3
+              and $4 = (
+                  select max(attempt_number)
+                  from underway.task_attempt
+                  where task_id = $1
+                    and task_queue_name = $3
+              )
             "#,
             self.id as TaskId,
-            TaskState::Failed as TaskState
+            TaskState::Failed as TaskState,
+            self.queue_name,
+            self.attempt_number
         )
         .execute(&mut *conn)
         .await?;
