@@ -866,27 +866,26 @@ impl<T: Task + Sync> Worker<T> {
         };
 
         match outcome {
-            TaskOutcome::Completed(result) => {
-                match result {
-                    Ok(_) => {
-                        execute_tx.commit().await?;
-                        in_progress_task.mark_succeeded(&mut tx).await?;
-                    }
-
-                    Err(ref error) => {
-                        execute_tx.rollback().await?;
-                        let retry_policy = &in_progress_task.retry_policy;
-                        self.handle_task_error(&mut tx, &in_progress_task, retry_policy, error)
-                            .await?;
-                    }
+            TaskOutcome::Completed(result) => match result {
+                Ok(_) => {
+                    execute_tx.commit().await?;
+                    in_progress_task.mark_succeeded(&mut tx).await?;
                 }
-            }
+
+                Err(ref error) => {
+                    execute_tx.rollback().await?;
+                    let retry_policy = &in_progress_task.retry_policy;
+                    self.handle_task_error(&mut tx, &in_progress_task, retry_policy, error)
+                        .await?;
+                }
+            },
 
             TaskOutcome::TimedOut => {
                 execute_tx.rollback().await?;
                 tracing::error!("Task execution timed out");
                 let retry_policy = &in_progress_task.retry_policy;
-                self.handle_task_timeout(&mut tx, &in_progress_task, retry_policy, timeout).await?;
+                self.handle_task_timeout(&mut tx, &in_progress_task, retry_policy, timeout)
+                    .await?;
             }
         }
 
@@ -1105,19 +1104,18 @@ mod tests {
                 tx: &mut Transaction<'_, Postgres>,
                 input: Self::Input,
             ) -> TaskResult<Self::Output> {
-                sqlx::query(
-                    "insert into underway.worker_commit_test (note) values ($1)",
-                )
-                .bind(input)
-                .execute(tx.as_mut())
-                .await?;
+                sqlx::query("insert into underway.worker_commit_test (note) values ($1)")
+                    .bind(input)
+                    .execute(tx.as_mut())
+                    .await?;
 
                 Ok(())
             }
         }
 
         sqlx::query(
-            "create table if not exists underway.worker_commit_test (id serial primary key, note text)",
+            "create table if not exists underway.worker_commit_test (id serial primary key, note \
+             text)",
         )
         .execute(&pool)
         .await?;
@@ -1136,11 +1134,9 @@ mod tests {
         let worker = Worker::new(Arc::new(queue), task);
         worker.process_next_task().await?;
 
-        let count: i64 = sqlx::query_scalar(
-            "select count(*) from underway.worker_commit_test",
-        )
-        .fetch_one(&pool)
-        .await?;
+        let count: i64 = sqlx::query_scalar("select count(*) from underway.worker_commit_test")
+            .fetch_one(&pool)
+            .await?;
 
         assert_eq!(count, 1);
 
