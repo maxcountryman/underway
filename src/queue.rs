@@ -126,7 +126,9 @@
 //!
 //! Only tasks which are in the "pending" state or are otherwise considered
 //! stale (i.e. they have not updated their heartbeat within the expected time
-//! frame) and with remaining retries can be dequeued.
+//! frame) and with remaining retries can be dequeued. When a task is reclaimed
+//! due to a stale heartbeat, a new attempt is created and older attempts are
+//! fenced out from updating task state.
 //!
 //! # Scheduling tasks
 //!
@@ -855,7 +857,8 @@ impl<T: Task> Queue<T> {
                 t.timeout,
                 t.heartbeat,
                 t.retry_policy as "retry_policy: RetryPolicy",
-                t.concurrency_key
+                t.concurrency_key,
+                0 as "attempt_number!"
             "#,
             self.name,
             TaskState::Pending as TaskState,
@@ -864,7 +867,7 @@ impl<T: Task> Queue<T> {
         .fetch_optional(&mut *tx)
         .await?;
 
-        if let Some(in_progress_task) = &in_progress_task {
+        let in_progress_task = if let Some(mut in_progress_task) = in_progress_task {
             let task_id = in_progress_task.id;
             tracing::Span::current().record("task.id", task_id.as_hyphenated().to_string());
 
@@ -889,7 +892,7 @@ impl<T: Task> Queue<T> {
             .await?;
 
             // Insert a new task attempt row
-            sqlx::query!(
+            let attempt_number = sqlx::query_scalar!(
                 r#"
                 with next_attempt as (
                     select coalesce(max(attempt_number) + 1, 1) as attempt_number
@@ -909,14 +912,21 @@ impl<T: Task> Queue<T> {
                     $3,
                     (select attempt_number from next_attempt)
                 )
+                returning attempt_number
                 "#,
                 task_id as TaskId,
                 self.name,
                 TaskState::InProgress as TaskState
             )
-            .execute(&mut *tx)
+            .fetch_one(&mut *tx)
             .await?;
-        }
+
+            in_progress_task.attempt_number = attempt_number;
+
+            Some(in_progress_task)
+        } else {
+            None
+        };
 
         tx.commit().await?;
 
@@ -1191,6 +1201,7 @@ pub struct InProgressTask {
     pub(crate) heartbeat: sqlx::postgres::types::PgInterval,
     pub(crate) retry_policy: RetryPolicy,
     pub(crate) concurrency_key: Option<String>,
+    pub(crate) attempt_number: i32,
 }
 
 impl InProgressTask {
@@ -1204,6 +1215,7 @@ impl InProgressTask {
                 completed_at = now()
             where task_id = $1
               and task_queue_name = $2
+              and attempt_number = $4
               and attempt_number = (
                   select attempt_number
                   from underway.task_attempt
@@ -1215,7 +1227,8 @@ impl InProgressTask {
             "#,
             self.id as TaskId,
             self.queue_name,
-            TaskState::Succeeded as TaskState
+            TaskState::Succeeded as TaskState,
+            self.attempt_number
         )
         .execute(&mut *conn)
         .await?;
@@ -1258,20 +1271,14 @@ impl InProgressTask {
                 completed_at = now()
             where task_id = $1
               and task_queue_name = $2
-              and attempt_number = (
-                  select attempt_number
-                  from underway.task_attempt
-                  where task_id = $1
-                    and task_queue_name = $2
-                    and state < $4
-                  order by attempt_number desc
-                  limit 1
-              )
+              and attempt_number = $5
+              and state < $4
             "#,
             self.id as TaskId,
             self.queue_name,
             TaskState::Cancelled as TaskState,
-            TaskState::Succeeded as TaskState
+            TaskState::Succeeded as TaskState,
+            self.attempt_number
         )
         .execute(&mut *conn)
         .await?;
@@ -1313,6 +1320,7 @@ impl InProgressTask {
                 completed_at = now()
             where task_id = $1
               and task_queue_name = $2
+              and attempt_number = $4
               and attempt_number = (
                   select attempt_number
                   from underway.task_attempt
@@ -1324,7 +1332,8 @@ impl InProgressTask {
             "#,
             self.id as TaskId,
             self.queue_name,
-            TaskState::Failed as TaskState
+            TaskState::Failed as TaskState,
+            self.attempt_number
         )
         .execute(&mut *conn)
         .await?;
@@ -1369,6 +1378,7 @@ impl InProgressTask {
                 error_message = $4
             where task_id = $1
               and task_queue_name = $2
+              and attempt_number = $5
               and attempt_number = (
                   select attempt_number
                   from underway.task_attempt
@@ -1382,6 +1392,7 @@ impl InProgressTask {
             self.queue_name,
             TaskState::Failed as TaskState,
             error.to_string(),
+            self.attempt_number
         )
         .execute(&mut *conn)
         .await?;
@@ -1420,6 +1431,7 @@ impl InProgressTask {
                 completed_at = now()
             where task_id = $1
               and task_queue_name = $2
+              and attempt_number = $4
               and attempt_number = (
                   select attempt_number
                   from underway.task_attempt
@@ -1431,7 +1443,8 @@ impl InProgressTask {
             "#,
             self.id as TaskId,
             self.queue_name,
-            TaskState::Failed as TaskState
+            TaskState::Failed as TaskState,
+            self.attempt_number
         )
         .execute(&mut *conn)
         .await?;
@@ -1493,9 +1506,19 @@ impl InProgressTask {
                 last_heartbeat_at = now()
             where id = $1
               and task_queue_name = $2
+              and exists (
+                  select 1
+                  from underway.task_attempt
+                  where task_id = $1
+                    and task_queue_name = $2
+                    and attempt_number = $3
+                    and state = $4
+              )
             "#,
             self.id as TaskId,
-            self.queue_name
+            self.queue_name,
+            self.attempt_number,
+            TaskState::InProgress as TaskState
         )
         .execute(executor)
         .await?;

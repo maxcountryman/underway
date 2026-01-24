@@ -28,6 +28,8 @@ Key Features:
   for reliable task storage and coordination.
 - **Atomic Task Management** Enqueue tasks within your transactions and use
   the worker's transaction within your tasks for atomic queries.
+- **Leased Execution** Heartbeats act as task leases; stale heartbeats trigger
+  new attempts and fence out older workers from updating task state.
 - **Automatic Retries** Configurable retry strategies ensure tasks are
   reliably completed, even after transient failures.
 - **Cron-Like Scheduling** Schedule recurring tasks with cron-like

@@ -1115,13 +1115,21 @@ mod tests {
 
         // Process the task multiple times to simulate retries
         for retries in 0..3 {
-            let delay = task.retry_policy().calculate_delay(retries);
-            tokio::time::sleep(delay.try_into()?).await;
-            let processed_task_id = worker
-                .process_next_task()
-                .await?
-                .expect("A task should be processed");
-            assert_eq!(task_id, processed_task_id);
+            let start = Instant::now();
+            let timeout = StdDuration::from_secs(10);
+
+            loop {
+                if let Some(processed_task_id) = worker.process_next_task().await? {
+                    assert_eq!(task_id, processed_task_id);
+                    break;
+                }
+
+                if start.elapsed() > timeout {
+                    panic!("Timed out waiting for retry {retries}");
+                }
+
+                tokio::time::sleep(StdDuration::from_millis(100)).await;
+            }
         }
 
         // Verify that the fail_times counter has reached zero
@@ -1141,6 +1149,84 @@ mod tests {
         .await?;
 
         assert_eq!(dequeued_task.state, TaskState::Succeeded);
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn fenced_attempts_ignore_stale_workers(pool: PgPool) -> sqlx::Result<(), Error> {
+        struct FenceTask;
+
+        impl Task for FenceTask {
+            type Input = ();
+            type Output = ();
+
+            async fn execute(
+                &self,
+                _: Transaction<'_, Postgres>,
+                _: Self::Input,
+            ) -> TaskResult<Self::Output> {
+                Ok(())
+            }
+        }
+
+        let queue = Queue::builder()
+            .name("fenced_attempts_ignore_stale_workers")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let task = FenceTask;
+        let task_id = queue.enqueue(&pool, &task, &()).await?;
+
+        let in_progress_task = queue
+            .dequeue()
+            .await?
+            .expect("A task should be dequeued");
+        assert_eq!(in_progress_task.attempt_number, 1);
+
+        sqlx::query!(
+            r#"
+            update underway.task
+            set last_heartbeat_at = now() - interval '1 hour'
+            where id = $1
+              and task_queue_name = $2
+            "#,
+            task_id as TaskId,
+            queue.name
+        )
+        .execute(&pool)
+        .await?;
+
+        let reclaimed_task = queue
+            .dequeue()
+            .await?
+            .expect("A reclaimed task should be dequeued");
+        assert!(reclaimed_task.attempt_number > in_progress_task.attempt_number);
+
+        let mut stale_tx = pool.begin().await?;
+        let stale_result = in_progress_task.mark_succeeded(&mut stale_tx).await;
+        stale_tx.rollback().await?;
+        assert!(matches!(stale_result, Err(crate::queue::Error::TaskNotFound(_))));
+
+        let mut reclaimed_tx = pool.begin().await?;
+        reclaimed_task.mark_succeeded(&mut reclaimed_tx).await?;
+        reclaimed_tx.commit().await?;
+
+        let task_state = sqlx::query_scalar!(
+            r#"
+            select state as "state: TaskState"
+            from underway.task
+            where id = $1
+              and task_queue_name = $2
+            "#,
+            task_id as TaskId,
+            queue.name
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(task_state, TaskState::Succeeded);
 
         Ok(())
     }

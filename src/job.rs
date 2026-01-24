@@ -917,7 +917,8 @@ impl<T: Task> EnqueuedJob<T> {
               retry_policy as "retry_policy: RetryPolicy",
               timeout,
               heartbeat,
-              concurrency_key
+              concurrency_key,
+              0 as "attempt_number!"
             from underway.task
             where input->>'job_id' = $1
               and state = $2
