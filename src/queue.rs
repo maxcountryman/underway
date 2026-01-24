@@ -293,6 +293,51 @@ pub struct Queue<T: Task> {
     _marker: PhantomData<T>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct TaskConfig {
+    retry_policy: RetryPolicy,
+    timeout: Span,
+    heartbeat: Span,
+    ttl: Span,
+    delay: Span,
+    concurrency_key: Option<String>,
+    priority: i32,
+}
+
+impl TaskConfig {
+    pub(crate) fn new(
+        retry_policy: RetryPolicy,
+        timeout: Span,
+        ttl: Span,
+        delay: Span,
+        heartbeat: Span,
+        concurrency_key: Option<String>,
+        priority: i32,
+    ) -> Self {
+        Self {
+            retry_policy,
+            timeout,
+            heartbeat,
+            ttl,
+            delay,
+            concurrency_key,
+            priority,
+        }
+    }
+
+    fn for_task<T: Task>(task: &T) -> Self {
+        Self {
+            retry_policy: task.retry_policy(),
+            timeout: task.timeout(),
+            heartbeat: task.heartbeat(),
+            ttl: task.ttl(),
+            delay: task.delay(),
+            concurrency_key: task.concurrency_key(),
+            priority: task.priority(),
+        }
+    }
+}
+
 impl<T: Task> Clone for Queue<T> {
     fn clone(&self) -> Self {
         Self {
@@ -428,7 +473,8 @@ impl<T: Task> Queue<T> {
     where
         E: PgExecutor<'a>,
     {
-        self.enqueue_with_delay(executor, task, input, task.delay())
+        let config = TaskConfig::for_task(task);
+        self.enqueue_with_config(executor, input, &config, Span::new())
             .await
     }
 
@@ -498,8 +544,22 @@ impl<T: Task> Queue<T> {
     where
         E: PgExecutor<'a>,
     {
-        let calculated_delay = task.delay().checked_add(delay)?;
-        self.enqueue_with_delay(executor, task, input, calculated_delay)
+        let config = TaskConfig::for_task(task);
+        self.enqueue_with_config(executor, input, &config, delay).await
+    }
+
+    pub(crate) async fn enqueue_with_config<'a, E>(
+        &self,
+        executor: E,
+        input: &T::Input,
+        config: &TaskConfig,
+        delay: Span,
+    ) -> Result<TaskId>
+    where
+        E: PgExecutor<'a>,
+    {
+        let calculated_delay = config.delay.checked_add(delay)?;
+        self.enqueue_with_delay(executor, input, config, calculated_delay)
             .await
     }
 
@@ -507,15 +567,15 @@ impl<T: Task> Queue<T> {
     // retries, i.e. `enqueue_after`.
     #[instrument(
         name = "enqueue",
-        skip(self, executor, task, input),
+        skip(self, executor, input, config),
         fields(queue.name = self.name, task.id = tracing::field::Empty),
         err
     )]
     async fn enqueue_with_delay<'a, E>(
         &self,
         executor: E,
-        task: &T,
         input: &T::Input,
+        config: &TaskConfig,
         delay: Span,
     ) -> Result<TaskId>
     where
@@ -525,12 +585,12 @@ impl<T: Task> Queue<T> {
 
         let input_value = serde_json::to_value(input)?;
 
-        let retry_policy = task.retry_policy();
-        let timeout = task.timeout();
-        let heartbeat = task.heartbeat();
-        let ttl = task.ttl();
-        let concurrency_key = task.concurrency_key();
-        let priority = task.priority();
+        let retry_policy = config.retry_policy;
+        let timeout = config.timeout;
+        let heartbeat = config.heartbeat;
+        let ttl = config.ttl;
+        let concurrency_key = config.concurrency_key.clone();
+        let priority = config.priority;
 
         tracing::Span::current().record("task.id", id.as_hyphenated().to_string());
 
@@ -657,12 +717,13 @@ impl<T: Task> Queue<T> {
 
         tracing::Span::current().record("tasks_numbers", tasks_number.to_string());
 
-        let timeout = task.timeout();
-        let heartbeat = task.heartbeat();
-        let ttl = task.ttl();
-        let retry_policy = task.retry_policy();
-        let concurrency_key = task.concurrency_key();
-        let priority = task.priority();
+        let config = TaskConfig::for_task(task);
+        let timeout = config.timeout;
+        let heartbeat = config.heartbeat;
+        let ttl = config.ttl;
+        let retry_policy = config.retry_policy;
+        let concurrency_key = config.concurrency_key.clone();
+        let priority = config.priority;
 
         let mut tx = executor.begin().await?;
 
@@ -674,7 +735,7 @@ impl<T: Task> Queue<T> {
             for input in chunk {
                 ids.push(TaskId::new());
                 input_values.push(serde_json::to_value(input)?);
-                delays.push(StdDuration::try_from(task.delay())?);
+                delays.push(StdDuration::try_from(config.delay)?);
             }
 
             sqlx::query!(
