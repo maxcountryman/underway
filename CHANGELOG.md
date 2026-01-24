@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # Unreleased
 
 - Fix: Pending retry delays now respect the last attempt time when re-queuing tasks
