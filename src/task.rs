@@ -438,7 +438,9 @@ pub trait Task: Send + 'static {
     /// This is used by workers to update the task row with the current
     /// timestamp. Doing so makes it possible to detect tasks that may have
     /// become stuck, for example because a worker crashed or otherwise
-    /// didn't exit cleanly.
+    /// didn't exit cleanly. When a heartbeat is considered stale, a new attempt
+    /// may be created and older attempts are fenced out from updating task
+    /// state.
     ///
     /// The default is 30 seconds.
     ///

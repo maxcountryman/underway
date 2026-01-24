@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            select\n              id as \"id: TaskId\",\n              task_queue_name as \"queue_name\",\n              input,\n              retry_policy as \"retry_policy: RetryPolicy\",\n              timeout,\n              heartbeat,\n              concurrency_key\n            from underway.task\n            where input->>'job_id' = $1\n              and state = $2\n            for update skip locked\n            ",
+  "query": "\n            select\n              id as \"id: TaskId\",\n              task_queue_name as \"queue_name\",\n              input,\n              retry_policy as \"retry_policy: RetryPolicy\",\n              timeout,\n              heartbeat,\n              concurrency_key,\n              0 as \"attempt_number!\"\n            from underway.task\n            where input->>'job_id' = $1\n              and state = $2\n            for update skip locked\n            ",
   "describe": {
     "columns": [
       {
@@ -61,6 +61,11 @@
         "ordinal": 6,
         "name": "concurrency_key",
         "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "attempt_number!",
+        "type_info": "Int4"
       }
     ],
     "parameters": {
@@ -89,8 +94,9 @@
       false,
       false,
       false,
-      true
+      true,
+      null
     ]
   },
-  "hash": "7513f95eb46920c91e32cf7dac34155bbaac4ee4a5011c110df702eab4c8e03f"
+  "hash": "db21627772830b526552af758a26b4797f55cf717e66149edaaf69f97a39c974"
 }
