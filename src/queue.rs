@@ -35,7 +35,7 @@
 //! # impl Task for MyTask {
 //! #    type Input = ();
 //! #    type Output = ();
-//! #    async fn execute(&self, _tx: Transaction<'_, Postgres>, input: Self::Input) -> TaskResult<Self::Output> {
+//! #    async fn execute(&self, _tx: &mut Transaction<'_, Postgres>, input: Self::Input) -> TaskResult<Self::Output> {
 //! #        Ok(())
 //! #    }
 //! # }
@@ -85,7 +85,7 @@
 //! # impl Task for MyTask {
 //! #    type Input = ();
 //! #    type Output = ();
-//! #    async fn execute(&self, _tx: Transaction<'_, Postgres>, input: Self::Input) -> TaskResult<Self::Output> {
+//! #    async fn execute(&self, _tx: &mut Transaction<'_, Postgres>, input: Self::Input) -> TaskResult<Self::Output> {
 //! #        Ok(())
 //! #    }
 //! # }
@@ -154,7 +154,7 @@
 //! # impl Task for MyTask {
 //! #    type Input = ();
 //! #    type Output = ();
-//! #    async fn execute(&self, _tx: Transaction<'_, Postgres>, input: Self::Input) -> TaskResult<Self::Output> {
+//! #    async fn execute(&self, _tx: &mut Transaction<'_, Postgres>, input: Self::Input) -> TaskResult<Self::Output> {
 //! #        Ok(())
 //! #    }
 //! # }
@@ -212,7 +212,7 @@
 //! # impl Task for MyTask {
 //! #    type Input = ();
 //! #    type Output = ();
-//! #    async fn execute(&self, _tx: Transaction<'_, Postgres>, input: Self::Input) -> TaskResult<Self::Output> {
+//! #    async fn execute(&self, _tx: &mut Transaction<'_, Postgres>, input: Self::Input) -> TaskResult<Self::Output> {
 //! #        Ok(())
 //! #    }
 //! # }
@@ -320,7 +320,7 @@ impl<T: Task> Queue<T> {
     /// #     type Output = ();
     /// #     async fn execute(
     /// #         &self,
-    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: &mut Transaction<'_, Postgres>,
     /// #         _: Self::Input,
     /// #     ) -> TaskResult<Self::Output> {
     /// #         Ok(())
@@ -389,7 +389,7 @@ impl<T: Task> Queue<T> {
     /// #     type Output = ();
     /// #     async fn execute(
     /// #         &self,
-    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: &mut Transaction<'_, Postgres>,
     /// #         _: Self::Input,
     /// #     ) -> TaskResult<Self::Output> {
     /// #         Ok(())
@@ -454,7 +454,7 @@ impl<T: Task> Queue<T> {
     /// #     type Output = ();
     /// #     async fn execute(
     /// #         &self,
-    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: &mut Transaction<'_, Postgres>,
     /// #         _: Self::Input,
     /// #     ) -> TaskResult<Self::Output> {
     /// #         Ok(())
@@ -582,7 +582,7 @@ impl<T: Task> Queue<T> {
     /// #     type Output = ();
     /// #     async fn execute(
     /// #         &self,
-    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: &mut Transaction<'_, Postgres>,
     /// #         _: Self::Input,
     /// #     ) -> TaskResult<Self::Output> {
     /// #         Ok(())
@@ -755,7 +755,7 @@ impl<T: Task> Queue<T> {
     /// #     type Output = ();
     /// #     async fn execute(
     /// #         &self,
-    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: &mut Transaction<'_, Postgres>,
     /// #         _: Self::Input,
     /// #     ) -> TaskResult<Self::Output> {
     /// #         Ok(())
@@ -951,7 +951,7 @@ impl<T: Task> Queue<T> {
     /// #     type Output = ();
     /// #     async fn execute(
     /// #         &self,
-    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: &mut Transaction<'_, Postgres>,
     /// #         _: Self::Input,
     /// #     ) -> TaskResult<Self::Output> {
     /// #         Ok(())
@@ -1044,7 +1044,7 @@ impl<T: Task> Queue<T> {
     /// #     type Output = ();
     /// #     async fn execute(
     /// #         &self,
-    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: &mut Transaction<'_, Postgres>,
     /// #         _: Self::Input,
     /// #     ) -> TaskResult<Self::Output> {
     /// #         Ok(())
@@ -1643,7 +1643,7 @@ impl<T: Task> Builder<T, Initial> {
     /// #     type Output = ();
     /// #     async fn execute(
     /// #         &self,
-    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: &mut Transaction<'_, Postgres>,
     /// #         _: Self::Input,
     /// #     ) -> TaskResult<Self::Output> {
     /// #         Ok(())
@@ -1673,7 +1673,7 @@ impl<T: Task> Builder<T, Initial> {
     /// #     type Output = ();
     /// #     async fn execute(
     /// #         &self,
-    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: &mut Transaction<'_, Postgres>,
     /// #         _: Self::Input,
     /// #     ) -> TaskResult<Self::Output> {
     /// #         Ok(())
@@ -1708,7 +1708,7 @@ impl<T: Task> Builder<T, NameSet> {
     /// #     type Output = ();
     /// #     async fn execute(
     /// #         &self,
-    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: &mut Transaction<'_, Postgres>,
     /// #         _: Self::Input,
     /// #     ) -> TaskResult<Self::Output> {
     /// #         Ok(())
@@ -1738,7 +1738,7 @@ impl<T: Task> Builder<T, NameSet> {
     /// #     type Output = ();
     /// #     async fn execute(
     /// #         &self,
-    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: &mut Transaction<'_, Postgres>,
     /// #         _: Self::Input,
     /// #     ) -> TaskResult<Self::Output> {
     /// #         Ok(())
@@ -1785,7 +1785,7 @@ impl<T: Task> Builder<T, PoolSet> {
     /// #     type Output = ();
     /// #     async fn execute(
     /// #         &self,
-    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: &mut Transaction<'_, Postgres>,
     /// #         _: Self::Input,
     /// #     ) -> TaskResult<Self::Output> {
     /// #         Ok(())
@@ -1973,7 +1973,7 @@ mod tests {
 
         async fn execute(
             &self,
-            _: Transaction<'_, Postgres>,
+            _: &mut Transaction<'_, Postgres>,
             _: Self::Input,
         ) -> TaskResult<Self::Output> {
             Ok(())
@@ -2078,7 +2078,7 @@ mod tests {
 
             async fn execute(
                 &self,
-                _tx: Transaction<'_, Postgres>,
+                _tx: &mut Transaction<'_, Postgres>,
                 _input: Self::Input,
             ) -> TaskResult<Self::Output> {
                 Ok(())
@@ -2132,7 +2132,7 @@ mod tests {
 
             async fn execute(
                 &self,
-                _tx: Transaction<'_, Postgres>,
+                _tx: &mut Transaction<'_, Postgres>,
                 _input: Self::Input,
             ) -> TaskResult<Self::Output> {
                 Ok(())
@@ -2181,7 +2181,7 @@ mod tests {
 
             async fn execute(
                 &self,
-                _tx: Transaction<'_, Postgres>,
+                _tx: &mut Transaction<'_, Postgres>,
                 _input: Self::Input,
             ) -> TaskResult<Self::Output> {
                 Ok(())
@@ -2230,7 +2230,7 @@ mod tests {
 
             async fn execute(
                 &self,
-                _tx: Transaction<'_, Postgres>,
+                _tx: &mut Transaction<'_, Postgres>,
                 _input: Self::Input,
             ) -> TaskResult<Self::Output> {
                 Ok(())
@@ -2278,7 +2278,7 @@ mod tests {
 
             async fn execute(
                 &self,
-                _tx: Transaction<'_, Postgres>,
+                _tx: &mut Transaction<'_, Postgres>,
                 _input: Self::Input,
             ) -> TaskResult<Self::Output> {
                 Ok(())
@@ -2330,7 +2330,7 @@ mod tests {
 
             async fn execute(
                 &self,
-                _tx: Transaction<'_, Postgres>,
+                _tx: &mut Transaction<'_, Postgres>,
                 _input: Self::Input,
             ) -> TaskResult<Self::Output> {
                 Ok(())
@@ -2378,7 +2378,7 @@ mod tests {
 
             async fn execute(
                 &self,
-                _tx: Transaction<'_, Postgres>,
+                _tx: &mut Transaction<'_, Postgres>,
                 _input: Self::Input,
             ) -> TaskResult<Self::Output> {
                 Ok(())
@@ -2429,7 +2429,7 @@ mod tests {
 
             async fn execute(
                 &self,
-                _tx: Transaction<'_, Postgres>,
+                _tx: &mut Transaction<'_, Postgres>,
                 _input: Self::Input,
             ) -> TaskResult<Self::Output> {
                 Ok(())

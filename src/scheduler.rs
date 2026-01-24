@@ -76,7 +76,7 @@ impl<T: Task> Scheduler<T> {
     /// #     type Output = ();
     /// #     async fn execute(
     /// #         &self,
-    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: &mut Transaction<'_, Postgres>,
     /// #         _: Self::Input,
     /// #     ) -> TaskResult<Self::Output> {
     /// #         Ok(())
@@ -133,7 +133,7 @@ impl<T: Task> Scheduler<T> {
     /// #     type Output = ();
     /// #     async fn execute(
     /// #         &self,
-    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: &mut Transaction<'_, Postgres>,
     /// #         _: Self::Input,
     /// #     ) -> TaskResult<Self::Output> {
     /// #         Ok(())
@@ -193,7 +193,7 @@ impl<T: Task> Scheduler<T> {
     /// #     type Output = ();
     /// #     async fn execute(
     /// #         &self,
-    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: &mut Transaction<'_, Postgres>,
     /// #         _: Self::Input,
     /// #     ) -> TaskResult<Self::Output> {
     /// #         Ok(())
@@ -245,7 +245,7 @@ impl<T: Task> Scheduler<T> {
     /// #     type Output = ();
     /// #     async fn execute(
     /// #         &self,
-    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: &mut Transaction<'_, Postgres>,
     /// #         _: Self::Input,
     /// #     ) -> TaskResult<Self::Output> {
     /// #         Ok(())
@@ -300,7 +300,7 @@ impl<T: Task> Scheduler<T> {
     /// #     type Output = ();
     /// #     async fn execute(
     /// #         &self,
-    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: &mut Transaction<'_, Postgres>,
     /// #         _: Self::Input,
     /// #     ) -> TaskResult<Self::Output> {
     /// #         Ok(())

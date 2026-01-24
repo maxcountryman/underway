@@ -35,7 +35,7 @@
 //! # impl Task for MyTask {
 //! #    type Input = ();
 //! #    type Output = ();
-//! #    async fn execute(&self, tx: Transaction<'_, Postgres>, input: Self::Input) -> TaskResult<Self::Output> {
+//! #    async fn execute(&self, tx: &mut Transaction<'_, Postgres>, input: Self::Input) -> TaskResult<Self::Output> {
 //! #        Ok(())
 //! #    }
 //! # }
@@ -84,7 +84,7 @@
 //! # impl Task for MyTask {
 //! #    type Input = ();
 //! #    type Output = ();
-//! #    async fn execute(&self, _tx: Transaction<'_, Postgres>, input: Self::Input) -> TaskResult<Self::Output> {
+//! #    async fn execute(&self, _tx: &mut Transaction<'_, Postgres>, input: Self::Input) -> TaskResult<Self::Output> {
 //! #        Ok(())
 //! #    }
 //! # }
@@ -140,7 +140,7 @@ use crate::{
     queue::{
         connect_listeners_with_retry, shutdown_channel, Error as QueueError, InProgressTask, Queue,
     },
-    task::{Error as TaskError, RetryCount, RetryPolicy, Task, TaskId},
+    task::{Error as TaskError, Result as TaskResult, RetryCount, RetryPolicy, Task, TaskId},
 };
 pub(crate) type Result<T = ()> = std::result::Result<T, Error>;
 
@@ -213,7 +213,7 @@ impl<T: Task + Sync> Worker<T> {
     /// #     type Output = ();
     /// #     async fn execute(
     /// #         &self,
-    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: &mut Transaction<'_, Postgres>,
     /// #         _: Self::Input,
     /// #     ) -> TaskResult<Self::Output> {
     /// #         Ok(())
@@ -269,7 +269,7 @@ impl<T: Task + Sync> Worker<T> {
     /// #     type Output = ();
     /// #     async fn execute(
     /// #         &self,
-    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: &mut Transaction<'_, Postgres>,
     /// #         _: Self::Input,
     /// #     ) -> TaskResult<Self::Output> {
     /// #         Ok(())
@@ -317,7 +317,7 @@ impl<T: Task + Sync> Worker<T> {
     /// #     type Output = ();
     /// #     async fn execute(
     /// #         &self,
-    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: &mut Transaction<'_, Postgres>,
     /// #         _: Self::Input,
     /// #     ) -> TaskResult<Self::Output> {
     /// #         Ok(())
@@ -377,7 +377,7 @@ impl<T: Task + Sync> Worker<T> {
     /// #     type Output = ();
     /// #     async fn execute(
     /// #         &self,
-    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: &mut Transaction<'_, Postgres>,
     /// #         _: Self::Input,
     /// #     ) -> TaskResult<Self::Output> {
     /// #         Ok(())
@@ -433,7 +433,7 @@ impl<T: Task + Sync> Worker<T> {
     /// #     type Output = ();
     /// #     async fn execute(
     /// #         &self,
-    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: &mut Transaction<'_, Postgres>,
     /// #         _: Self::Input,
     /// #     ) -> TaskResult<Self::Output> {
     /// #         Ok(())
@@ -492,7 +492,7 @@ impl<T: Task + Sync> Worker<T> {
     /// #     type Output = ();
     /// #     async fn execute(
     /// #         &self,
-    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: &mut Transaction<'_, Postgres>,
     /// #         _: Self::Input,
     /// #     ) -> TaskResult<Self::Output> {
     /// #         Ok(())
@@ -545,7 +545,7 @@ impl<T: Task + Sync> Worker<T> {
     /// #     type Output = ();
     /// #     async fn execute(
     /// #         &self,
-    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: &mut Transaction<'_, Postgres>,
     /// #         _: Self::Input,
     /// #     ) -> TaskResult<Self::Output> {
     /// #         Ok(())
@@ -767,7 +767,7 @@ impl<T: Task + Sync> Worker<T> {
     /// #     type Output = ();
     /// #     async fn execute(
     /// #         &self,
-    /// #         _: Transaction<'_, Postgres>,
+    /// #         _: &mut Transaction<'_, Postgres>,
     /// #         _: Self::Input,
     /// #     ) -> TaskResult<Self::Output> {
     /// #         Ok(())
@@ -851,16 +851,30 @@ impl<T: Task + Sync> Worker<T> {
         });
 
         // Execute savepoint, available directly to the task execute method.
-        let execute_tx = tx.begin().await?;
+        let mut execute_tx = tx.begin().await?;
 
-        tokio::select! {
-            result = self.task.execute(execute_tx, input) => {
+        enum TaskOutcome<T> {
+            Completed(TaskResult<T>),
+            TimedOut,
+        }
+
+        let outcome = tokio::select! {
+            result = self.task.execute(&mut execute_tx, input) => TaskOutcome::Completed(result),
+
+            // Handle timed-out task execution.
+            _ = tokio::time::sleep(timeout) => TaskOutcome::TimedOut,
+        };
+
+        match outcome {
+            TaskOutcome::Completed(result) => {
                 match result {
                     Ok(_) => {
+                        execute_tx.commit().await?;
                         in_progress_task.mark_succeeded(&mut tx).await?;
                     }
 
                     Err(ref error) => {
+                        execute_tx.rollback().await?;
                         let retry_policy = &in_progress_task.retry_policy;
                         self.handle_task_error(&mut tx, &in_progress_task, retry_policy, error)
                             .await?;
@@ -868,8 +882,8 @@ impl<T: Task + Sync> Worker<T> {
                 }
             }
 
-            // Handle timed-out task execution.
-            _ = tokio::time::sleep(timeout) => {
+            TaskOutcome::TimedOut => {
+                execute_tx.rollback().await?;
                 tracing::error!("Task execution timed out");
                 let retry_policy = &in_progress_task.retry_policy;
                 self.handle_task_timeout(&mut tx, &in_progress_task, retry_policy, timeout).await?;
@@ -1011,7 +1025,7 @@ mod tests {
 
         async fn execute(
             &self,
-            _: Transaction<'_, Postgres>,
+            _: &mut Transaction<'_, Postgres>,
             _: Self::Input,
         ) -> TaskResult<Self::Output> {
             Ok(())
@@ -1029,7 +1043,7 @@ mod tests {
 
         async fn execute(
             &self,
-            _: Transaction<'_, Postgres>,
+            _: &mut Transaction<'_, Postgres>,
             _: Self::Input,
         ) -> TaskResult<Self::Output> {
             let mut fail_times = self.fail_times.lock().await;
@@ -1079,6 +1093,61 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn task_execute_commits_changes(pool: PgPool) -> sqlx::Result<(), Error> {
+        struct WriteTask;
+
+        impl Task for WriteTask {
+            type Input = String;
+            type Output = ();
+
+            async fn execute(
+                &self,
+                tx: &mut Transaction<'_, Postgres>,
+                input: Self::Input,
+            ) -> TaskResult<Self::Output> {
+                sqlx::query(
+                    "insert into underway.worker_commit_test (note) values ($1)",
+                )
+                .bind(input)
+                .execute(tx.as_mut())
+                .await?;
+
+                Ok(())
+            }
+        }
+
+        sqlx::query(
+            "create table if not exists underway.worker_commit_test (id serial primary key, note text)",
+        )
+        .execute(&pool)
+        .await?;
+
+        let queue = Queue::builder()
+            .name("task_execute_commits_changes")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let task = WriteTask;
+        queue
+            .enqueue(&pool, &task, &"persisted".to_string())
+            .await?;
+
+        let worker = Worker::new(Arc::new(queue), task);
+        worker.process_next_task().await?;
+
+        let count: i64 = sqlx::query_scalar(
+            "select count(*) from underway.worker_commit_test",
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(count, 1);
+
+        Ok(())
+    }
+
+    #[sqlx::test]
     async fn process_retries(pool: PgPool) -> sqlx::Result<(), Error> {
         let queue = Queue::builder()
             .name("process_retries")
@@ -1097,13 +1166,20 @@ mod tests {
         let task_id = queue.enqueue(&pool, &worker.task, &()).await?;
 
         // Process the task multiple times to simulate retries
-        for retries in 0..3 {
-            let delay = task.retry_policy().calculate_delay(retries);
-            tokio::time::sleep(delay.try_into()?).await;
-            let processed_task_id = worker
-                .process_next_task()
-                .await?
-                .expect("A task should be processed");
+        for _ in 0..3 {
+            let start = Instant::now();
+            let processed_task_id = loop {
+                if let Some(processed_task_id) = worker.process_next_task().await? {
+                    break processed_task_id;
+                }
+
+                if start.elapsed() > StdDuration::from_secs(10) {
+                    panic!("A task should be processed");
+                }
+
+                tokio::time::sleep(StdDuration::from_millis(100)).await;
+            };
+
             assert_eq!(task_id, processed_task_id);
         }
 
@@ -1138,7 +1214,7 @@ mod tests {
 
             async fn execute(
                 &self,
-                _: Transaction<'_, Postgres>,
+                _: &mut Transaction<'_, Postgres>,
                 _: Self::Input,
             ) -> TaskResult<Self::Output> {
                 tokio::time::sleep(StdDuration::from_secs(1)).await;
@@ -1220,7 +1296,7 @@ mod tests {
 
             async fn execute(
                 &self,
-                _: Transaction<'_, Postgres>,
+                _: &mut Transaction<'_, Postgres>,
                 _: Self::Input,
             ) -> TaskResult<Self::Output> {
                 // Simulate work by sleeping

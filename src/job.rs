@@ -642,7 +642,7 @@ use builder_states::{Initial, PoolSet, QueueNameSet, QueueSet, StateSet, StepSet
 use jiff::Span;
 use sealed::JobState;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use sqlx::{PgExecutor, PgPool, Postgres, Transaction};
+use sqlx::{Acquire, PgExecutor, PgPool, Postgres, Transaction};
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
@@ -1632,7 +1632,7 @@ where
     )]
     async fn execute(
         &self,
-        mut tx: Transaction<'_, Postgres>,
+        tx: &mut Transaction<'_, Postgres>,
         input: Self::Input,
     ) -> TaskResult<Self::Output> {
         let JobState {
@@ -1647,30 +1647,34 @@ where
 
         let (step, _) = &self.steps[step_index];
 
+        let step_tx = tx.begin().await?;
+
         // SAFETY:
         //
-        // We are extending the lifetime of `tx` to `'static` to satisfy the trait
-        // object requirements in `StepExecutor`. This is sound because:
+        // We are extending the lifetime of `step_tx` to `'static` to satisfy the
+        // trait object requirements in `StepExecutor`. This is sound because:
         //
         // 1. The `execute` method awaits the future returned by `execute_step`
-        //    immediately, ensuring that `tx` remains valid during the entire operation.
+        //    immediately, ensuring that `step_tx` remains valid during the entire
+        //    operation.
         // 2. `step_tx` does not escape the scope of the `execute` method; it is not
         //    stored or moved elsewhere.
         // 3. The `Context` and any data derived from `step_tx` are used only within the
         //    `execute_step` method and its returned future.
         //
-        // As a result, even though we are claiming a `'static` lifetime for `tx`, we
-        // ensure that it does not actually outlive its true lifetime, maintaining
-        // soundness.
+        // As a result, even though we are claiming a `'static` lifetime for
+        // `step_tx`, we ensure that it does not actually outlive its true lifetime,
+        // maintaining soundness.
         //
         // Note: This is a workaround due to limitations with trait objects and
         // lifetimes in async contexts. Be cautious with any changes that might
-        // allow `step_tx` to outlive `tx`.
-        let step_tx: Transaction<'static, Postgres> = unsafe { mem::transmute_copy(&tx) };
+        // allow `step_tx` to outlive its true lifetime.
+        let step_tx_for_context: Transaction<'static, Postgres> =
+            unsafe { mem::transmute_copy(&step_tx) };
 
         let cx = Context {
             state: self.state.clone(),
-            tx: step_tx,
+            tx: step_tx_for_context,
             step_index,
             job_id,
             step_count: self.steps.len(),
@@ -1681,11 +1685,12 @@ where
         let step_result = match step.execute_step(cx, step_input).await {
             Ok(result) => result,
             Err(err) => {
-                // N.B.: Commit the transaction to ensure attempt rows are persisted.
-                tx.commit().await?;
+                step_tx.rollback().await?;
                 return Err(err);
             }
         };
+
+        step_tx.commit().await?;
 
         // If there's a next step, enqueue it.
         if let Some((next_input, delay)) = step_result {
@@ -1700,13 +1705,10 @@ where
             };
 
             self.queue
-                .enqueue_after(&mut *tx, self, &next_job_input, delay)
+                .enqueue_after(tx.as_mut(), self, &next_job_input, delay)
                 .await
                 .map_err(|err| TaskError::Retryable(err.to_string()))?;
         }
-
-        // Commit the transaction.
-        tx.commit().await?;
 
         Ok(())
     }

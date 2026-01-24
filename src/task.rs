@@ -50,7 +50,7 @@
 //!     /// Simulate sending a welcome email by printing a message to the console.
 //!     async fn execute(
 //!         &self,
-//!         _tx: Transaction<'_, Postgres>,
+//!         _tx: &mut Transaction<'_, Postgres>,
 //!         input: Self::Input,
 //!     ) -> TaskResult<Self::Output> {
 //!         println!(
@@ -64,14 +64,14 @@
 //!     }
 //! }
 //! # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
-//! # let tx = pool.begin().await?;
+//! # let mut tx = pool.begin().await?;
 //! # let task = WelcomeEmailTask;
 //! # let input = WelcomeEmail {
 //! #     user_id: 1,
 //! #     email: "user@example.com".to_string(),
 //! #     name: "Alice".to_string(),
 //! # };
-//! # task.execute(tx, input).await?;
+//! # task.execute(&mut tx, input).await?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! # });
 //! # }
@@ -223,6 +223,9 @@ pub trait Task: Send + 'static {
     /// The core of a task, this method is called when the task is picked up by
     /// a worker.
     ///
+    /// The worker commits or rolls back this savepoint based on the outcome of
+    /// execution.
+    ///
     /// Typically this method will do something with the provided input. If no
     /// input is needed, then the unit type, `()`, can be used instead and the
     /// input ignored.
@@ -252,7 +255,7 @@ pub trait Task: Send + 'static {
     ///     /// Simulate sending a welcome email by printing a message to the console.
     ///     async fn execute(
     ///         &self,
-    ///         tx: Transaction<'_, Postgres>,
+    ///         tx: &mut Transaction<'_, Postgres>,
     ///         input: Self::Input,
     ///     ) -> TaskResult<Self::Output> {
     ///         println!(
@@ -268,7 +271,7 @@ pub trait Task: Send + 'static {
     /// ```
     fn execute(
         &self,
-        tx: Transaction<'_, Postgres>,
+        tx: &mut Transaction<'_, Postgres>,
         input: Self::Input,
     ) -> impl Future<Output = Result<Self::Output>> + Send;
 
@@ -296,7 +299,7 @@ pub trait Task: Send + 'static {
     ///
     ///     async fn execute(
     ///         &self,
-    ///         _tx: Transaction<'_, Postgres>,
+    ///         _tx: &mut Transaction<'_, Postgres>,
     ///         _input: Self::Input,
     ///     ) -> TaskResult<Self::Output> {
     ///         Ok(())
@@ -337,7 +340,7 @@ pub trait Task: Send + 'static {
     ///
     ///     async fn execute(
     ///         &self,
-    ///         _tx: Transaction<'_, Postgres>,
+    ///         _tx: &mut Transaction<'_, Postgres>,
     ///         _input: Self::Input,
     ///     ) -> TaskResult<Self::Output> {
     ///         Ok(())
@@ -378,7 +381,7 @@ pub trait Task: Send + 'static {
     ///
     ///     async fn execute(
     ///         &self,
-    ///         _tx: Transaction<'_, Postgres>,
+    ///         _tx: &mut Transaction<'_, Postgres>,
     ///         _input: Self::Input,
     ///     ) -> TaskResult<Self::Output> {
     ///         Ok(())
@@ -416,7 +419,7 @@ pub trait Task: Send + 'static {
     ///
     ///     async fn execute(
     ///         &self,
-    ///         _tx: Transaction<'_, Postgres>,
+    ///         _tx: &mut Transaction<'_, Postgres>,
     ///         _input: Self::Input,
     ///     ) -> TaskResult<Self::Output> {
     ///         Ok(())
@@ -457,7 +460,7 @@ pub trait Task: Send + 'static {
     ///
     ///     async fn execute(
     ///         &self,
-    ///         _tx: Transaction<'_, Postgres>,
+    ///         _tx: &mut Transaction<'_, Postgres>,
     ///         _input: Self::Input,
     ///     ) -> TaskResult<Self::Output> {
     ///         Ok(())
@@ -503,7 +506,7 @@ pub trait Task: Send + 'static {
     ///
     ///     async fn execute(
     ///         &self,
-    ///         _tx: Transaction<'_, Postgres>,
+    ///         _tx: &mut Transaction<'_, Postgres>,
     ///         _input: Self::Input,
     ///     ) -> TaskResult<Self::Output> {
     ///         Ok(())
@@ -542,7 +545,7 @@ pub trait Task: Send + 'static {
     ///
     ///     async fn execute(
     ///         &self,
-    ///         _tx: Transaction<'_, Postgres>,
+    ///         _tx: &mut Transaction<'_, Postgres>,
     ///         _input: Self::Input,
     ///     ) -> TaskResult<Self::Output> {
     ///         Ok(())
@@ -599,7 +602,7 @@ mod tests {
 
         async fn execute(
             &self,
-            _tx: Transaction<'_, Postgres>,
+            _tx: &mut Transaction<'_, Postgres>,
             input: Self::Input,
         ) -> Result<Self::Output> {
             println!("Executing task with message: {}", input.message);
@@ -617,8 +620,8 @@ mod tests {
             message: "Hello, World!".to_string(),
         };
 
-        let tx = pool.begin().await.unwrap();
-        let result = task.execute(tx, input).await;
+        let mut tx = pool.begin().await.unwrap();
+        let result = task.execute(&mut tx, input).await;
         assert!(result.is_ok())
     }
 
@@ -629,8 +632,8 @@ mod tests {
             message: "fail".to_string(),
         };
 
-        let tx = pool.begin().await.unwrap();
-        let result = task.execute(tx, input).await;
+        let mut tx = pool.begin().await.unwrap();
+        let result = task.execute(&mut tx, input).await;
         assert!(result.is_err())
     }
 

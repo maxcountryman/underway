@@ -1,6 +1,7 @@
 use std::env;
 
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use sqlx::{PgPool, Postgres, Transaction};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use underway::{
@@ -39,7 +40,11 @@ impl Task for WelcomeEmailTask {
     type Input = WelcomeEmail;
     type Output = ();
 
-    async fn execute(&self, _tx: Transaction<'_, Postgres>, input: Self::Input) -> TaskResult<()> {
+    async fn execute(
+        &self,
+        _tx: &mut Transaction<'_, Postgres>,
+        input: Self::Input,
+    ) -> TaskResult<()> {
         tracing::info!(?input, "Simulate sending a welcome email");
         Ok(())
     }
@@ -72,7 +77,11 @@ impl Task for OrderTask {
     type Input = Order;
     type Output = ();
 
-    async fn execute(&self, _tx: Transaction<'_, Postgres>, input: Self::Input) -> TaskResult<()> {
+    async fn execute(
+        &self,
+        _tx: &mut Transaction<'_, Postgres>,
+        input: Self::Input,
+    ) -> TaskResult<()> {
         tracing::info!(?input, "Simulate order processing");
         Ok(())
     }
@@ -128,7 +137,11 @@ impl Task for Multitask {
     type Input = TaskInput;
     type Output = ();
 
-    async fn execute(&self, tx: Transaction<'_, Postgres>, input: Self::Input) -> TaskResult<()> {
+    async fn execute(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        input: Self::Input,
+    ) -> TaskResult<()> {
         match input {
             TaskInput::WelcomeEmail(input) => self.welcome_email.execute(tx, input).await,
             TaskInput::Order(input) => self.order.execute(tx, input).await,
@@ -163,13 +176,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .pool(pool.clone())
         .build()
         .await?;
+    let queue = Arc::new(queue);
 
     // Enqueue a welcome email task.
     let welcome_email_task = WelcomeEmailTask;
     let task_id = welcome_email_task
         .enqueue(
             &pool,
-            &queue,
+            queue.as_ref(),
             WelcomeEmail {
                 user_id: 42,
                 email: "ferris@example.com".to_string(),
@@ -185,7 +199,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let task_id = order_task
         .enqueue(
             &pool,
-            &queue,
+            queue.as_ref(),
             Order {
                 user_id: 42,
                 sku: "SKU0-0042".to_string(),
@@ -197,7 +211,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Run a worker that processes all tasks.
     let multitask = Multitask::new();
-    Worker::new(queue, multitask).run().await?;
+    Worker::new(queue.clone(), multitask).run().await?;
 
     Ok(())
 }
