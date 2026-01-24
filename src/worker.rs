@@ -1179,10 +1179,7 @@ mod tests {
         let task = FenceTask;
         let task_id = queue.enqueue(&pool, &task, &()).await?;
 
-        let in_progress_task = queue
-            .dequeue()
-            .await?
-            .expect("A task should be dequeued");
+        let in_progress_task = queue.dequeue().await?.expect("A task should be dequeued");
         assert_eq!(in_progress_task.attempt_number, 1);
 
         sqlx::query!(
@@ -1207,7 +1204,10 @@ mod tests {
         let mut stale_tx = pool.begin().await?;
         let stale_result = in_progress_task.mark_succeeded(&mut stale_tx).await;
         stale_tx.rollback().await?;
-        assert!(matches!(stale_result, Err(crate::queue::Error::TaskNotFound(_))));
+        assert!(matches!(
+            stale_result,
+            Err(crate::queue::Error::TaskNotFound(_))
+        ));
 
         let mut reclaimed_tx = pool.begin().await?;
         reclaimed_task.mark_succeeded(&mut reclaimed_tx).await?;
