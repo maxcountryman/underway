@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            update underway.task\n            set updated_at = now()\n            where id = $1\n              and task_queue_name = $2\n              and $3 = (\n                  select max(attempt_number)\n                  from underway.task_attempt\n                  where task_id = $1\n                    and task_queue_name = $2\n              )\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "dc0ada858cc5d0d0d6752e562654879e3f82963af9feac2101b9eb969d2bebf3"
+}
