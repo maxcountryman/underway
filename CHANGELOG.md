@@ -1,5 +1,8 @@
 # Unreleased
 
+- Fix: Job step configuration now uses per-step task settings and always starts new enqueues at step 0
+- Add: Job step builders support timeout, ttl, delay, heartbeat, concurrency key, and priority settings
+
 # 0.2.0
 
 - Breaking: Queues are now stored and passed as `Arc<Queue<_>>`;
