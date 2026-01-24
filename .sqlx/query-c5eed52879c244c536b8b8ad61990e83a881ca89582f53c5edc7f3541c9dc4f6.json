@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            update underway.task\n            set last_heartbeat_at = now() - interval '30 seconds'\n            where id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c5eed52879c244c536b8b8ad61990e83a881ca89582f53c5edc7f3541c9dc4f6"
+}
