@@ -630,14 +630,8 @@
 //! desired.
 
 use std::{
-    future::Future,
-    marker::PhantomData,
-    mem,
-    ops::Deref,
-    pin::Pin,
-    result::Result as StdResult,
-    sync::Arc,
-    task::Poll,
+    future::Future, marker::PhantomData, mem, ops::Deref, pin::Pin, result::Result as StdResult,
+    sync::Arc, task::Poll,
 };
 
 use builder_states::{Initial, PoolSet, QueueNameSet, QueueSet, StateSet, StepSet};

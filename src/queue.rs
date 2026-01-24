@@ -545,7 +545,8 @@ impl<T: Task> Queue<T> {
         E: PgExecutor<'a>,
     {
         let config = TaskConfig::for_task(task);
-        self.enqueue_with_config(executor, input, &config, delay).await
+        self.enqueue_with_config(executor, input, &config, delay)
+            .await
     }
 
     pub(crate) async fn enqueue_with_config<'a, E>(
