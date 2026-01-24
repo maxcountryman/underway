@@ -812,25 +812,28 @@ impl<T: Task> Queue<T> {
             with available_task as (
                 select id
                 from underway.task
-                where task_queue_name = $1
-                  and (
-                      -- Find pending tasks...
-                      state = $2
-                      -- ...Or look for stalled tasks.
-                      or (
-                          state = $3
-                          -- Has heartbeat stalled?
-                          and last_heartbeat_at < now() - heartbeat
-                          -- Are there remaining retries?
-                          and (retry_policy).max_attempts > (
-                              select count(*)
-                              from underway.task_attempt
-                              where task_queue_name = $1
-                                and task_id = id
-                          )
-                      )
-                  )
-                  and created_at + delay <= now()
+              where task_queue_name = $1
+                and (
+                    -- Find pending tasks...
+                    (
+                        state = $2
+                        and coalesce(last_attempt_at, created_at) + delay <= now()
+                    )
+                    -- ...Or look for stalled tasks.
+                    or (
+                        state = $3
+                        -- Has heartbeat stalled?
+                        and last_heartbeat_at < now() - heartbeat
+                        -- Are there remaining retries?
+                        and (retry_policy).max_attempts > (
+                            select count(*)
+                            from underway.task_attempt
+                            where task_queue_name = $1
+                              and task_id = id
+                        )
+                        and created_at + delay <= now()
+                    )
+                )
                 order by
                   priority desc,
                   created_at,
@@ -1335,6 +1338,7 @@ impl InProgressTask {
             update underway.task
             set state = $3,
                 delay = $2,
+                last_attempt_at = now(),
                 updated_at = now()
             where id = $1
             "#,
@@ -2611,6 +2615,47 @@ mod tests {
         assert_eq!(
             pg_interval_to_span(&dequeued_task.delay).compare(delay)?,
             std::cmp::Ordering::Equal
+        );
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn retry_delay_is_respected(pool: PgPool) -> sqlx::Result<(), Error> {
+        let queue = Queue::builder()
+            .name("retry_delay_is_respected")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let task_id = queue.enqueue(&pool, &TestTask, &json!("{}")).await?;
+
+        let mut conn = pool.acquire().await?;
+        let in_progress_task = queue.dequeue().await?.expect("A task should be dequeued");
+
+        let delay = 30.minutes();
+        in_progress_task.retry_after(&mut conn, delay).await?;
+
+        assert!(
+            queue.dequeue().await?.is_none(),
+            "Task should not be eligible until retry delay elapses"
+        );
+
+        sqlx::query!(
+            r#"
+            update underway.task
+            set last_attempt_at = now() - interval '2 hours'
+            where task_queue_name = $1 and id = $2
+            "#,
+            queue.name.as_str(),
+            task_id as TaskId
+        )
+        .execute(&pool)
+        .await?;
+
+        assert!(
+            queue.dequeue().await?.is_some(),
+            "Task should be eligible after retry delay elapses"
         );
 
         Ok(())

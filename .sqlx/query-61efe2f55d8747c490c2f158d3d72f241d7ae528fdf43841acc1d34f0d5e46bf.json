@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            update underway.task\n            set state = $3,\n                delay = $2,\n                updated_at = now()\n            where id = $1\n            ",
+  "query": "\n            update underway.task\n            set state = $3,\n                delay = $2,\n                last_attempt_at = now(),\n                updated_at = now()\n            where id = $1\n            ",
   "describe": {
     "columns": [],
     "parameters": {
@@ -25,5 +25,5 @@
     },
     "nullable": []
   },
-  "hash": "596a1dcc593b0dc55002a47cea8a2e6fa1328977f2a41d01ba092b0854853365"
+  "hash": "61efe2f55d8747c490c2f158d3d72f241d7ae528fdf43841acc1d34f0d5e46bf"
 }
