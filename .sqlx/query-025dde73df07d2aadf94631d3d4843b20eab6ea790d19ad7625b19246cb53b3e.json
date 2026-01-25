@@ -51,6 +51,10 @@
                 [
                   "backoff_coefficient",
                   "Float8"
+                ],
+                [
+                  "jitter_factor",
+                  "Float8"
                 ]
               ]
             }
