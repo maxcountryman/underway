@@ -1,5 +1,5 @@
 # Unreleased
-# 0.3.0 (unreleased)
+# Unreleased
 
 - Breaking: Rename `enqueue_multi` to `enqueue_many` and return task IDs for batch enqueue
 - Fix: Pending retry delays now respect the last attempt time when re-queuing tasks
@@ -7,7 +7,6 @@
 - Fix: Fence reclaimed task attempts so stale workers cannot update task state
 - Fix: Job step configuration now uses the step index from input to avoid cross-run drift
 - Add: Job steps can configure task timeouts, TTLs, delays, heartbeats, concurrency keys, and priorities
-- Add: `enqueue_many` et al, allowing batched enqueue with task IDs returned. #79
 
 # 0.2.0
 
@@ -18,6 +17,7 @@
 - Fix: Shutdown channels are now unique. #97
 - Add: `Job::queue`, `Job::worker`, and `Job::scheduler` helpers for
   zero‑boilerplate executor creation. #100
+- Add: `enqueue_multi` et al, allowing batched enqueue. #79
 
 # 0.1.2
 
