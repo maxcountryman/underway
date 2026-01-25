@@ -1,5 +1,4 @@
 # Unreleased
-# Unreleased
 
 - Breaking: Rename `enqueue_multi` to `enqueue_many` and return task IDs for batch enqueue
 - Fix: Pending retry delays now respect the last attempt time when re-queuing tasks
