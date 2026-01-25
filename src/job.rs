@@ -28,9 +28,9 @@
 //! Instead of a closure, we could also use a named function.
 //!
 //! ```rust
-//! use underway::{job::Context, task::Result as TaskResult, Job, To};
+//! use underway::{job::StepContext, task::Result as TaskResult, Job, To};
 //!
-//! async fn named_step(_cx: Context<()>, _: ()) -> TaskResult<To<()>> {
+//! async fn named_step(_cx: StepContext<()>, _: ()) -> TaskResult<To<()>> {
 //!     To::done()
 //! }
 //!
@@ -38,10 +38,10 @@
 //! ```
 //!
 //! Notice that the first argument to our function is [a context
-//! binding](crate::job::Context). This provides access to fields like
-//! [`state`](crate::job::Context::state),
-//! [`step_index`](crate::job::Context::step_index),
-//! and [`job_id`](crate::job::Context::job_id).
+//! binding](crate::job::StepContext). This provides access to fields like
+//! [`state`](crate::job::StepContext::state),
+//! [`step_index`](crate::job::StepContext::step_index),
+//! and [`job_id`](crate::job::StepContext::job_id).
 //!
 //! The second argument is a type we provide as input to the step. In our
 //! example it's the unit type. But if we were to specify another type it would
@@ -211,7 +211,7 @@
 //! that all steps should have access to. The only requirement is that the state
 //! type be `Clone`, as it will be cloned into each step.
 //! ```rust
-//! use underway::{job::Context, Job, To};
+//! use underway::{job::StepContext, Job, To};
 //!
 //! // A simple state that'll be provided to our steps.
 //! #[derive(Clone)]
@@ -225,7 +225,7 @@
 //!
 //! let job_builder = Job::<(), _>::builder()
 //!     .state(state) // Here we've set the state.
-//!     .step(|Context { state, .. }, _| async move {
+//!     .step(|StepContext { state, .. }, _| async move {
 //!         println!("State data is: {}", state.data);
 //!         To::done()
 //!     });
@@ -699,8 +699,8 @@ pub enum Error {
 type JobQueue<T, S> = Queue<Job<T, S>>;
 type EffectQueue<T, S> = Queue<EffectTask<T, S>>;
 
-/// Context passed in to each step.
-pub struct Context<S> {
+/// Step context passed in to each step.
+pub struct StepContext<S> {
     /// Shared step state.
     ///
     /// This value is set via [`state`](Builder::state).
@@ -729,7 +729,7 @@ pub struct Context<S> {
     pub queue_name: String,
 }
 
-/// Context passed in to each effect handler.
+/// Effect context passed in to each effect handler.
 pub struct EffectContext<S> {
     /// Shared step state.
     ///
@@ -820,6 +820,78 @@ mod sealed {
         pub effect_input: serde_json::Value,
         pub(crate) job_id: JobId,
     }
+}
+
+enum StageInput {
+    Step(JobState),
+    Effect(EffectState),
+}
+
+trait TaskConfig {
+    type Input;
+
+    fn task_config_default(&self) -> StepTaskConfig;
+    fn task_config_for(&self, input: &Self::Input) -> StepTaskConfig;
+}
+
+macro_rules! impl_task_config {
+    () => {
+        fn retry_policy(&self) -> RetryPolicy {
+            self.task_config_default().retry_policy
+        }
+
+        fn timeout(&self) -> Span {
+            self.task_config_default().timeout
+        }
+
+        fn ttl(&self) -> Span {
+            self.task_config_default().ttl
+        }
+
+        fn delay(&self) -> Span {
+            self.task_config_default().delay
+        }
+
+        fn heartbeat(&self) -> Span {
+            self.task_config_default().heartbeat
+        }
+
+        fn concurrency_key(&self) -> Option<String> {
+            self.task_config_default().concurrency_key
+        }
+
+        fn priority(&self) -> i32 {
+            self.task_config_default().priority
+        }
+
+        fn retry_policy_for(&self, input: &Self::Input) -> RetryPolicy {
+            self.task_config_for(input).retry_policy
+        }
+
+        fn timeout_for(&self, input: &Self::Input) -> Span {
+            self.task_config_for(input).timeout
+        }
+
+        fn ttl_for(&self, input: &Self::Input) -> Span {
+            self.task_config_for(input).ttl
+        }
+
+        fn delay_for(&self, input: &Self::Input) -> Span {
+            self.task_config_for(input).delay
+        }
+
+        fn heartbeat_for(&self, input: &Self::Input) -> Span {
+            self.task_config_for(input).heartbeat
+        }
+
+        fn concurrency_key_for(&self, input: &Self::Input) -> Option<String> {
+            self.task_config_for(input).concurrency_key
+        }
+
+        fn priority_for(&self, input: &Self::Input) -> i32 {
+            self.task_config_for(input).priority
+        }
+    };
 }
 
 /// Container for the runtime of the job instance.
@@ -1855,6 +1927,201 @@ where
             .map(|effect| effect.task_config.clone())
             .unwrap_or_default()
     }
+
+    fn step_context(&self, job_id: JobId, step_index: usize) -> StepContext<S> {
+        StepContext {
+            state: self.state.clone(),
+            step_index,
+            step_count: self.steps.len(),
+            job_id,
+            queue_name: self.queue.name.clone(),
+        }
+    }
+
+    fn effect_context(
+        &self,
+        job_id: JobId,
+        step_index: usize,
+        effect_index: usize,
+    ) -> EffectContext<S> {
+        EffectContext {
+            state: self.state.clone(),
+            step_index,
+            step_count: self.steps.len(),
+            effect_index,
+            job_id,
+            queue_name: self.queue.name.clone(),
+            effect_queue_name: self.effect_queue.name.clone(),
+        }
+    }
+
+    fn validate_step_index(&self, step_index: usize) -> TaskResult<()> {
+        if step_index >= self.steps.len() {
+            return Err(TaskError::Fatal("Invalid step index.".into()));
+        }
+
+        Ok(())
+    }
+
+    fn validate_effect_index(&self, effect_index: usize) -> TaskResult<()> {
+        if effect_index >= self.effects.len() {
+            return Err(TaskError::Fatal("Invalid effect index.".into()));
+        }
+
+        Ok(())
+    }
+
+    async fn enqueue_transition(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        job_id: JobId,
+        step_index: usize,
+        next_effect_index: Option<usize>,
+        next_input: serde_json::Value,
+        delay: Span,
+    ) -> TaskResult<()> {
+        if let Some(effect_index) = next_effect_index {
+            self.validate_effect_index(effect_index)?;
+
+            let effect_task = self.effect_task();
+            let effect_input = EffectState {
+                effect_index,
+                step_index,
+                effect_input: next_input,
+                job_id,
+            };
+
+            self.effect_queue
+                .enqueue_after(&mut *tx, &effect_task, &effect_input, delay)
+                .await
+                .map_err(|err| TaskError::Retryable(err.to_string()))?;
+        } else {
+            let next_index = step_index + 1;
+            let next_job_input = JobState {
+                step_input: next_input,
+                step_index: next_index,
+                job_id,
+            };
+
+            self.queue
+                .enqueue_after(&mut *tx, self, &next_job_input, delay)
+                .await
+                .map_err(|err| TaskError::Retryable(err.to_string()))?;
+        }
+
+        Ok(())
+    }
+
+    async fn execute_stage(
+        &self,
+        mut tx: Transaction<'_, Postgres>,
+        input: StageInput,
+    ) -> TaskResult<()> {
+        let (step_index, job_id, next_effect_index, stage_result) = match input {
+            StageInput::Step(JobState {
+                step_index,
+                step_input,
+                job_id,
+            }) => {
+                self.validate_step_index(step_index)?;
+
+                let step_config = &self.steps[step_index];
+                let cx = self.step_context(job_id, step_index);
+                let stage_result = match step_config.executor.execute_step(cx, step_input).await {
+                    Ok(result) => result,
+                    Err(err) => {
+                        tx.commit().await?;
+                        return Err(err);
+                    }
+                };
+
+                (
+                    step_index,
+                    job_id,
+                    step_config.next_effect_index,
+                    stage_result,
+                )
+            }
+            StageInput::Effect(EffectState {
+                effect_index,
+                step_index,
+                effect_input,
+                job_id,
+            }) => {
+                self.validate_step_index(step_index)?;
+                self.validate_effect_index(effect_index)?;
+
+                let effect_config = &self.effects[effect_index];
+                let cx = self.effect_context(job_id, step_index, effect_index);
+                let stage_result = match effect_config
+                    .executor
+                    .execute_effect(cx, effect_input)
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(err) => {
+                        tx.commit().await?;
+                        return Err(err);
+                    }
+                };
+
+                (
+                    step_index,
+                    job_id,
+                    effect_config.next_effect_index,
+                    stage_result,
+                )
+            }
+        };
+
+        if let Some((next_input, delay)) = stage_result {
+            self.enqueue_transition(
+                &mut tx,
+                job_id,
+                step_index,
+                next_effect_index,
+                next_input,
+                delay,
+            )
+            .await?;
+        }
+
+        tx.commit().await?;
+
+        Ok(())
+    }
+}
+
+impl<I, S> TaskConfig for Job<I, S>
+where
+    I: Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
+{
+    type Input = JobState;
+
+    fn task_config_default(&self) -> StepTaskConfig {
+        self.step_task_config(0)
+    }
+
+    fn task_config_for(&self, input: &Self::Input) -> StepTaskConfig {
+        self.step_task_config(input.step_index)
+    }
+}
+
+impl<I, S> TaskConfig for EffectTask<I, S>
+where
+    I: Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
+{
+    type Input = EffectState;
+
+    fn task_config_default(&self) -> StepTaskConfig {
+        self.job.effect_task_config(0)
+    }
+
+    fn task_config_for(&self, input: &Self::Input) -> StepTaskConfig {
+        self.job.effect_task_config(input.effect_index)
+    }
 }
 
 impl<I, S> Task for Job<I, S>
@@ -1876,137 +2143,13 @@ where
     )]
     async fn execute(
         &self,
-        mut tx: Transaction<'_, Postgres>,
+        tx: Transaction<'_, Postgres>,
         input: Self::Input,
     ) -> TaskResult<Self::Output> {
-        let JobState {
-            step_index,
-            step_input,
-            job_id,
-        } = input;
-
-        if step_index >= self.steps.len() {
-            return Err(TaskError::Fatal("Invalid step index.".into()));
-        }
-
-        let step_config = &self.steps[step_index];
-        let step = &step_config.executor;
-
-        let cx = Context {
-            state: self.state.clone(),
-            step_index,
-            job_id,
-            step_count: self.steps.len(),
-            queue_name: self.queue.name.clone(),
-        };
-
-        // Execute the step and handle any errors.
-        let step_result = match step.execute_step(cx, step_input).await {
-            Ok(result) => result,
-            Err(err) => {
-                // Commit the savepoint to release the transaction promptly.
-                tx.commit().await?;
-                return Err(err);
-            }
-        };
-
-        // If there's a next step, enqueue it.
-        if let Some((next_input, delay)) = step_result {
-            if let Some(effect_index) = step_config.next_effect_index {
-                if effect_index >= self.effects.len() {
-                    return Err(TaskError::Fatal("Invalid effect index.".into()));
-                }
-
-                let effect_task = self.effect_task();
-                let effect_input = EffectState {
-                    effect_index,
-                    step_index,
-                    effect_input: next_input,
-                    job_id,
-                };
-
-                self.effect_queue
-                    .enqueue_after(&mut *tx, &effect_task, &effect_input, delay)
-                    .await
-                    .map_err(|err| TaskError::Retryable(err.to_string()))?;
-            } else {
-                // Advance to the next step after executing the step.
-                let next_index = step_index + 1;
-
-                let next_job_input = JobState {
-                    step_input: next_input,
-                    step_index: next_index,
-                    job_id,
-                };
-
-                self.queue
-                    .enqueue_after(&mut *tx, self, &next_job_input, delay)
-                    .await
-                    .map_err(|err| TaskError::Retryable(err.to_string()))?;
-            }
-        }
-
-        // Commit the transaction.
-        tx.commit().await?;
-
-        Ok(())
+        self.execute_stage(tx, StageInput::Step(input)).await
     }
 
-    fn retry_policy(&self) -> RetryPolicy {
-        self.step_task_config(0).retry_policy
-    }
-
-    fn timeout(&self) -> Span {
-        self.step_task_config(0).timeout
-    }
-
-    fn ttl(&self) -> Span {
-        self.step_task_config(0).ttl
-    }
-
-    fn delay(&self) -> Span {
-        self.step_task_config(0).delay
-    }
-
-    fn heartbeat(&self) -> Span {
-        self.step_task_config(0).heartbeat
-    }
-
-    fn concurrency_key(&self) -> Option<String> {
-        self.step_task_config(0).concurrency_key
-    }
-
-    fn priority(&self) -> i32 {
-        self.step_task_config(0).priority
-    }
-
-    fn retry_policy_for(&self, input: &Self::Input) -> RetryPolicy {
-        self.step_task_config(input.step_index).retry_policy
-    }
-
-    fn timeout_for(&self, input: &Self::Input) -> Span {
-        self.step_task_config(input.step_index).timeout
-    }
-
-    fn ttl_for(&self, input: &Self::Input) -> Span {
-        self.step_task_config(input.step_index).ttl
-    }
-
-    fn delay_for(&self, input: &Self::Input) -> Span {
-        self.step_task_config(input.step_index).delay
-    }
-
-    fn heartbeat_for(&self, input: &Self::Input) -> Span {
-        self.step_task_config(input.step_index).heartbeat
-    }
-
-    fn concurrency_key_for(&self, input: &Self::Input) -> Option<String> {
-        self.step_task_config(input.step_index).concurrency_key
-    }
-
-    fn priority_for(&self, input: &Self::Input) -> i32 {
-        self.step_task_config(input.step_index).priority
-    }
+    impl_task_config!();
 }
 
 impl<I, S> Task for EffectTask<I, S>
@@ -2029,137 +2172,13 @@ where
     )]
     async fn execute(
         &self,
-        mut tx: Transaction<'_, Postgres>,
+        tx: Transaction<'_, Postgres>,
         input: Self::Input,
     ) -> TaskResult<Self::Output> {
-        let EffectState {
-            effect_index,
-            step_index,
-            effect_input,
-            job_id,
-        } = input;
-
-        if effect_index >= self.job.effects.len() {
-            return Err(TaskError::Fatal("Invalid effect index.".into()));
-        }
-
-        let effect_config = &self.job.effects[effect_index];
-        let effect = &effect_config.executor;
-        let cx = EffectContext {
-            state: self.job.state.clone(),
-            step_index,
-            step_count: self.job.steps.len(),
-            effect_index,
-            job_id,
-            queue_name: self.job.queue.name.clone(),
-            effect_queue_name: self.job.effect_queue.name.clone(),
-        };
-
-        let effect_result = match effect.execute_effect(cx, effect_input).await {
-            Ok(result) => result,
-            Err(err) => {
-                tx.commit().await?;
-                return Err(err);
-            }
-        };
-
-        if let Some((next_input, delay)) = effect_result {
-            if let Some(next_effect_index) = effect_config.next_effect_index {
-                if next_effect_index >= self.job.effects.len() {
-                    return Err(TaskError::Fatal("Invalid effect index.".into()));
-                }
-
-                let effect_task = self.job.effect_task();
-                let next_effect_input = EffectState {
-                    effect_index: next_effect_index,
-                    step_index,
-                    effect_input: next_input,
-                    job_id,
-                };
-
-                self.job
-                    .effect_queue
-                    .enqueue_after(&mut *tx, &effect_task, &next_effect_input, delay)
-                    .await
-                    .map_err(|err| TaskError::Retryable(err.to_string()))?;
-            } else {
-                let next_index = step_index + 1;
-                let next_job_input = JobState {
-                    step_input: next_input,
-                    step_index: next_index,
-                    job_id,
-                };
-
-                self.job
-                    .queue
-                    .enqueue_after(&mut *tx, &self.job, &next_job_input, delay)
-                    .await
-                    .map_err(|err| TaskError::Retryable(err.to_string()))?;
-            }
-        }
-
-        tx.commit().await?;
-
-        Ok(())
+        self.job.execute_stage(tx, StageInput::Effect(input)).await
     }
 
-    fn retry_policy(&self) -> RetryPolicy {
-        self.job.effect_task_config(0).retry_policy
-    }
-
-    fn timeout(&self) -> Span {
-        self.job.effect_task_config(0).timeout
-    }
-
-    fn ttl(&self) -> Span {
-        self.job.effect_task_config(0).ttl
-    }
-
-    fn delay(&self) -> Span {
-        self.job.effect_task_config(0).delay
-    }
-
-    fn heartbeat(&self) -> Span {
-        self.job.effect_task_config(0).heartbeat
-    }
-
-    fn concurrency_key(&self) -> Option<String> {
-        self.job.effect_task_config(0).concurrency_key
-    }
-
-    fn priority(&self) -> i32 {
-        self.job.effect_task_config(0).priority
-    }
-
-    fn retry_policy_for(&self, input: &Self::Input) -> RetryPolicy {
-        self.job.effect_task_config(input.effect_index).retry_policy
-    }
-
-    fn timeout_for(&self, input: &Self::Input) -> Span {
-        self.job.effect_task_config(input.effect_index).timeout
-    }
-
-    fn ttl_for(&self, input: &Self::Input) -> Span {
-        self.job.effect_task_config(input.effect_index).ttl
-    }
-
-    fn delay_for(&self, input: &Self::Input) -> Span {
-        self.job.effect_task_config(input.effect_index).delay
-    }
-
-    fn heartbeat_for(&self, input: &Self::Input) -> Span {
-        self.job.effect_task_config(input.effect_index).heartbeat
-    }
-
-    fn concurrency_key_for(&self, input: &Self::Input) -> Option<String> {
-        self.job
-            .effect_task_config(input.effect_index)
-            .concurrency_key
-    }
-
-    fn priority_for(&self, input: &Self::Input) -> i32 {
-        self.job.effect_task_config(input.effect_index).priority
-    }
+    impl_task_config!();
 }
 
 impl<I, S> Clone for Job<I, S>
@@ -2239,7 +2258,7 @@ impl To<()> {
 // A concrete implementation of a step using a closure.
 struct StepFn<I, O, S, F>
 where
-    F: Fn(Context<S>, I) -> Pin<Box<dyn Future<Output = TaskResult<To<O>>> + Send>>
+    F: Fn(StepContext<S>, I) -> Pin<Box<dyn Future<Output = TaskResult<To<O>>> + Send>>
         + Send
         + Sync
         + 'static,
@@ -2250,7 +2269,7 @@ where
 
 impl<I, O, S, F> StepFn<I, O, S, F>
 where
-    F: Fn(Context<S>, I) -> Pin<Box<dyn Future<Output = TaskResult<To<O>>> + Send>>
+    F: Fn(StepContext<S>, I) -> Pin<Box<dyn Future<Output = TaskResult<To<O>>> + Send>>
         + Send
         + Sync
         + 'static,
@@ -2298,7 +2317,7 @@ trait StepExecutor<S>: Send + Sync {
     // Execute the step with the given input serialized as JSON.
     fn execute_step(
         &self,
-        cx: Context<S>,
+        cx: StepContext<S>,
         input: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = StepResult> + Send>>;
 }
@@ -2319,14 +2338,14 @@ where
     I: DeserializeOwned + Serialize + Send + Sync + 'static,
     O: Serialize + Send + Sync + 'static,
     S: Send + Sync + 'static,
-    F: Fn(Context<S>, I) -> Pin<Box<dyn Future<Output = TaskResult<To<O>>> + Send>>
+    F: Fn(StepContext<S>, I) -> Pin<Box<dyn Future<Output = TaskResult<To<O>>> + Send>>
         + Send
         + Sync
         + 'static,
 {
     fn execute_step(
         &self,
-        cx: Context<S>,
+        cx: StepContext<S>,
         input: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = StepResult> + Send>> {
         let deserialized_input: I = match serde_json::from_value(input) {
@@ -2560,7 +2579,7 @@ impl<I, S> Builder<I, I, S, Initial> {
         I: DeserializeOwned + Serialize + Send + Sync + 'static,
         O: Serialize + Send + Sync + 'static,
         S: Send + Sync + 'static,
-        F: Fn(Context<S>, I) -> Fut + Send + Sync + 'static,
+        F: Fn(StepContext<S>, I) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = TaskResult<To<O>>> + Send + 'static,
     {
         let step_fn = StepFn::new(move |cx, input| Box::pin(func(cx, input)));
@@ -2624,7 +2643,7 @@ impl<I, S> Builder<I, I, S, StateSet<S>> {
         I: DeserializeOwned + Serialize + Send + Sync + 'static,
         O: Serialize + Send + Sync + 'static,
         S: Send + Sync + 'static,
-        F: Fn(Context<S>, I) -> Fut + Send + Sync + 'static,
+        F: Fn(StepContext<S>, I) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = TaskResult<To<O>>> + Send + 'static,
     {
         let step_fn = StepFn::new(move |cx, input| Box::pin(func(cx, input)));
@@ -2678,7 +2697,7 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
         Current: DeserializeOwned + Serialize + Send + Sync + 'static,
         New: Serialize + Send + Sync + 'static,
         S: Send + Sync + 'static,
-        F: Fn(Context<S>, Current) -> Fut + Send + Sync + 'static,
+        F: Fn(StepContext<S>, Current) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = TaskResult<To<New>>> + Send + 'static,
     {
         let step_fn = StepFn::new(move |cx, input| Box::pin(func(cx, input)));
@@ -3261,7 +3280,7 @@ mod tests {
             message: String,
         }
 
-        async fn step(_cx: Context<()>, Input { message }: Input) -> TaskResult<To<()>> {
+        async fn step(_cx: StepContext<()>, Input { message }: Input) -> TaskResult<To<()>> {
             println!("Executing job with message: {message}");
             To::done()
         }
@@ -3396,7 +3415,7 @@ mod tests {
             message: String,
         }
 
-        async fn step(cx: Context<State>, Input { message }: Input) -> TaskResult<To<()>> {
+        async fn step(cx: StepContext<State>, Input { message }: Input) -> TaskResult<To<()>> {
             println!(
                 "Executing job with message: {message} and state: {data}",
                 data = cx.state.data
