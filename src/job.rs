@@ -326,7 +326,7 @@
 //!     })
 //!     .retry_policy(RetryPolicy::builder().max_interval_ms(15_000).build());
 //! ```
-//! 
+//!
 //! # Step configuration
 //!
 //! Steps and effects can configure the same task-level settings as standalone
@@ -346,7 +346,7 @@
 //!     .concurrency_key("customer:42")
 //!     .priority(10);
 //! ```
-//! 
+//!
 //! # Enqueuing jobs
 //!
 //! Once we've configured our job with its sequence of one or more steps we can
@@ -378,7 +378,7 @@
 //! # });
 //! # }
 //! ```
-//! 
+//!
 //! We could also supply a queue that's already been constructed, to use as our
 //! job's queue. The job build still awaits to create the effect queue.
 //! ```rust,no_run
@@ -413,7 +413,7 @@
 //! # });
 //! # }
 //! ```
-//! 
+//!
 //! Notice that we've enqueued a value of a type that's compatible with our
 //! first step's input--in this case that's unit since we haven't given another
 //! type.
@@ -453,7 +453,7 @@
 //! # });
 //! # }
 //! ```
-//! 
+//!
 //! While we're only demonstrating a single step here for brevity, the process
 //! is the same for jobs with multiple steps.
 //!
@@ -504,7 +504,7 @@
 //! # });
 //! # }
 //! ```
-//! 
+//!
 //! # Running jobs
 //!
 //! Jobs are run via workers and schedulers, where the former processes tasks
@@ -537,7 +537,7 @@
 //! # });
 //! # }
 //! ```
-//! 
+//!
 //! Typically starting the job such that our program isn't blocked is desirable.
 //! However, we can also run the job in a blocking manner directly.
 //! ```rust,no_run
@@ -567,7 +567,7 @@
 //! # });
 //! # }
 //! ```
-//! 
+//!
 //! Workers and schedulers can be used directly too.
 //! ```rust,no_run
 //! # use sqlx::PgPool;
@@ -596,7 +596,7 @@
 //! # });
 //! # }
 //! ```
-//! 
+//!
 //! # Scheduling jobs
 //!
 //! Jobs may also be run on a schedule that follows the form of a cron-like
@@ -631,7 +631,7 @@
 //! # });
 //! # }
 //! ```
-//! 
+//!
 //! Often input to a scheduled job would consist of static configuration or
 //! other fields that are shared for scheduled runs.
 //!
@@ -765,14 +765,13 @@ pub struct EffectContext<S> {
     pub effect_queue_name: String,
 }
 
-struct StepConfig<S> {
-    executor: Box<dyn StepExecutor<S>>,
-    task_config: StepTaskConfig,
-    next_effect_index: Option<usize>,
+enum StageExecutor<S> {
+    Step(Box<dyn StepExecutor<S>>),
+    Effect(Box<dyn EffectExecutor<S>>),
 }
 
-struct EffectConfig<S> {
-    executor: Box<dyn EffectExecutor<S>>,
+struct StageConfig<S> {
+    executor: StageExecutor<S>,
     task_config: StepTaskConfig,
     next_effect_index: Option<usize>,
 }
@@ -1097,8 +1096,8 @@ where
 {
     queue: Arc<JobQueue<I, S>>,
     effect_queue: Arc<EffectQueue<I, S>>,
-    steps: Arc<Vec<StepConfig<S>>>,
-    effects: Arc<Vec<EffectConfig<S>>>,
+    steps: Arc<Vec<StageConfig<S>>>,
+    effects: Arc<Vec<StageConfig<S>>>,
     state: S,
     _marker: PhantomData<I>,
 }
@@ -2092,7 +2091,10 @@ where
 
                 let step_config = &self.steps[step_index];
                 let cx = self.step_context(job_id, step_index);
-                let stage_result = match step_config.executor.execute_step(cx, step_input).await {
+                let StageExecutor::Step(step) = &step_config.executor else {
+                    return Err(TaskError::Fatal("Invalid step executor.".into()));
+                };
+                let stage_result = match step.execute_step(cx, step_input).await {
                     Ok(result) => result,
                     Err(err) => {
                         tx.commit().await?;
@@ -2118,11 +2120,10 @@ where
 
                 let effect_config = &self.effects[effect_index];
                 let cx = self.effect_context(job_id, step_index, effect_index);
-                let stage_result = match effect_config
-                    .executor
-                    .execute_effect(cx, effect_input)
-                    .await
-                {
+                let StageExecutor::Effect(effect) = &effect_config.executor else {
+                    return Err(TaskError::Fatal("Invalid effect executor.".into()));
+                };
+                let stage_result = match effect.execute_effect(cx, effect_input).await {
                     Ok(result) => result,
                     Err(err) => {
                         tx.commit().await?;
@@ -2538,8 +2539,8 @@ enum ConfigTarget {
 /// Builder for constructing a `Job` with a sequence of steps.
 pub struct Builder<I, O, S, B> {
     builder_state: B,
-    steps: Vec<StepConfig<S>>,
-    effects: Vec<EffectConfig<S>>,
+    steps: Vec<StageConfig<S>>,
+    effects: Vec<StageConfig<S>>,
     last_config: Option<ConfigTarget>,
     effect_queue_name: Option<String>,
     _marker: PhantomData<(I, O, S)>,
@@ -2649,8 +2650,8 @@ impl<I, S> Builder<I, I, S, Initial> {
     {
         let step_fn = StepFn::new(move |cx, input| Box::pin(func(cx, input)));
         let step_index = self.steps.len();
-        self.steps.push(StepConfig {
-            executor: Box::new(step_fn),
+        self.steps.push(StageConfig {
+            executor: StageExecutor::Step(Box::new(step_fn)),
             task_config: StepTaskConfig::default(),
             next_effect_index: None,
         });
@@ -2713,8 +2714,8 @@ impl<I, S> Builder<I, I, S, StateSet<S>> {
     {
         let step_fn = StepFn::new(move |cx, input| Box::pin(func(cx, input)));
         let step_index = self.steps.len();
-        self.steps.push(StepConfig {
-            executor: Box::new(step_fn),
+        self.steps.push(StageConfig {
+            executor: StageExecutor::Step(Box::new(step_fn)),
             task_config: StepTaskConfig::default(),
             next_effect_index: None,
         });
@@ -2767,8 +2768,8 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
     {
         let step_fn = StepFn::new(move |cx, input| Box::pin(func(cx, input)));
         let step_index = self.steps.len();
-        self.steps.push(StepConfig {
-            executor: Box::new(step_fn),
+        self.steps.push(StageConfig {
+            executor: StageExecutor::Step(Box::new(step_fn)),
             task_config: StepTaskConfig::default(),
             next_effect_index: None,
         });
@@ -3023,8 +3024,8 @@ impl<I, E, S> Builder<I, Effect<E>, S, StepSet<Effect<E>, S>> {
         let effect_fn = EffectFn::new(move |cx, input| Box::pin(func(cx, input)));
         let next_effect_index = self.effects.len();
 
-        self.effects.push(EffectConfig {
-            executor: Box::new(effect_fn),
+        self.effects.push(StageConfig {
+            executor: StageExecutor::Effect(Box::new(effect_fn)),
             task_config: StepTaskConfig::default(),
             next_effect_index: None,
         });
