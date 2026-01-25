@@ -1,0 +1,27 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                insert into underway.task (\n                  id,\n                  task_queue_name,\n                  input,\n                  timeout,\n                  heartbeat,\n                  ttl,\n                  delay,\n                  retry_policy,\n                  concurrency_key,\n                  priority\n                )\n                select\n                  t.id,\n                  $1 as task_queue_name,\n                  t.input,\n                  t.timeout,\n                  t.heartbeat,\n                  t.ttl,\n                  t.delay,\n                  (\n                    t.retry_max_attempts,\n                    t.retry_initial_interval_ms,\n                    t.retry_max_interval_ms,\n                    t.retry_backoff_coefficient,\n                    t.retry_jitter_factor\n                  )::underway.task_retry_policy,\n                  t.concurrency_key,\n                  t.priority\n                from unnest(\n                  $2::uuid[],\n                  $3::jsonb[],\n                  $4::interval[],\n                  $5::interval[],\n                  $6::interval[],\n                  $7::interval[],\n                  $8::int4[],\n                  $9::int4[],\n                  $10::int4[],\n                  $11::float8[],\n                  $12::float8[],\n                  $13::text[],\n                  $14::int4[]\n                ) as t(\n                  id,\n                  input,\n                  timeout,\n                  heartbeat,\n                  ttl,\n                  delay,\n                  retry_max_attempts,\n                  retry_initial_interval_ms,\n                  retry_max_interval_ms,\n                  retry_backoff_coefficient,\n                  retry_jitter_factor,\n                  concurrency_key,\n                  priority\n                )\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "UuidArray",
+        "JsonbArray",
+        "IntervalArray",
+        "IntervalArray",
+        "IntervalArray",
+        "IntervalArray",
+        "Int4Array",
+        "Int4Array",
+        "Int4Array",
+        "Float8Array",
+        "Float8Array",
+        "TextArray",
+        "Int4Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "885843b0ffb967f8107291ffd0d06fcf37bd1b3b2b0596fa1be3bdd66096a3a2"
+}

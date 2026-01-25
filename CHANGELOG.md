@@ -1,10 +1,13 @@
 # Unreleased
 
+- Breaking: Rename `enqueue_multi` to `enqueue_many` and return task IDs for batch enqueue
+- Perf: Optimize `enqueue_many` for uniform-config batches
 - Fix: Pending retry delays now respect the last attempt time when re-queuing tasks
 - Fix: Reap completed worker processing tasks to avoid unbounded memory growth
 - Fix: Fence reclaimed task attempts so stale workers cannot update task state
 - Fix: Job step configuration now uses the step index from input to avoid cross-run drift
 - Add: Job steps can configure task timeouts, TTLs, delays, heartbeats, concurrency keys, and priorities
+- Add: Job batch enqueue helpers (`enqueue_many`, `enqueue_many_using`)
 
 # 0.2.0
 
