@@ -569,7 +569,7 @@ impl<T: Task> Queue<T> {
     }
 
     /// Enqueues tasks in chunks (max 5000 per batch) within a single
-    /// transaction.
+    /// transaction, returning task IDs.
     ///
     /// # Example
     ///
@@ -613,49 +613,54 @@ impl<T: Task> Queue<T> {
     /// #
     ///
     /// // Enqueue a new task with input after five minutes.
-    /// let _ = queue.enqueue_multi(&pool, &task, &[(), ()]).await?;
+    /// let task_ids = queue.enqueue_many(&pool, &task, &[(), ()]).await?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
     /// # }
     /// ```
     #[instrument(
-        name = "enqueue_multi",
+        name = "enqueue_many",
         skip(self, executor, task, inputs),
         fields(queue.name = self.name, task.id = tracing::field::Empty),
         err
     )]
-    pub async fn enqueue_multi<'a, E>(
+    pub async fn enqueue_many<'a, E>(
         &self,
         executor: E,
         task: &T,
         inputs: &[T::Input],
-    ) -> Result<usize>
+    ) -> Result<Vec<TaskId>>
     where
         E: PgExecutor<'a> + sqlx::Acquire<'a, Database = sqlx::Postgres>,
     {
-        self.enqueue_multi_wth_chunk_size(executor, task, inputs, 5000)
+        self.enqueue_many_with_chunk_size(executor, task, inputs, 5000)
             .await
     }
 
-    /// Same as `enqueue_multi`, but allows you to specify `chunk_size`
+    /// Same as `enqueue_many`, but allows you to specify `chunk_size`.
 
     #[instrument(
-        name = "enqueue_multi",
+        name = "enqueue_many",
         skip(self, executor, task, inputs),
         fields(queue.name = self.name, task.id = tracing::field::Empty),
         err
     )]
-    pub async fn enqueue_multi_wth_chunk_size<'a, E>(
+    pub async fn enqueue_many_with_chunk_size<'a, E>(
         &self,
         executor: E,
         task: &T,
         inputs: &[T::Input],
         chunk_size: usize,
-    ) -> Result<usize>
+    ) -> Result<Vec<TaskId>>
     where
         E: PgExecutor<'a> + sqlx::Acquire<'a, Database = sqlx::Postgres>,
     {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let tasks_number = inputs.len();
+        let mut task_ids = Vec::with_capacity(tasks_number);
 
         tracing::Span::current().record("tasks_numbers", tasks_number.to_string());
 
@@ -771,11 +776,13 @@ impl<T: Task> Queue<T> {
             )
             .execute(tx.as_mut())
             .await?;
+
+            task_ids.extend(ids);
         }
 
         tx.commit().await?;
 
-        Ok(tasks_number)
+        Ok(task_ids)
     }
 
     /// Dequeues the next available task.
@@ -2394,9 +2401,9 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn enqueue_multi_with_delay(pool: PgPool) -> sqlx::Result<(), Error> {
+    async fn enqueue_many_with_delay(pool: PgPool) -> sqlx::Result<(), Error> {
         let queue = Queue::builder()
-            .name("test_enqueue_multi")
+            .name("test_enqueue_many")
             .pool(pool.clone())
             .build()
             .await?;
@@ -2419,11 +2426,11 @@ mod tests {
                 1.hour()
             }
         }
-        let tasks_number = queue
-            .enqueue_multi(&pool, &MyDelayedTask, &[(), (), ()])
+        let task_ids = queue
+            .enqueue_many(&pool, &MyDelayedTask, &[(), (), ()])
             .await?;
 
-        assert_eq!(3, tasks_number);
+        assert_eq!(3, task_ids.len());
 
         let scheduled_tasks = sqlx::query!(
             r#"

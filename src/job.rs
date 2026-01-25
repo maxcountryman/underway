@@ -1070,6 +1070,44 @@ where
         self.enqueue_using(&mut *conn, input).await
     }
 
+    /// Enqueue the job multiple times using a connection from the queue's pool.
+    ///
+    /// # Errors
+    ///
+    /// This has the same error conditions as [`Queue::enqueue_many`].
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::PgPool;
+    /// # use underway::{Job, To};
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # let job = Job::builder()
+    /// #     .step(|_cx, _| async move { To::done() })
+    /// #     .name("example")
+    /// #     .pool(pool)
+    /// #     .build()
+    /// #     .await?;
+    /// # /*
+    /// let job = { /* A `Job`. */ };
+    /// # */
+    /// #
+    ///
+    /// // Enqueue a few jobs at once.
+    /// let enqueued = job.enqueue_many(&[(), ()]).await?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
+    pub async fn enqueue_many(&self, inputs: &[I]) -> Result<Vec<EnqueuedJob<Self>>> {
+        let mut conn = self.queue.pool.acquire().await?;
+        self.enqueue_many_using(&mut *conn, inputs).await
+    }
+
     /// Enqueue the job using the provided executor.
     ///
     /// This allows jobs to be enqueued using the same transaction as an
@@ -1123,6 +1161,83 @@ where
         E: PgExecutor<'a>,
     {
         self.enqueue_after_using(executor, input, Span::new()).await
+    }
+
+    /// Enqueue the job multiple times using the provided executor.
+    ///
+    /// This allows jobs to be enqueued using the same transaction as an
+    /// application may already be using in a given context.
+    ///
+    /// **Note:** If you pass a transactional executor and the transaction is
+    /// rolled back, the returned job IDs will not correspond to any persisted
+    /// tasks.
+    ///
+    /// # Errors
+    ///
+    /// This has the same error conditions as [`Queue::enqueue_many`].
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::PgPool;
+    /// # use underway::{Job, To};
+    /// # use tokio::runtime::Runtime;
+    /// # fn main() {
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # /*
+    /// let pool = { /* A `PgPool`. */ };
+    /// # */
+    /// #
+    ///
+    /// let mut tx = pool.begin().await?;
+    ///
+    /// # let job = Job::builder()
+    /// #     .step(|_cx, _| async move { To::done() })
+    /// #     .name("example")
+    /// #     .pool(pool.clone())
+    /// #     .build()
+    /// #     .await?;
+    /// # /*
+    /// let job = { /* A `Job`. */ };
+    /// # */
+    /// #
+    ///
+    /// // Enqueue using the transaction we already have.
+    /// let enqueued = job.enqueue_many_using(&mut *tx, &[(), ()]).await?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
+    pub async fn enqueue_many_using<'a, E>(
+        &self,
+        executor: E,
+        inputs: &[I],
+    ) -> Result<Vec<EnqueuedJob<Self>>>
+    where
+        E: PgExecutor<'a> + sqlx::Acquire<'a, Database = sqlx::Postgres>,
+    {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let job_inputs = inputs
+            .iter()
+            .map(|input| self.first_job_input(input))
+            .collect::<Result<Vec<_>>>()?;
+
+        self.queue.enqueue_many(executor, self, &job_inputs).await?;
+
+        let enqueued = job_inputs
+            .into_iter()
+            .map(|job_input| EnqueuedJob {
+                id: job_input.job_id,
+                queue: self.queue.clone(),
+            })
+            .collect();
+
+        Ok(enqueued)
     }
 
     /// Enqueue the job after the given delay using a connection from the
@@ -2907,6 +3022,72 @@ mod tests {
         let job_state: JobState = serde_json::from_value(pending_task.input)?;
         assert_eq!(job_state.step_index, 0);
         assert_eq!(job_state.step_input, serde_json::to_value(&input)?);
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn enqueue_many(pool: PgPool) -> sqlx::Result<(), Error> {
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+        struct Input {
+            message: String,
+        }
+
+        let queue = Queue::builder()
+            .name("enqueue_many")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let job = Job::builder()
+            .step(|_cx, Input { message }| async move {
+                println!("Processing {message}");
+                To::done()
+            })
+            .queue(queue.clone())
+            .build();
+
+        let inputs = [
+            Input {
+                message: "first".to_string(),
+            },
+            Input {
+                message: "second".to_string(),
+            },
+        ];
+
+        let enqueued = job.enqueue_many(&inputs).await?;
+        assert_eq!(enqueued.len(), 2);
+
+        let mut job_ids: Vec<String> = enqueued
+            .iter()
+            .map(|handle| handle.id.to_string())
+            .collect();
+        job_ids.sort();
+
+        let pending_tasks = sqlx::query!(
+            r#"
+            select input
+            from underway.task
+            where task_queue_name = $1
+              and state = $2
+            "#,
+            queue.name,
+            TaskState::Pending as TaskState
+        )
+        .fetch_all(&pool)
+        .await?;
+
+        let mut pending_job_ids = Vec::new();
+        for task in pending_tasks {
+            let job_state: JobState = serde_json::from_value(task.input)?;
+            assert_eq!(job_state.step_index, 0);
+            pending_job_ids.push(job_state.job_id.to_string());
+        }
+
+        pending_job_ids.sort();
+
+        assert_eq!(pending_job_ids, job_ids);
 
         Ok(())
     }
