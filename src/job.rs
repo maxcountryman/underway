@@ -290,6 +290,7 @@
 //!         println!("Finished subscription for {user_id}");
 //!         To::done()
 //!     });
+//! ```
 //!
 //! # Retry policies
 //!
