@@ -430,7 +430,7 @@ impl<T: Task> Queue<T> {
     where
         E: PgExecutor<'a>,
     {
-        self.enqueue_with_delay(executor, task, input, task.delay())
+        self.enqueue_with_delay(executor, task, input, task.delay_for(input))
             .await
     }
 
@@ -500,7 +500,7 @@ impl<T: Task> Queue<T> {
     where
         E: PgExecutor<'a>,
     {
-        let calculated_delay = task.delay().checked_add(delay)?;
+        let calculated_delay = task.delay_for(input).checked_add(delay)?;
         self.enqueue_with_delay(executor, task, input, calculated_delay)
             .await
     }
@@ -527,12 +527,12 @@ impl<T: Task> Queue<T> {
 
         let input_value = serde_json::to_value(input)?;
 
-        let retry_policy = task.retry_policy();
-        let timeout = task.timeout();
-        let heartbeat = task.heartbeat();
-        let ttl = task.ttl();
-        let concurrency_key = task.concurrency_key();
-        let priority = task.priority();
+        let retry_policy = task.retry_policy_for(input);
+        let timeout = task.timeout_for(input);
+        let heartbeat = task.heartbeat_for(input);
+        let ttl = task.ttl_for(input);
+        let concurrency_key = task.concurrency_key_for(input);
+        let priority = task.priority_for(input);
 
         tracing::Span::current().record("task.id", id.as_hyphenated().to_string());
 
@@ -659,24 +659,38 @@ impl<T: Task> Queue<T> {
 
         tracing::Span::current().record("tasks_numbers", tasks_number.to_string());
 
-        let timeout = task.timeout();
-        let heartbeat = task.heartbeat();
-        let ttl = task.ttl();
-        let retry_policy = task.retry_policy();
-        let concurrency_key = task.concurrency_key();
-        let priority = task.priority();
-
         let mut tx = executor.begin().await?;
 
         for chunk in inputs.chunks(chunk_size) {
             let mut ids = Vec::with_capacity(chunk.len());
             let mut input_values = Vec::with_capacity(chunk.len());
+            let mut timeouts = Vec::with_capacity(chunk.len());
+            let mut heartbeats = Vec::with_capacity(chunk.len());
+            let mut ttls = Vec::with_capacity(chunk.len());
             let mut delays = Vec::with_capacity(chunk.len());
+            let mut retry_max_attempts = Vec::with_capacity(chunk.len());
+            let mut retry_initial_interval_ms = Vec::with_capacity(chunk.len());
+            let mut retry_max_interval_ms = Vec::with_capacity(chunk.len());
+            let mut retry_backoff_coefficients = Vec::with_capacity(chunk.len());
+            let mut retry_jitter_factors = Vec::with_capacity(chunk.len());
+            let mut concurrency_keys = Vec::with_capacity(chunk.len());
+            let mut priorities = Vec::with_capacity(chunk.len());
 
             for input in chunk {
                 ids.push(TaskId::new());
                 input_values.push(serde_json::to_value(input)?);
-                delays.push(StdDuration::try_from(task.delay())?);
+                timeouts.push(StdDuration::try_from(task.timeout_for(input))?);
+                heartbeats.push(StdDuration::try_from(task.heartbeat_for(input))?);
+                ttls.push(StdDuration::try_from(task.ttl_for(input))?);
+                delays.push(StdDuration::try_from(task.delay_for(input))?);
+                let retry_policy = task.retry_policy_for(input);
+                retry_max_attempts.push(retry_policy.max_attempts);
+                retry_initial_interval_ms.push(retry_policy.initial_interval_ms);
+                retry_max_interval_ms.push(retry_policy.max_interval_ms);
+                retry_backoff_coefficients.push(retry_policy.backoff_coefficient);
+                retry_jitter_factors.push(retry_policy.jitter_factor);
+                concurrency_keys.push(task.concurrency_key_for(input));
+                priorities.push(task.priority_for(input));
             }
 
             sqlx::query!(
@@ -693,20 +707,67 @@ impl<T: Task> Queue<T> {
               concurrency_key,
               priority
             )
-            select t.id, $1 as task_queue_name, t.input, $2 as timeout, $3 as heartbeat, $4 as ttl, t.delay, $5 as retry_policy, $6 as concurrency_key, $7 as priority
-            from unnest($8::uuid[], $9::jsonb[], $10::interval[]) as t(id, input, delay)
+            select
+              t.id,
+              $1 as task_queue_name,
+              t.input,
+              t.timeout,
+              t.heartbeat,
+              t.ttl,
+              t.delay,
+              (
+                t.retry_max_attempts,
+                t.retry_initial_interval_ms,
+                t.retry_max_interval_ms,
+                t.retry_backoff_coefficient,
+                t.retry_jitter_factor
+              )::underway.task_retry_policy,
+              t.concurrency_key,
+              t.priority
+            from unnest(
+              $2::uuid[],
+              $3::jsonb[],
+              $4::interval[],
+              $5::interval[],
+              $6::interval[],
+              $7::interval[],
+              $8::int4[],
+              $9::int4[],
+              $10::int4[],
+              $11::float8[],
+              $12::float8[],
+              $13::text[],
+              $14::int4[]
+            ) as t(
+              id,
+              input,
+              timeout,
+              heartbeat,
+              ttl,
+              delay,
+              retry_max_attempts,
+              retry_initial_interval_ms,
+              retry_max_interval_ms,
+              retry_backoff_coefficient,
+              retry_jitter_factor,
+              concurrency_key,
+              priority
+            )
             "#,
             self.name,
-            StdDuration::try_from(timeout)? as _,
-            StdDuration::try_from(heartbeat)? as _,
-            StdDuration::try_from(ttl)? as _,
-            retry_policy as RetryPolicy,
-            concurrency_key,
-            priority,
-
             &ids as _,
             &input_values,
-            delays as _,
+            &timeouts as _,
+            &heartbeats as _,
+            &ttls as _,
+            &delays as _,
+            &retry_max_attempts as _,
+            &retry_initial_interval_ms as _,
+            &retry_max_interval_ms as _,
+            &retry_backoff_coefficients as _,
+            &retry_jitter_factors as _,
+            &concurrency_keys as _,
+            &priorities as _,
         )
         .execute(tx.as_mut())
         .await?;

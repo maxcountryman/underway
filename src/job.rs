@@ -652,10 +652,7 @@ use std::{
     ops::Deref,
     pin::Pin,
     result::Result as StdResult,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
+    sync::Arc,
     task::Poll,
 };
 
@@ -1001,7 +998,6 @@ where
     queue: Arc<JobQueue<I, S>>,
     steps: Arc<Vec<StepConfig<S>>>,
     state: S,
-    current_index: Arc<AtomicUsize>,
     _marker: PhantomData<I>,
 }
 
@@ -1653,13 +1649,26 @@ where
 
     fn first_job_input(&self, input: &I) -> Result<JobState> {
         let step_input = serde_json::to_value(input)?;
-        let step_index = self.current_index.load(Ordering::SeqCst);
+        let step_index = 0;
         let job_id = JobId::new();
         Ok(JobState {
             step_input,
             step_index,
             job_id,
         })
+    }
+}
+
+impl<I, S> Job<I, S>
+where
+    I: Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
+{
+    fn step_task_config(&self, step_index: usize) -> StepTaskConfig {
+        self.steps
+            .get(step_index)
+            .map(|step| step.task_config.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -1739,9 +1748,8 @@ where
 
         // If there's a next step, enqueue it.
         if let Some((next_input, delay)) = step_result {
-            // Advance current index after executing the step.
+            // Advance to the next step after executing the step.
             let next_index = step_index + 1;
-            self.current_index.store(next_index, Ordering::SeqCst);
 
             let next_job_input = JobState {
                 step_input: next_input,
@@ -1762,38 +1770,59 @@ where
     }
 
     fn retry_policy(&self) -> RetryPolicy {
-        let current_index = self.current_index.load(Ordering::SeqCst);
-        self.steps[current_index].task_config.retry_policy
+        self.step_task_config(0).retry_policy
     }
 
     fn timeout(&self) -> Span {
-        let current_index = self.current_index.load(Ordering::SeqCst);
-        self.steps[current_index].task_config.timeout
+        self.step_task_config(0).timeout
     }
 
     fn ttl(&self) -> Span {
-        let current_index = self.current_index.load(Ordering::SeqCst);
-        self.steps[current_index].task_config.ttl
+        self.step_task_config(0).ttl
     }
 
     fn delay(&self) -> Span {
-        let current_index = self.current_index.load(Ordering::SeqCst);
-        self.steps[current_index].task_config.delay
+        self.step_task_config(0).delay
     }
 
     fn heartbeat(&self) -> Span {
-        let current_index = self.current_index.load(Ordering::SeqCst);
-        self.steps[current_index].task_config.heartbeat
+        self.step_task_config(0).heartbeat
     }
 
     fn concurrency_key(&self) -> Option<String> {
-        let current_index = self.current_index.load(Ordering::SeqCst);
-        self.steps[current_index].task_config.concurrency_key.clone()
+        self.step_task_config(0).concurrency_key
     }
 
     fn priority(&self) -> i32 {
-        let current_index = self.current_index.load(Ordering::SeqCst);
-        self.steps[current_index].task_config.priority
+        self.step_task_config(0).priority
+    }
+
+    fn retry_policy_for(&self, input: &Self::Input) -> RetryPolicy {
+        self.step_task_config(input.step_index).retry_policy
+    }
+
+    fn timeout_for(&self, input: &Self::Input) -> Span {
+        self.step_task_config(input.step_index).timeout
+    }
+
+    fn ttl_for(&self, input: &Self::Input) -> Span {
+        self.step_task_config(input.step_index).ttl
+    }
+
+    fn delay_for(&self, input: &Self::Input) -> Span {
+        self.step_task_config(input.step_index).delay
+    }
+
+    fn heartbeat_for(&self, input: &Self::Input) -> Span {
+        self.step_task_config(input.step_index).heartbeat
+    }
+
+    fn concurrency_key_for(&self, input: &Self::Input) -> Option<String> {
+        self.step_task_config(input.step_index).concurrency_key
+    }
+
+    fn priority_for(&self, input: &Self::Input) -> i32 {
+        self.step_task_config(input.step_index).priority
     }
 }
 
@@ -1807,7 +1836,6 @@ where
             queue: self.queue.clone(),
             state: self.state.clone(),
             steps: self.steps.clone(),
-            current_index: self.current_index.clone(),
             _marker: PhantomData,
         }
     }
@@ -2517,7 +2545,6 @@ where
             queue: Arc::new(queue),
             steps: Arc::new(self.steps),
             state,
-            current_index: Arc::new(AtomicUsize::new(0)),
             _marker: PhantomData,
         })
     }
@@ -2609,7 +2636,6 @@ where
             queue: Arc::new(queue),
             steps: Arc::new(self.steps),
             state,
-            current_index: Arc::new(AtomicUsize::new(0)),
             _marker: PhantomData,
         }
     }
@@ -3027,6 +3053,87 @@ mod tests {
         assert_eq!(stored_retry_policy.initial_interval_ms, 500);
         assert_eq!(stored_retry_policy.max_interval_ms, 5_000);
         assert_eq!(stored_retry_policy.backoff_coefficient, 1.25);
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn step_config_is_per_job_run(pool: PgPool) -> sqlx::Result<(), Error> {
+        #[derive(Serialize, Deserialize)]
+        struct Step1 {
+            message: String,
+        }
+
+        #[derive(Serialize, Deserialize)]
+        struct Step2 {
+            message: String,
+        }
+
+        let queue = Queue::builder()
+            .name("step_config_is_per_job_run")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let step2_policy = RetryPolicy::builder().max_attempts(9).build();
+
+        let job = Job::builder()
+            .step(|_cx, Step1 { message }| async move { To::next(Step2 { message }) })
+            .step(|_cx, Step2 { message }| async move {
+                println!("Processed {message}");
+                To::done()
+            })
+            .retry_policy(step2_policy)
+            .priority(7)
+            .queue(queue.clone())
+            .build();
+
+        job.enqueue(&Step1 {
+            message: "first".to_string(),
+        })
+        .await?;
+        job.worker().process_next_task().await?;
+
+        job.enqueue(&Step1 {
+            message: "second".to_string(),
+        })
+        .await?;
+
+        let pending_tasks = sqlx::query!(
+            r#"
+            select
+              input,
+              retry_policy as "retry_policy: RetryPolicy",
+              priority
+            from underway.task
+            where task_queue_name = $1
+              and state = $2
+            "#,
+            queue.name,
+            TaskState::Pending as TaskState
+        )
+        .fetch_all(&pool)
+        .await?;
+
+        let mut step0 = None;
+        let mut step1 = None;
+
+        for task in pending_tasks {
+            let job_state: JobState = serde_json::from_value(task.input.clone())?;
+            match job_state.step_index {
+                0 => step0 = Some(task),
+                1 => step1 = Some(task),
+                _ => {}
+            }
+        }
+
+        let step0 = step0.expect("Expected step 0 task");
+        let step1 = step1.expect("Expected step 1 task");
+
+        assert_eq!(step0.retry_policy, RetryPolicy::default());
+        assert_eq!(step0.priority, 0);
+        assert_eq!(step1.retry_policy, step2_policy);
+        assert_eq!(step1.priority, 7);
 
         Ok(())
     }

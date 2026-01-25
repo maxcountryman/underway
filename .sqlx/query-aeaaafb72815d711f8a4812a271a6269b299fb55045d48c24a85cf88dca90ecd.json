@@ -1,10 +1,15 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            select retry_policy as \"retry_policy: RetryPolicy\"\n            from underway.task\n            where id = $1\n            ",
+  "query": "\n            select\n              input,\n              retry_policy as \"retry_policy: RetryPolicy\",\n              priority\n            from underway.task\n            where task_queue_name = $1\n              and state = $2\n            ",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
+        "name": "input",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 1,
         "name": "retry_policy: RetryPolicy",
         "type_info": {
           "Custom": {
@@ -35,16 +40,37 @@
             }
           }
         }
+      },
+      {
+        "ordinal": 2,
+        "name": "priority",
+        "type_info": "Int4"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Text",
+        {
+          "Custom": {
+            "name": "underway.task_state",
+            "kind": {
+              "Enum": [
+                "pending",
+                "in_progress",
+                "succeeded",
+                "cancelled",
+                "failed"
+              ]
+            }
+          }
+        }
       ]
     },
     "nullable": [
+      false,
+      false,
       false
     ]
   },
-  "hash": "451f277986a4d8543187e4266cca5bb8b55246a78583ea7230a264f972f4d0ca"
+  "hash": "aeaaafb72815d711f8a4812a271a6269b299fb55045d48c24a85cf88dca90ecd"
 }

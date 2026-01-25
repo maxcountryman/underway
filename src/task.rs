@@ -559,6 +559,55 @@ pub trait Task: Send + 'static {
     fn priority(&self) -> i32 {
         0
     }
+
+    /// Defines the retry policy for a specific input.
+    ///
+    /// Defaults to [`retry_policy`](Task::retry_policy).
+    fn retry_policy_for(&self, _input: &Self::Input) -> RetryPolicy {
+        self.retry_policy()
+    }
+
+    /// Provides the task execution timeout for a specific input.
+    ///
+    /// Defaults to [`timeout`](Task::timeout).
+    fn timeout_for(&self, _input: &Self::Input) -> Span {
+        self.timeout()
+    }
+
+    /// Provides task time-to-live for a specific input.
+    ///
+    /// Defaults to [`ttl`](Task::ttl).
+    fn ttl_for(&self, _input: &Self::Input) -> Span {
+        self.ttl()
+    }
+
+    /// Provides a delay before dequeue for a specific input.
+    ///
+    /// Defaults to [`delay`](Task::delay).
+    fn delay_for(&self, _input: &Self::Input) -> Span {
+        self.delay()
+    }
+
+    /// Provides the heartbeat interval for a specific input.
+    ///
+    /// Defaults to [`heartbeat`](Task::heartbeat).
+    fn heartbeat_for(&self, _input: &Self::Input) -> Span {
+        self.heartbeat()
+    }
+
+    /// Provides the concurrency key for a specific input.
+    ///
+    /// Defaults to [`concurrency_key`](Task::concurrency_key).
+    fn concurrency_key_for(&self, _input: &Self::Input) -> Option<String> {
+        self.concurrency_key()
+    }
+
+    /// Provides the priority for a specific input.
+    ///
+    /// Defaults to [`priority`](Task::priority).
+    fn priority_for(&self, _input: &Self::Input) -> i32 {
+        self.priority()
+    }
 }
 
 /// Represents the possible states a task can be in.
