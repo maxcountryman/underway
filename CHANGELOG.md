@@ -3,6 +3,7 @@
 - Fix: Pending retry delays now respect the last attempt time when re-queuing tasks
 - Fix: Reap completed worker processing tasks to avoid unbounded memory growth
 - Fix: Fence reclaimed task attempts so stale workers cannot update task state
+- Add: Job steps can configure task timeouts, TTLs, delays, heartbeats, concurrency keys, and priorities
 
 # 0.2.0
 
