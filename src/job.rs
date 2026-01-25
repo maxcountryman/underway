@@ -39,8 +39,9 @@
 //!
 //! Notice that the first argument to our function is [a context
 //! binding](crate::job::Context). This provides access to fields like
-//! [`state`](crate::job::Context::state) and
-//! [`tx`](crate::job::Context::tx).
+//! [`state`](crate::job::Context::state),
+//! [`step_index`](crate::job::Context::step_index),
+//! and [`job_id`](crate::job::Context::job_id).
 //!
 //! The second argument is a type we provide as input to the step. In our
 //! example it's the unit type. But if we were to specify another type it would
@@ -248,53 +249,52 @@
 //! will have access to the same state. For this reason, this pattern is
 //! discouraged.
 //!
-//! # Atomicity
+//! # Side effects
 //!
-//! Apart from state, context also provides another useful field: a transaction
-//! that's shared with the worker.
-//!
-//! Access to this transaction means we can make updates to the database that
-//! are only visible if the execution itself succeeds and the transaction is
-//! committed by the worker.
+//! Steps should focus on durable state transitions. When a step needs to
+//! perform an external side effect (HTTP calls, emails, etc.), return
+//! [`To::effect`] and add an effect handler. Effects run on a dedicated queue
+//! after the step's transaction commits, and only then enqueue the next step.
+//! Effect handlers should be idempotent since they may be retried.
 //!
 //! ```rust
 //! use serde::{Deserialize, Serialize};
-//! use underway::{job::Context, Job, To};
+//! use underway::{Job, To};
 //!
 //! #[derive(Serialize, Deserialize)]
 //! struct UserSub {
 //!     user_id: i64,
 //! }
 //!
-//! let job_builder =
-//!     Job::<_, ()>::builder().step(|Context { mut tx, .. }, UserSub { user_id }| async move {
-//!         sqlx::query(
-//!             r#"
-//!             update user
-//!             set subscribed_at = now()
-//!             where id = $1
-//!             "#,
-//!         )
-//!         .bind(user_id)
-//!         .fetch_one(&mut *tx)
-//!         .await?;
+//! #[derive(Serialize, Deserialize)]
+//! struct SendEmail {
+//!     user_id: i64,
+//! }
 //!
-//!         tx.commit().await?;
+//! #[derive(Serialize, Deserialize)]
+//! struct FinishSub {
+//!     user_id: i64,
+//! }
 //!
+//! let job_builder = Job::<_, ()>::builder()
+//!     .step(|_cx, UserSub { user_id }| async move {
+//!         // Persist state to the database here.
+//!         To::effect(SendEmail { user_id })
+//!     })
+//!     .effect(|_cx, SendEmail { user_id }| async move {
+//!         // Perform the external side effect.
+//!         println!("Sending email for user {user_id}");
+//!         To::next(FinishSub { user_id })
+//!     })
+//!     .step(|_cx, FinishSub { user_id }| async move {
+//!         println!("Finished subscription for {user_id}");
 //!         To::done()
 //!     });
-//! ```
-//!
-//! The special thing about this code is that we've leveraged the transaction
-//! provided by the context to make an update to the user table. What this means
-//! is the execution either succeeds and this update becomes visible or it
-//! doesn't and it's like nothing ever happened.
 //!
 //! # Retry policies
 //!
 //! Steps being tasks also have associated retry policies. This policy inherits
 //! the default but can be provided for each step.
-//!
 //! ```rust
 //! use serde::{Deserialize, Serialize};
 //! use underway::{task::RetryPolicy, Job, To};
@@ -325,14 +325,13 @@
 //!     })
 //!     .retry_policy(RetryPolicy::builder().max_interval_ms(15_000).build());
 //! ```
-//!
+//! 
 //! # Step configuration
 //!
-//! Steps can configure the same task-level settings as standalone tasks. Each
-//! step can set its timeout, TTL, delay, heartbeat interval, concurrency key,
-//! and priority. Base delays are added to any delay returned by
-//! [`To::delay_for`].
-//!
+//! Steps and effects can configure the same task-level settings as standalone
+//! tasks. Each step or effect can set its timeout, TTL, delay, heartbeat
+//! interval, concurrency key, and priority. Base delays are added to any delay
+//! returned by [`To::delay_for`].
 //! ```rust
 //! use jiff::ToSpan;
 //! use underway::{Job, To};
@@ -346,12 +345,11 @@
 //!     .concurrency_key("customer:42")
 //!     .priority(10);
 //! ```
-//!
+//! 
 //! # Enqueuing jobs
 //!
 //! Once we've configured our job with its sequence of one or more steps we can
 //! build the job and enqueue it with input.
-//!
 //! ```rust,no_run
 //! # use sqlx::PgPool;
 //! use underway::{Job, To};
@@ -379,10 +377,9 @@
 //! # });
 //! # }
 //! ```
-//!
+//! 
 //! We could also supply a queue that's already been constructed, to use as our
-//! job's queue. This obviates the need to await the job build method.
-//!
+//! job's queue. The job build still awaits to create the effect queue.
 //! ```rust,no_run
 //! # use sqlx::PgPool;
 //! use underway::{Job, Queue, To};
@@ -407,18 +404,18 @@
 //! let job = Job::builder()
 //!     .step(|_cx, _| async move { To::done() })
 //!     .queue(queue)
-//!     .build();
+//!     .build()
+//!     .await?;
 //!
 //! job.enqueue(&()).await?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! # });
 //! # }
 //! ```
-//!
+//! 
 //! Notice that we've enqueued a value of a type that's compatible with our
 //! first step's input--in this case that's unit since we haven't given another
 //! type.
-//!
 //! ```rust,no_run
 //! # use sqlx::PgPool;
 //! use serde::{Deserialize, Serialize};
@@ -455,7 +452,7 @@
 //! # });
 //! # }
 //! ```
-//!
+//! 
 //! While we're only demonstrating a single step here for brevity, the process
 //! is the same for jobs with multiple steps.
 //!
@@ -467,7 +464,6 @@
 //!
 //! By doing so, we can ensure that the enqueue will only happen when the
 //! transaction is committed.
-//!
 //! ```rust,no_run
 //! # use sqlx::PgPool;
 //! use serde::{Deserialize, Serialize};
@@ -507,13 +503,12 @@
 //! # });
 //! # }
 //! ```
-//!
+//! 
 //! # Running jobs
 //!
 //! Jobs are run via workers and schedulers, where the former processes tasks
 //! and the latter processes schedules for enqueuing tasks. Starting both is
 //! encapsulated by the job interface.
-//!
 //! ```rust,no_run
 //! # use sqlx::PgPool;
 //! use underway::{Job, To};
@@ -541,10 +536,9 @@
 //! # });
 //! # }
 //! ```
-//!
+//! 
 //! Typically starting the job such that our program isn't blocked is desirable.
 //! However, we can also run the job in a blocking manner directly.
-//!
 //! ```rust,no_run
 //! # use sqlx::PgPool;
 //! use underway::{Job, To};
@@ -572,9 +566,8 @@
 //! # });
 //! # }
 //! ```
-//!
+//! 
 //! Workers and schedulers can be used directly too.
-//!
 //! ```rust,no_run
 //! # use sqlx::PgPool;
 //! use underway::{Job, Queue, Scheduler, To, Worker};
@@ -602,12 +595,11 @@
 //! # });
 //! # }
 //! ```
-//!
+//! 
 //! # Scheduling jobs
 //!
 //! Jobs may also be run on a schedule that follows the form of a cron-like
 //! expression.
-//!
 //! ```rust,no_run
 //! # use sqlx::PgPool;
 //! use underway::{Job, To};
@@ -638,7 +630,7 @@
 //! # });
 //! # }
 //! ```
-//!
+//! 
 //! Often input to a scheduled job would consist of static configuration or
 //! other fields that are shared for scheduled runs.
 //!
@@ -646,13 +638,13 @@
 //! desired.
 
 use std::{
-    future::Future, marker::PhantomData, mem, ops::Deref, pin::Pin, result::Result as StdResult,
+    future::Future, marker::PhantomData, ops::Deref, pin::Pin, result::Result as StdResult,
     sync::Arc, task::Poll,
 };
 
 use builder_states::{Initial, PoolSet, QueueNameSet, QueueSet, StateSet, StepSet};
 use jiff::{Span, ToSpan};
-use sealed::JobState;
+use sealed::{EffectState, JobState};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sqlx::{PgExecutor, PgPool, Postgres, Transaction};
 use tokio::task::{JoinError, JoinSet};
@@ -705,6 +697,7 @@ pub enum Error {
 }
 
 type JobQueue<T, S> = Queue<Job<T, S>>;
+type EffectQueue<T, S> = Queue<EffectTask<T, S>>;
 
 /// Context passed in to each step.
 pub struct Context<S> {
@@ -715,16 +708,6 @@ pub struct Context<S> {
     /// **Note:** State is not persisted and therefore should not be
     /// relied on when durability is needed.
     pub state: S,
-
-    /// A savepoint that originates from the worker executing the task.
-    ///
-    /// This is useful for ensuring atomicity: writes made to the database with
-    /// this handle are only realized if the worker succeeds in processing
-    /// the task.
-    ///
-    /// Put another way, this savepoint is derived from the same transaction
-    /// that holds the lock on the underlying task row.
-    pub tx: Transaction<'static, Postgres>,
 
     /// Current index of the step being executed zero-based.
     ///
@@ -746,9 +729,51 @@ pub struct Context<S> {
     pub queue_name: String,
 }
 
+/// Context passed in to each effect handler.
+pub struct EffectContext<S> {
+    /// Shared step state.
+    ///
+    /// This value is set via [`state`](Builder::state).
+    ///
+    /// **Note:** State is not persisted and therefore should not be
+    /// relied on when durability is needed.
+    pub state: S,
+
+    /// Current index of the step that produced this effect, zero-based.
+    pub step_index: usize,
+
+    /// Total steps count.
+    ///
+    /// The number of steps in this job definition.
+    pub step_count: usize,
+
+    /// Current index of the effect being executed, zero-based.
+    pub effect_index: usize,
+
+    /// This `JobId`.
+    pub job_id: JobId,
+
+    /// Queue name.
+    ///
+    /// Name of the queue the job step is currently running on.
+    pub queue_name: String,
+
+    /// Effect queue name.
+    ///
+    /// Name of the queue the effect handler is running on.
+    pub effect_queue_name: String,
+}
+
 struct StepConfig<S> {
     executor: Box<dyn StepExecutor<S>>,
     task_config: StepTaskConfig,
+    next_effect_index: Option<usize>,
+}
+
+struct EffectConfig<S> {
+    executor: Box<dyn EffectExecutor<S>>,
+    task_config: StepTaskConfig,
+    next_effect_index: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -787,6 +812,14 @@ mod sealed {
         pub step_input: serde_json::Value,
         pub(crate) job_id: JobId,
     } // TODO: Versioning?
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    pub struct EffectState {
+        pub effect_index: usize,
+        pub step_index: usize,
+        pub effect_input: serde_json::Value,
+        pub(crate) job_id: JobId,
+    }
 }
 
 /// Container for the runtime of the job instance.
@@ -990,9 +1023,23 @@ where
     S: Clone + Sync + Send + 'static,
 {
     queue: Arc<JobQueue<I, S>>,
+    effect_queue: Arc<EffectQueue<I, S>>,
     steps: Arc<Vec<StepConfig<S>>>,
+    effects: Arc<Vec<EffectConfig<S>>>,
     state: S,
     _marker: PhantomData<I>,
+}
+
+/// Task wrapper that runs effect handlers on the effect queue.
+///
+/// This is primarily for internal use; prefer [`Job::effect_worker`] for
+/// running effects.
+pub struct EffectTask<I, S>
+where
+    I: Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
+{
+    job: Job<I, S>,
 }
 
 impl<I, S> Job<I, S>
@@ -1578,6 +1625,11 @@ where
         Arc::clone(&self.queue)
     }
 
+    /// Returns this job's effect `Queue`.
+    pub fn effect_queue(&self) -> Arc<Queue<EffectTask<I, S>>> {
+        Arc::clone(&self.effect_queue)
+    }
+
     /// Creates a `Worker` for this job.
     ///
     /// # Example
@@ -1608,6 +1660,11 @@ where
     /// # }
     pub fn worker(&self) -> Worker<Self> {
         Worker::new(self.queue(), self.clone())
+    }
+
+    /// Creates a `Worker` for this job's effects.
+    pub fn effect_worker(&self) -> Worker<EffectTask<I, S>> {
+        Worker::new(self.effect_queue(), self.effect_task())
     }
 
     /// Creates a `Scheduler` for this job.
@@ -1642,13 +1699,13 @@ where
         Scheduler::new(self.queue(), self.clone())
     }
 
-    /// Runs both a worker and scheduler for the job.
+    /// Runs the worker, effect worker, and scheduler for the job.
     ///
     /// # Errors
     ///
     /// This has the same error conditions as [`Worker::run`] and
     /// [`Scheduler::run`]. It will also return an error if either of the
-    /// spawned worker or scheduler cannot be joined.
+    /// spawned workers or scheduler cannot be joined.
     ///
     /// # Example
     ///
@@ -1678,10 +1735,12 @@ where
     /// ```
     pub async fn run(&self) -> Result {
         let worker = self.worker();
+        let effect_worker = self.effect_worker();
         let scheduler = self.scheduler();
 
         let mut workers = JoinSet::new();
         workers.spawn(async move { worker.run().await.map_err(Error::from) });
+        workers.spawn(async move { effect_worker.run().await.map_err(Error::from) });
         workers.spawn(async move { scheduler.run().await.map_err(Error::from) });
 
         while let Some(ret) = workers.join_next().await {
@@ -1695,7 +1754,8 @@ where
         Ok(())
     }
 
-    /// Starts both a worker and scheduler for the job and returns a handle.
+    /// Starts the worker, effect worker, and scheduler for the job and returns
+    /// a handle.
     ///
     /// The returned handle may be used to gracefully shutdown the worker and
     /// scheduler.
@@ -1704,7 +1764,7 @@ where
     ///
     /// This has the same error conditions as [`Worker::run`] and
     /// [`Scheduler::run`]. It will also return an error if either of the
-    /// spawned worker or scheduler cannot be joined.
+    /// spawned workers or scheduler cannot be joined.
     ///
     /// # Example
     ///
@@ -1738,16 +1798,21 @@ where
 
         let mut worker = self.worker();
         worker.set_shutdown_token(shutdown_token.clone());
+        let mut effect_worker = self.effect_worker();
+        effect_worker.set_shutdown_token(shutdown_token.clone());
         let mut scheduler = self.scheduler();
         scheduler.set_shutdown_token(shutdown_token.clone());
 
         // Spawn the tasks using `tokio::spawn` to decouple them from polling the
         // `Future`.
         let worker_handle = tokio::spawn(async move { worker.run().await.map_err(Error::from) });
+        let effect_handle =
+            tokio::spawn(async move { effect_worker.run().await.map_err(Error::from) });
         let scheduler_handle =
             tokio::spawn(async move { scheduler.run().await.map_err(Error::from) });
 
         workers.spawn(worker_handle);
+        workers.spawn(effect_handle);
         workers.spawn(scheduler_handle);
 
         JobHandle {
@@ -1773,10 +1838,21 @@ where
     I: Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
 {
+    fn effect_task(&self) -> EffectTask<I, S> {
+        EffectTask { job: self.clone() }
+    }
+
     fn step_task_config(&self, step_index: usize) -> StepTaskConfig {
         self.steps
             .get(step_index)
             .map(|step| step.task_config.clone())
+            .unwrap_or_default()
+    }
+
+    fn effect_task_config(&self, effect_index: usize) -> StepTaskConfig {
+        self.effects
+            .get(effect_index)
+            .map(|effect| effect.task_config.clone())
             .unwrap_or_default()
     }
 }
@@ -1813,32 +1889,11 @@ where
             return Err(TaskError::Fatal("Invalid step index.".into()));
         }
 
-        let step = &self.steps[step_index].executor;
-
-        // SAFETY:
-        //
-        // We are extending the lifetime of `tx` to `'static` to satisfy the trait
-        // object requirements in `StepExecutor`. This is sound because:
-        //
-        // 1. The `execute` method awaits the future returned by `execute_step`
-        //    immediately, ensuring that `tx` remains valid during the entire operation.
-        // 2. `step_tx` does not escape the scope of the `execute` method; it is not
-        //    stored or moved elsewhere.
-        // 3. The `Context` and any data derived from `step_tx` are used only within the
-        //    `execute_step` method and its returned future.
-        //
-        // As a result, even though we are claiming a `'static` lifetime for `tx`, we
-        // ensure that it does not actually outlive its true lifetime, maintaining
-        // soundness.
-        //
-        // Note: This is a workaround due to limitations with trait objects and
-        // lifetimes in async contexts. Be cautious with any changes that might
-        // allow `step_tx` to outlive `tx`.
-        let step_tx: Transaction<'static, Postgres> = unsafe { mem::transmute_copy(&tx) };
+        let step_config = &self.steps[step_index];
+        let step = &step_config.executor;
 
         let cx = Context {
             state: self.state.clone(),
-            tx: step_tx,
             step_index,
             job_id,
             step_count: self.steps.len(),
@@ -1849,7 +1904,7 @@ where
         let step_result = match step.execute_step(cx, step_input).await {
             Ok(result) => result,
             Err(err) => {
-                // N.B.: Commit the transaction to ensure attempt rows are persisted.
+                // Commit the savepoint to release the transaction promptly.
                 tx.commit().await?;
                 return Err(err);
             }
@@ -1857,19 +1912,38 @@ where
 
         // If there's a next step, enqueue it.
         if let Some((next_input, delay)) = step_result {
-            // Advance to the next step after executing the step.
-            let next_index = step_index + 1;
+            if let Some(effect_index) = step_config.next_effect_index {
+                if effect_index >= self.effects.len() {
+                    return Err(TaskError::Fatal("Invalid effect index.".into()));
+                }
 
-            let next_job_input = JobState {
-                step_input: next_input,
-                step_index: next_index,
-                job_id,
-            };
+                let effect_task = self.effect_task();
+                let effect_input = EffectState {
+                    effect_index,
+                    step_index,
+                    effect_input: next_input,
+                    job_id,
+                };
 
-            self.queue
-                .enqueue_after(&mut *tx, self, &next_job_input, delay)
-                .await
-                .map_err(|err| TaskError::Retryable(err.to_string()))?;
+                self.effect_queue
+                    .enqueue_after(&mut *tx, &effect_task, &effect_input, delay)
+                    .await
+                    .map_err(|err| TaskError::Retryable(err.to_string()))?;
+            } else {
+                // Advance to the next step after executing the step.
+                let next_index = step_index + 1;
+
+                let next_job_input = JobState {
+                    step_input: next_input,
+                    step_index: next_index,
+                    job_id,
+                };
+
+                self.queue
+                    .enqueue_after(&mut *tx, self, &next_job_input, delay)
+                    .await
+                    .map_err(|err| TaskError::Retryable(err.to_string()))?;
+            }
         }
 
         // Commit the transaction.
@@ -1935,6 +2009,159 @@ where
     }
 }
 
+impl<I, S> Task for EffectTask<I, S>
+where
+    I: Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
+{
+    type Input = EffectState;
+    type Output = ();
+
+    #[instrument(
+        skip_all,
+        fields(
+            job.id = %input.job_id.as_hyphenated(),
+            step = input.step_index + 1,
+            effect = input.effect_index + 1,
+            steps = self.job.steps.len()
+        ),
+        err
+    )]
+    async fn execute(
+        &self,
+        mut tx: Transaction<'_, Postgres>,
+        input: Self::Input,
+    ) -> TaskResult<Self::Output> {
+        let EffectState {
+            effect_index,
+            step_index,
+            effect_input,
+            job_id,
+        } = input;
+
+        if effect_index >= self.job.effects.len() {
+            return Err(TaskError::Fatal("Invalid effect index.".into()));
+        }
+
+        let effect_config = &self.job.effects[effect_index];
+        let effect = &effect_config.executor;
+        let cx = EffectContext {
+            state: self.job.state.clone(),
+            step_index,
+            step_count: self.job.steps.len(),
+            effect_index,
+            job_id,
+            queue_name: self.job.queue.name.clone(),
+            effect_queue_name: self.job.effect_queue.name.clone(),
+        };
+
+        let effect_result = match effect.execute_effect(cx, effect_input).await {
+            Ok(result) => result,
+            Err(err) => {
+                tx.commit().await?;
+                return Err(err);
+            }
+        };
+
+        if let Some((next_input, delay)) = effect_result {
+            if let Some(next_effect_index) = effect_config.next_effect_index {
+                if next_effect_index >= self.job.effects.len() {
+                    return Err(TaskError::Fatal("Invalid effect index.".into()));
+                }
+
+                let effect_task = self.job.effect_task();
+                let next_effect_input = EffectState {
+                    effect_index: next_effect_index,
+                    step_index,
+                    effect_input: next_input,
+                    job_id,
+                };
+
+                self.job
+                    .effect_queue
+                    .enqueue_after(&mut *tx, &effect_task, &next_effect_input, delay)
+                    .await
+                    .map_err(|err| TaskError::Retryable(err.to_string()))?;
+            } else {
+                let next_index = step_index + 1;
+                let next_job_input = JobState {
+                    step_input: next_input,
+                    step_index: next_index,
+                    job_id,
+                };
+
+                self.job
+                    .queue
+                    .enqueue_after(&mut *tx, &self.job, &next_job_input, delay)
+                    .await
+                    .map_err(|err| TaskError::Retryable(err.to_string()))?;
+            }
+        }
+
+        tx.commit().await?;
+
+        Ok(())
+    }
+
+    fn retry_policy(&self) -> RetryPolicy {
+        self.job.effect_task_config(0).retry_policy
+    }
+
+    fn timeout(&self) -> Span {
+        self.job.effect_task_config(0).timeout
+    }
+
+    fn ttl(&self) -> Span {
+        self.job.effect_task_config(0).ttl
+    }
+
+    fn delay(&self) -> Span {
+        self.job.effect_task_config(0).delay
+    }
+
+    fn heartbeat(&self) -> Span {
+        self.job.effect_task_config(0).heartbeat
+    }
+
+    fn concurrency_key(&self) -> Option<String> {
+        self.job.effect_task_config(0).concurrency_key
+    }
+
+    fn priority(&self) -> i32 {
+        self.job.effect_task_config(0).priority
+    }
+
+    fn retry_policy_for(&self, input: &Self::Input) -> RetryPolicy {
+        self.job.effect_task_config(input.effect_index).retry_policy
+    }
+
+    fn timeout_for(&self, input: &Self::Input) -> Span {
+        self.job.effect_task_config(input.effect_index).timeout
+    }
+
+    fn ttl_for(&self, input: &Self::Input) -> Span {
+        self.job.effect_task_config(input.effect_index).ttl
+    }
+
+    fn delay_for(&self, input: &Self::Input) -> Span {
+        self.job.effect_task_config(input.effect_index).delay
+    }
+
+    fn heartbeat_for(&self, input: &Self::Input) -> Span {
+        self.job.effect_task_config(input.effect_index).heartbeat
+    }
+
+    fn concurrency_key_for(&self, input: &Self::Input) -> Option<String> {
+        self.job
+            .effect_task_config(input.effect_index)
+            .concurrency_key
+    }
+
+    fn priority_for(&self, input: &Self::Input) -> i32 {
+        self.job.effect_task_config(input.effect_index).priority
+    }
+}
+
 impl<I, S> Clone for Job<I, S>
 where
     I: Send + Sync + 'static,
@@ -1943,12 +2170,22 @@ where
     fn clone(&self) -> Self {
         Self {
             queue: self.queue.clone(),
+            effect_queue: self.effect_queue.clone(),
             state: self.state.clone(),
             steps: self.steps.clone(),
+            effects: self.effects.clone(),
             _marker: PhantomData,
         }
     }
 }
+
+/// Marker type for effect inputs.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct Effect<E>(
+    /// The effect payload.
+    pub E,
+);
 
 /// Represents the state after executing a step.
 #[derive(Deserialize, Serialize)]
@@ -1982,6 +2219,13 @@ impl<S> To<S> {
     /// the span has elapsed.
     pub fn delay_for(step: S, delay: Span) -> TaskResult<Self> {
         Ok(Self::Delay { next: step, delay })
+    }
+}
+
+impl<E> To<Effect<E>> {
+    /// Transitions to an effect handler.
+    pub fn effect(effect: E) -> TaskResult<Self> {
+        Ok(Self::Next(Effect(effect)))
     }
 }
 
@@ -2019,6 +2263,33 @@ where
     }
 }
 
+// A concrete implementation of an effect using a closure.
+struct EffectFn<I, O, S, F>
+where
+    F: Fn(EffectContext<S>, I) -> Pin<Box<dyn Future<Output = TaskResult<To<O>>> + Send>>
+        + Send
+        + Sync
+        + 'static,
+{
+    func: Arc<F>,
+    _marker: PhantomData<(I, O, S)>,
+}
+
+impl<I, O, S, F> EffectFn<I, O, S, F>
+where
+    F: Fn(EffectContext<S>, I) -> Pin<Box<dyn Future<Output = TaskResult<To<O>>> + Send>>
+        + Send
+        + Sync
+        + 'static,
+{
+    fn new(func: F) -> Self {
+        Self {
+            func: Arc::new(func),
+            _marker: PhantomData,
+        }
+    }
+}
+
 type StepResult = TaskResult<Option<(serde_json::Value, Span)>>;
 
 // A trait object wrapper for steps to allow heterogeneous step types in a
@@ -2028,6 +2299,17 @@ trait StepExecutor<S>: Send + Sync {
     fn execute_step(
         &self,
         cx: Context<S>,
+        input: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = StepResult> + Send>>;
+}
+
+// A trait object wrapper for effects to allow heterogeneous effect types in a
+// vector.
+trait EffectExecutor<S>: Send + Sync {
+    // Execute the effect with the given input serialized as JSON.
+    fn execute_effect(
+        &self,
+        cx: EffectContext<S>,
         input: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = StepResult> + Send>>;
 }
@@ -2045,6 +2327,52 @@ where
     fn execute_step(
         &self,
         cx: Context<S>,
+        input: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = StepResult> + Send>> {
+        let deserialized_input: I = match serde_json::from_value(input) {
+            Ok(val) => val,
+            Err(e) => return Box::pin(async move { Err(TaskError::Fatal(e.to_string())) }),
+        };
+        let fut = (self.func)(cx, deserialized_input);
+
+        Box::pin(async move {
+            match fut.await {
+                Ok(To::Next(output)) => {
+                    let serialized_output = serde_json::to_value(output)
+                        .map_err(|e| TaskError::Fatal(e.to_string()))?;
+                    Ok(Some((serialized_output, Span::new())))
+                }
+
+                Ok(To::Delay {
+                    next: output,
+                    delay,
+                }) => {
+                    let serialized_output = serde_json::to_value(output)
+                        .map_err(|e| TaskError::Fatal(e.to_string()))?;
+                    Ok(Some((serialized_output, delay)))
+                }
+
+                Ok(To::Done) => Ok(None),
+
+                Err(e) => Err(e),
+            }
+        })
+    }
+}
+
+impl<I, O, S, F> EffectExecutor<S> for EffectFn<I, O, S, F>
+where
+    I: DeserializeOwned + Serialize + Send + Sync + 'static,
+    O: Serialize + Send + Sync + 'static,
+    S: Send + Sync + 'static,
+    F: Fn(EffectContext<S>, I) -> Pin<Box<dyn Future<Output = TaskResult<To<O>>> + Send>>
+        + Send
+        + Sync
+        + 'static,
+{
+    fn execute_effect(
+        &self,
+        cx: EffectContext<S>,
         input: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = StepResult> + Send>> {
         let deserialized_input: I = match serde_json::from_value(input) {
@@ -2117,16 +2445,35 @@ mod builder_states {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ConfigTarget {
+    Step(usize),
+    Effect(usize),
+}
+
 /// Builder for constructing a `Job` with a sequence of steps.
 pub struct Builder<I, O, S, B> {
     builder_state: B,
     steps: Vec<StepConfig<S>>,
+    effects: Vec<EffectConfig<S>>,
+    last_config: Option<ConfigTarget>,
+    effect_queue_name: Option<String>,
     _marker: PhantomData<(I, O, S)>,
 }
 
 impl<I, S> Default for Builder<I, I, S, Initial> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl<I, O, S, B> Builder<I, O, S, B> {
+    /// Sets the queue name for effects.
+    ///
+    /// Defaults to `"<queue_name>__effects"` when not provided.
+    pub fn effect_queue_name(mut self, name: impl Into<String>) -> Self {
+        self.effect_queue_name = Some(name.into());
+        self
     }
 }
 
@@ -2145,6 +2492,9 @@ impl<I, S> Builder<I, I, S, Initial> {
         Builder::<I, I, S, _> {
             builder_state: Initial,
             steps: Vec::new(),
+            effects: Vec::new(),
+            last_config: None,
+            effect_queue_name: None,
             _marker: PhantomData,
         }
     }
@@ -2179,6 +2529,9 @@ impl<I, S> Builder<I, I, S, Initial> {
         Builder {
             builder_state: StateSet { state },
             steps: self.steps,
+            effects: self.effects,
+            last_config: self.last_config,
+            effect_queue_name: self.effect_queue_name,
             _marker: PhantomData,
         }
     }
@@ -2211,10 +2564,13 @@ impl<I, S> Builder<I, I, S, Initial> {
         Fut: Future<Output = TaskResult<To<O>>> + Send + 'static,
     {
         let step_fn = StepFn::new(move |cx, input| Box::pin(func(cx, input)));
+        let step_index = self.steps.len();
         self.steps.push(StepConfig {
             executor: Box::new(step_fn),
             task_config: StepTaskConfig::default(),
+            next_effect_index: None,
         });
+        self.last_config = Some(ConfigTarget::Step(step_index));
 
         Builder {
             builder_state: StepSet {
@@ -2222,6 +2578,9 @@ impl<I, S> Builder<I, I, S, Initial> {
                 _marker: PhantomData,
             },
             steps: self.steps,
+            effects: self.effects,
+            last_config: self.last_config,
+            effect_queue_name: self.effect_queue_name,
             _marker: PhantomData,
         }
     }
@@ -2269,10 +2628,13 @@ impl<I, S> Builder<I, I, S, StateSet<S>> {
         Fut: Future<Output = TaskResult<To<O>>> + Send + 'static,
     {
         let step_fn = StepFn::new(move |cx, input| Box::pin(func(cx, input)));
+        let step_index = self.steps.len();
         self.steps.push(StepConfig {
             executor: Box::new(step_fn),
             task_config: StepTaskConfig::default(),
+            next_effect_index: None,
         });
+        self.last_config = Some(ConfigTarget::Step(step_index));
 
         Builder {
             builder_state: StepSet {
@@ -2280,6 +2642,9 @@ impl<I, S> Builder<I, I, S, StateSet<S>> {
                 _marker: PhantomData,
             },
             steps: self.steps,
+            effects: self.effects,
+            last_config: self.last_config,
+            effect_queue_name: self.effect_queue_name,
             _marker: PhantomData,
         }
     }
@@ -2317,10 +2682,13 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
         Fut: Future<Output = TaskResult<To<New>>> + Send + 'static,
     {
         let step_fn = StepFn::new(move |cx, input| Box::pin(func(cx, input)));
+        let step_index = self.steps.len();
         self.steps.push(StepConfig {
             executor: Box::new(step_fn),
             task_config: StepTaskConfig::default(),
+            next_effect_index: None,
         });
+        self.last_config = Some(ConfigTarget::Step(step_index));
 
         Builder {
             builder_state: StepSet {
@@ -2328,11 +2696,35 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
                 _marker: PhantomData,
             },
             steps: self.steps,
+            effects: self.effects,
+            last_config: self.last_config,
+            effect_queue_name: self.effect_queue_name,
             _marker: PhantomData,
         }
     }
 
-    /// Sets the retry policy of the previous step.
+    fn update_task_config(&mut self, update: impl FnOnce(&mut StepTaskConfig)) {
+        let target = self.last_config.expect("Steps should not be empty");
+
+        match target {
+            ConfigTarget::Step(step_index) => {
+                let step_config = self
+                    .steps
+                    .get_mut(step_index)
+                    .expect("Step config should exist");
+                update(&mut step_config.task_config);
+            }
+            ConfigTarget::Effect(effect_index) => {
+                let effect_config = self
+                    .effects
+                    .get_mut(effect_index)
+                    .expect("Effect config should exist");
+                update(&mut effect_config.task_config);
+            }
+        }
+    }
+
+    /// Sets the retry policy of the previous step or effect.
     ///
     /// This policy applies to the step immediately before the method. That
     /// means that a retry policy may be defined for each step and each
@@ -2353,20 +2745,11 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
         mut self,
         retry_policy: RetryPolicy,
     ) -> Builder<I, Current, S, StepSet<Current, S>> {
-        let step_config = self.steps.last_mut().expect("Steps should not be empty");
-        step_config.task_config.retry_policy = retry_policy;
-
-        Builder {
-            builder_state: StepSet {
-                state: self.builder_state.state,
-                _marker: PhantomData,
-            },
-            steps: self.steps,
-            _marker: PhantomData,
-        }
+        self.update_task_config(|task_config| task_config.retry_policy = retry_policy);
+        self
     }
 
-    /// Sets the timeout of the previous step.
+    /// Sets the timeout of the previous step or effect.
     ///
     /// # Example
     ///
@@ -2379,20 +2762,11 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
     ///     .timeout(1.minute());
     /// ```
     pub fn timeout(mut self, timeout: Span) -> Builder<I, Current, S, StepSet<Current, S>> {
-        let step_config = self.steps.last_mut().expect("Steps should not be empty");
-        step_config.task_config.timeout = timeout;
-
-        Builder {
-            builder_state: StepSet {
-                state: self.builder_state.state,
-                _marker: PhantomData,
-            },
-            steps: self.steps,
-            _marker: PhantomData,
-        }
+        self.update_task_config(|task_config| task_config.timeout = timeout);
+        self
     }
 
-    /// Sets the TTL of the previous step.
+    /// Sets the TTL of the previous step or effect.
     ///
     /// # Example
     ///
@@ -2405,20 +2779,11 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
     ///     .ttl(7.days());
     /// ```
     pub fn ttl(mut self, ttl: Span) -> Builder<I, Current, S, StepSet<Current, S>> {
-        let step_config = self.steps.last_mut().expect("Steps should not be empty");
-        step_config.task_config.ttl = ttl;
-
-        Builder {
-            builder_state: StepSet {
-                state: self.builder_state.state,
-                _marker: PhantomData,
-            },
-            steps: self.steps,
-            _marker: PhantomData,
-        }
+        self.update_task_config(|task_config| task_config.ttl = ttl);
+        self
     }
 
-    /// Sets a base delay before the previous step can be dequeued.
+    /// Sets a base delay before the previous step or effect can be dequeued.
     ///
     /// This delay is added to any delay specified by [`To::delay_for`].
     ///
@@ -2433,20 +2798,11 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
     ///     .delay(30.seconds());
     /// ```
     pub fn delay(mut self, delay: Span) -> Builder<I, Current, S, StepSet<Current, S>> {
-        let step_config = self.steps.last_mut().expect("Steps should not be empty");
-        step_config.task_config.delay = delay;
-
-        Builder {
-            builder_state: StepSet {
-                state: self.builder_state.state,
-                _marker: PhantomData,
-            },
-            steps: self.steps,
-            _marker: PhantomData,
-        }
+        self.update_task_config(|task_config| task_config.delay = delay);
+        self
     }
 
-    /// Sets the heartbeat interval of the previous step.
+    /// Sets the heartbeat interval of the previous step or effect.
     ///
     /// # Example
     ///
@@ -2459,20 +2815,11 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
     ///     .heartbeat(5.seconds());
     /// ```
     pub fn heartbeat(mut self, heartbeat: Span) -> Builder<I, Current, S, StepSet<Current, S>> {
-        let step_config = self.steps.last_mut().expect("Steps should not be empty");
-        step_config.task_config.heartbeat = heartbeat;
-
-        Builder {
-            builder_state: StepSet {
-                state: self.builder_state.state,
-                _marker: PhantomData,
-            },
-            steps: self.steps,
-            _marker: PhantomData,
-        }
+        self.update_task_config(|task_config| task_config.heartbeat = heartbeat);
+        self
     }
 
-    /// Sets the concurrency key of the previous step.
+    /// Sets the concurrency key of the previous step or effect.
     ///
     /// # Example
     ///
@@ -2487,20 +2834,12 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
         mut self,
         concurrency_key: impl Into<String>,
     ) -> Builder<I, Current, S, StepSet<Current, S>> {
-        let step_config = self.steps.last_mut().expect("Steps should not be empty");
-        step_config.task_config.concurrency_key = Some(concurrency_key.into());
-
-        Builder {
-            builder_state: StepSet {
-                state: self.builder_state.state,
-                _marker: PhantomData,
-            },
-            steps: self.steps,
-            _marker: PhantomData,
-        }
+        let concurrency_key = concurrency_key.into();
+        self.update_task_config(|task_config| task_config.concurrency_key = Some(concurrency_key));
+        self
     }
 
-    /// Sets the priority of the previous step.
+    /// Sets the priority of the previous step or effect.
     ///
     /// # Example
     ///
@@ -2512,17 +2851,8 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
     ///     .priority(10);
     /// ```
     pub fn priority(mut self, priority: i32) -> Builder<I, Current, S, StepSet<Current, S>> {
-        let step_config = self.steps.last_mut().expect("Steps should not be empty");
-        step_config.task_config.priority = priority;
-
-        Builder {
-            builder_state: StepSet {
-                state: self.builder_state.state,
-                _marker: PhantomData,
-            },
-            steps: self.steps,
-            _marker: PhantomData,
-        }
+        self.update_task_config(|task_config| task_config.priority = priority);
+        self
     }
 }
 
@@ -2559,6 +2889,91 @@ where
                 queue_name: name.into(),
             },
             steps: self.steps,
+            effects: self.effects,
+            last_config: self.last_config,
+            effect_queue_name: self.effect_queue_name,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<I, E, S> Builder<I, Effect<E>, S, StepSet<Effect<E>, S>> {
+    /// Add an effect handler after the previous step.
+    ///
+    /// Effects are intended for external side effects (HTTP calls, emails,
+    /// etc.) and are executed on a dedicated effect queue. The next step is
+    /// only enqueued after the effect handler succeeds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use serde::{Deserialize, Serialize};
+    /// use underway::{Job, To};
+    ///
+    /// #[derive(Deserialize, Serialize)]
+    /// struct SendEmail {
+    ///     user_id: i64,
+    /// }
+    ///
+    /// #[derive(Deserialize, Serialize)]
+    /// struct NextStep {
+    ///     user_id: i64,
+    /// }
+    ///
+    /// let job_builder = Job::<(), ()>::builder()
+    ///     .step(|_cx, _| async move { To::effect(SendEmail { user_id: 42 }) })
+    ///     .effect(|_cx, SendEmail { user_id }| async move {
+    ///         // send the email
+    ///         To::next(NextStep { user_id })
+    ///     })
+    ///     .step(|_cx, _| async move { To::done() });
+    /// ```
+    pub fn effect<F, New, Fut>(mut self, func: F) -> Builder<I, New, S, StepSet<New, S>>
+    where
+        E: DeserializeOwned + Serialize + Send + Sync + 'static,
+        New: Serialize + Send + Sync + 'static,
+        S: Send + Sync + 'static,
+        F: Fn(EffectContext<S>, E) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = TaskResult<To<New>>> + Send + 'static,
+    {
+        let effect_fn = EffectFn::new(move |cx, input| Box::pin(func(cx, input)));
+        let next_effect_index = self.effects.len();
+
+        self.effects.push(EffectConfig {
+            executor: Box::new(effect_fn),
+            task_config: StepTaskConfig::default(),
+            next_effect_index: None,
+        });
+
+        match self.last_config {
+            Some(ConfigTarget::Step(step_index)) => {
+                let step_config = self
+                    .steps
+                    .get_mut(step_index)
+                    .expect("Step config should exist");
+                step_config.next_effect_index = Some(next_effect_index);
+            }
+            Some(ConfigTarget::Effect(effect_index)) => {
+                let effect_config = self
+                    .effects
+                    .get_mut(effect_index)
+                    .expect("Effect config should exist");
+                effect_config.next_effect_index = Some(next_effect_index);
+            }
+            None => panic!("Effects require a preceding step"),
+        }
+
+        self.last_config = Some(ConfigTarget::Effect(next_effect_index));
+
+        Builder {
+            builder_state: StepSet {
+                state: self.builder_state.state,
+                _marker: PhantomData,
+            },
+            steps: self.steps,
+            effects: self.effects,
+            last_config: self.last_config,
+            effect_queue_name: self.effect_queue_name,
             _marker: PhantomData,
         }
     }
@@ -2606,6 +3021,9 @@ where
                 pool,
             },
             steps: self.steps,
+            effects: self.effects,
+            last_config: self.last_config,
+            effect_queue_name: self.effect_queue_name,
             _marker: PhantomData,
         }
     }
@@ -2649,10 +3067,24 @@ where
             queue_name,
             pool,
         } = self.builder_state;
-        let queue = Queue::builder().name(queue_name).pool(pool).build().await?;
+        let effect_queue_name = self
+            .effect_queue_name
+            .unwrap_or_else(|| format!("{queue_name}__effects"));
+        let queue = Queue::builder()
+            .name(queue_name)
+            .pool(pool.clone())
+            .build()
+            .await?;
+        let effect_queue = Queue::builder()
+            .name(effect_queue_name)
+            .pool(pool)
+            .build()
+            .await?;
         Ok(Job {
             queue: Arc::new(queue),
+            effect_queue: Arc::new(effect_queue),
             steps: Arc::new(self.steps),
+            effects: Arc::new(self.effects),
             state,
             _marker: PhantomData,
         })
@@ -2690,7 +3122,9 @@ where
     /// // Set a queue.
     /// let job = Job::<(), ()>::builder()
     ///     .step(|_cx, _| async move { To::done() })
-    ///     .queue(queue);
+    ///     .queue(queue)
+    ///     .build()
+    ///     .await?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
     /// # }
@@ -2702,6 +3136,9 @@ where
                 queue,
             },
             steps: self.steps,
+            effects: self.effects,
+            last_config: self.last_config,
+            effect_queue_name: self.effect_queue_name,
             _marker: PhantomData,
         }
     }
@@ -2735,31 +3172,46 @@ where
     /// let job = Job::<(), ()>::builder()
     ///     .step(|_cx, _| async move { To::done() })
     ///     .queue(queue)
-    ///     .build();
+    ///     .build()
+    ///     .await?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
     /// # }
-    pub fn build(self) -> Job<I, S> {
+    pub async fn build(self) -> Result<Job<I, S>> {
         let QueueSet { state, queue } = self.builder_state;
-        Job {
+        let effect_queue_name = self
+            .effect_queue_name
+            .unwrap_or_else(|| format!("{}__effects", queue.name));
+        let effect_queue = Queue::builder()
+            .name(effect_queue_name)
+            .pool(queue.pool.clone())
+            .build()
+            .await?;
+
+        Ok(Job {
             queue: Arc::new(queue),
+            effect_queue: Arc::new(effect_queue),
             steps: Arc::new(self.steps),
+            effects: Arc::new(self.effects),
             state,
             _marker: PhantomData,
-        }
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{cmp::Ordering, sync::Mutex};
+    use std::{
+        cmp::Ordering,
+        sync::{Arc, Mutex},
+    };
 
     use jiff::ToSpan;
     use serde::{Deserialize, Serialize};
     use sqlx::{postgres::types::PgInterval, PgPool};
 
     use super::*;
-    use crate::{queue::graceful_shutdown, worker::pg_interval_to_span};
+    use crate::worker::pg_interval_to_span;
 
     #[sqlx::test]
     async fn one_step(pool: PgPool) -> sqlx::Result<(), Error> {
@@ -2780,7 +3232,8 @@ mod tests {
                 To::done()
             })
             .queue(queue.clone())
-            .build();
+            .build()
+            .await?;
 
         assert_eq!(job.retry_policy(), RetryPolicy::default());
 
@@ -2819,7 +3272,11 @@ mod tests {
             .build()
             .await?;
 
-        let job = Job::builder().step(step).queue(queue.clone()).build();
+        let job = Job::builder()
+            .step(step)
+            .queue(queue.clone())
+            .build()
+            .await?;
 
         assert_eq!(job.retry_policy(), RetryPolicy::default());
 
@@ -2870,7 +3327,8 @@ mod tests {
                 To::done()
             })
             .queue(queue.clone())
-            .build();
+            .build()
+            .await?;
 
         assert_eq!(job.retry_policy(), RetryPolicy::default());
 
@@ -2916,19 +3374,12 @@ mod tests {
 
         job.enqueue(&()).await?;
 
-        job.start();
-
-        // Give the job a moment to process.
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        job.worker().process_next_task().await?;
 
         assert_eq!(
             *state.data.lock().expect("Mutex should not be poisoned"),
             "bar".to_string()
         );
-
-        // Shutdown and wait for a bit to ensure the test can exit.
-        tokio::spawn(async move { graceful_shutdown(&pool).await });
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
         Ok(())
     }
@@ -2967,7 +3418,8 @@ mod tests {
             .state(state)
             .step(step)
             .queue(queue.clone())
-            .build();
+            .build()
+            .await?;
 
         assert_eq!(job.retry_policy(), RetryPolicy::default());
 
@@ -3007,7 +3459,8 @@ mod tests {
                 To::done()
             })
             .queue(queue.clone())
-            .build();
+            .build()
+            .await?;
 
         let input = Input {
             message: "Hello, world!".to_string(),
@@ -3045,7 +3498,8 @@ mod tests {
                 To::done()
             })
             .queue(queue.clone())
-            .build();
+            .build()
+            .await?;
 
         let inputs = [
             Input {
@@ -3117,7 +3571,8 @@ mod tests {
             .concurrency_key("customer:42")
             .priority(9)
             .queue(queue.clone())
-            .build();
+            .build()
+            .await?;
 
         job.enqueue(&()).await?;
 
@@ -3261,7 +3716,8 @@ mod tests {
             .retry_policy(step2_policy)
             .priority(7)
             .queue(queue.clone())
-            .build();
+            .build()
+            .await?;
 
         job.enqueue(&Step1 {
             message: "first".to_string(),
@@ -3324,7 +3780,8 @@ mod tests {
         let job = Job::builder()
             .step(|_, _| async { To::done() })
             .queue(queue.clone())
-            .build();
+            .build()
+            .await?;
 
         let monthly = "@monthly[America/Los_Angeles]"
             .parse()
@@ -3400,7 +3857,8 @@ mod tests {
                 To::done()
             })
             .queue(queue.clone())
-            .build();
+            .build()
+            .await?;
 
         assert_eq!(job.retry_policy(), RetryPolicy::default());
 
@@ -3466,7 +3924,8 @@ mod tests {
             })
             .retry_policy(step2_policy)
             .queue(queue.clone())
-            .build();
+            .build()
+            .await?;
 
         assert_eq!(job.retry_policy(), step1_policy);
 
@@ -3559,7 +4018,8 @@ mod tests {
                 To::done()
             })
             .queue(queue.clone())
-            .build();
+            .build()
+            .await?;
 
         assert_eq!(job.retry_policy(), RetryPolicy::default());
 
@@ -3619,7 +4079,8 @@ mod tests {
                 To::done()
             })
             .queue(queue.clone())
-            .build();
+            .build()
+            .await?;
 
         let input = Step1 {
             message: "Hello, world!".to_string(),
@@ -3687,6 +4148,91 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn effect_steps_run_in_order(pool: PgPool) -> sqlx::Result<(), Error> {
+        #[derive(Clone)]
+        struct State {
+            events: Arc<Mutex<Vec<String>>>,
+        }
+
+        #[derive(Serialize, Deserialize)]
+        struct Step1 {
+            message: String,
+        }
+
+        #[derive(Serialize, Deserialize)]
+        struct SendEmail {
+            message: String,
+        }
+
+        #[derive(Serialize, Deserialize)]
+        struct Step2 {
+            message: String,
+        }
+
+        let queue = Queue::builder()
+            .name("effect_steps_run_in_order")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let state = State {
+            events: Arc::clone(&events),
+        };
+
+        let job = Job::builder()
+            .state(state)
+            .step(|cx, Step1 { message }| async move {
+                cx.state
+                    .events
+                    .lock()
+                    .expect("Mutex should not be poisoned")
+                    .push("step1".to_string());
+                To::effect(SendEmail { message })
+            })
+            .effect(|cx, SendEmail { message }| async move {
+                cx.state
+                    .events
+                    .lock()
+                    .expect("Mutex should not be poisoned")
+                    .push("effect".to_string());
+                To::next(Step2 { message })
+            })
+            .step(|cx, Step2 { message }| async move {
+                cx.state
+                    .events
+                    .lock()
+                    .expect("Mutex should not be poisoned")
+                    .push(format!("step2:{message}"));
+                To::done()
+            })
+            .queue(queue.clone())
+            .build()
+            .await?;
+
+        job.enqueue(&Step1 {
+            message: "hello".to_string(),
+        })
+        .await?;
+
+        job.worker().process_next_task().await?;
+        job.effect_worker().process_next_task().await?;
+        job.worker().process_next_task().await?;
+
+        let events = events.lock().expect("Mutex should not be poisoned").clone();
+        assert_eq!(
+            events,
+            vec![
+                "step1".to_string(),
+                "effect".to_string(),
+                "step2:hello".to_string()
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[sqlx::test]
     async fn schedule(pool: PgPool) -> sqlx::Result<(), Error> {
         #[derive(Serialize, Deserialize)]
         struct Input {
@@ -3705,7 +4251,8 @@ mod tests {
                 To::done()
             })
             .queue(queue.clone())
-            .build();
+            .build()
+            .await?;
 
         assert_eq!(job.retry_policy(), RetryPolicy::default());
 
@@ -3748,7 +4295,8 @@ mod tests {
                 To::done()
             })
             .queue(queue.clone())
-            .build();
+            .build()
+            .await?;
 
         assert_eq!(job.retry_policy(), RetryPolicy::default());
 
@@ -3785,7 +4333,8 @@ mod tests {
                 To::done()
             })
             .queue(queue.clone())
-            .build();
+            .build()
+            .await?;
 
         assert_eq!(job.retry_policy(), RetryPolicy::default());
 
@@ -3806,7 +4355,8 @@ mod tests {
         let job = Job::builder()
             .step(|_cx, _| async move { To::done() })
             .queue(queue.clone())
-            .build();
+            .build()
+            .await?;
 
         let enqueued_job = job.enqueue(&()).await?;
 

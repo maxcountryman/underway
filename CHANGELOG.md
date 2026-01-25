@@ -8,6 +8,9 @@
 - Fix: Job step configuration now uses the step index from input to avoid cross-run drift
 - Add: Job steps can configure task timeouts, TTLs, delays, heartbeats, concurrency keys, and priorities
 - Add: Job batch enqueue helpers (`enqueue_many`, `enqueue_many_using`)
+- Breaking: Job steps no longer receive a worker transaction via `Context::tx`
+- Breaking: `Job::builder().queue(...).build()` is now async to create the effect queue
+- Add: Effect handlers and `To::effect` for explicit external side effects
 
 # 0.2.0
 

@@ -9,7 +9,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sqlx::PgPool;
 use tokio::task::JoinSet;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use underway::{job::Context, Job, To, ToTaskResult};
+use underway::{job::EffectContext, Job, To, ToTaskResult};
 
 const SYSTEM_PROMPT: &str = include_str!("../system-prompt.llm.txt");
 
@@ -19,6 +19,9 @@ const HN_API_BASE: &str = "https://hacker-news.firebaseio.com/v0/";
 struct Summarize {
     top_stories: Vec<(Story, Vec<Comment>)>,
 }
+
+#[derive(Deserialize, Serialize)]
+struct FetchTopStories;
 
 #[derive(Clone)]
 struct State {
@@ -158,18 +161,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let job = Job::builder()
         .state(State { openai_client })
-        .step(|_cx, _| async move {
+        .step(|_cx, _| async move { To::effect(FetchTopStories) })
+        .effect(|_cx, FetchTopStories| async move {
             tracing::info!("Retrieving the top five stories from Hacker News");
 
             let top_stories = fetch_top_stories().await.retryable()?;
             let top_five = top_stories.into_iter().take(5).collect::<Vec<_>>();
 
-            To::next(Summarize {
+            To::effect(Summarize {
                 top_stories: top_five,
             })
         })
-        .step(
-            |Context {
+        .effect(
+            |EffectContext {
                  state: State { openai_client },
                  ..
              },

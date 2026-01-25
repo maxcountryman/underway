@@ -13,8 +13,8 @@
 //!
 //! - **PostgreSQL-Backed** Leverages PostgreSQL with `FOR UPDATE SKIP LOCKED`
 //!   for reliable task storage and coordination.
-//! - **Atomic Task Management**: Enqueue tasks within your transactions and use
-//!   the worker's transaction within your tasks for atomic queries.
+//! - **Atomic Task Management**: Enqueue tasks within your transactions and
+//!   model external side effects explicitly via effect handlers.
 //! - **Automatic Retries**: Configurable retry strategies ensure tasks are
 //!   reliably completed, even after transient failures.
 //! - **Cron-Like Scheduling**: Schedule recurring tasks with cron-like
@@ -64,7 +64,8 @@
 //!
 //!     // Build the job.
 //!     let job = Job::builder()
-//!         .step(
+//!         .step(|_cx, input| async move { To::effect(input) })
+//!         .effect(
 //!             |_cx,
 //!              WelcomeEmail {
 //!                  user_id,
@@ -99,14 +100,14 @@
 //!
 //! ## Order receipts
 //!
-//! Another common use case is defining dependencies between discrete steps of a
-//! job. For instance, we might generate PDF receipts for orders and then email
-//! these to customers. With Underway, each step is handled separately, making
-//! it easy to create a job that first generates the PDF and, once
-//! completed, proceeds to send the email.
+//! Another common use case is defining dependencies between durable steps and
+//! external side effects. For instance, we might generate PDF receipts for
+//! orders and then email these to customers. With Underway, the PDF generation
+//! remains a step, and the email is modeled as an effect handler that runs
+//! after the step commits.
 //!
-//! This separation provides significant value: if the email sending service
-//! is temporarily unavailable, we can retry the email step without having to
+//! This separation provides significant value: if the email sending service is
+//! temporarily unavailable, we can retry the effect handler without having to
 //! regenerate the PDF, avoiding unnecessary repeated work.
 //!
 //! ```rust,no_run
@@ -144,10 +145,10 @@
 //!             let receipt_key = format!("receipts_bucket/{order_id}-receipt.pdf");
 //!             // ...store the PDF in an object store.
 //!
-//!             // We proceed to the next step with the receipt_key as its input.
-//!             To::next(EmailReceipt { receipt_key })
+//!             // We proceed to the effect handler with the receipt_key as its input.
+//!             To::effect(EmailReceipt { receipt_key })
 //!         })
-//!         .step(|_cx, EmailReceipt { receipt_key }| async move {
+//!         .effect(|_cx, EmailReceipt { receipt_key }| async move {
 //!             // Retrieve the PDF from the object store, and send the email.
 //!             println!("Emailing receipt for {receipt_key}");
 //!             To::done()
@@ -303,12 +304,13 @@
 //! is unawre of the concept of a "job" and treats it like any other task.
 //!
 //! [SoC]: https://en.wikipedia.org/wiki/Separation_of_concerns
+#![deny(unsafe_code)]
 #![warn(clippy::all, nonstandard_style, future_incompatible, missing_docs)]
 
 use sqlx::{migrate::Migrator, Acquire, Postgres};
 
 pub use crate::{
-    job::{Job, To},
+    job::{Effect, Job, To},
     queue::Queue,
     scheduler::{Scheduler, ZonedSchedule},
     task::{Task, ToTaskResult},
