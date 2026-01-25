@@ -694,7 +694,7 @@ impl<T: Task> Queue<T> {
             }
 
             sqlx::query!(
-            r#"
+                r#"
             insert into underway.task (
               id,
               task_queue_name,
@@ -754,23 +754,23 @@ impl<T: Task> Queue<T> {
               priority
             )
             "#,
-            self.name,
-            &ids as _,
-            &input_values,
-            &timeouts as _,
-            &heartbeats as _,
-            &ttls as _,
-            &delays as _,
-            &retry_max_attempts as _,
-            &retry_initial_interval_ms as _,
-            &retry_max_interval_ms as _,
-            &retry_backoff_coefficients as _,
-            &retry_jitter_factors as _,
-            &concurrency_keys as _,
-            &priorities as _,
-        )
-        .execute(tx.as_mut())
-        .await?;
+                self.name,
+                &ids as _,
+                &input_values,
+                &timeouts as _,
+                &heartbeats as _,
+                &ttls as _,
+                &delays as _,
+                &retry_max_attempts as _,
+                &retry_initial_interval_ms as _,
+                &retry_max_interval_ms as _,
+                &retry_backoff_coefficients as _,
+                &retry_jitter_factors as _,
+                &concurrency_keys as _,
+                &priorities as _,
+            )
+            .execute(tx.as_mut())
+            .await?;
         }
 
         tx.commit().await?;
