@@ -1102,16 +1102,79 @@ where
     _marker: PhantomData<I>,
 }
 
-/// Task wrapper that runs effect handlers on the effect queue.
-///
-/// This is primarily for internal use; prefer [`Job::effect_worker`] for
-/// running effects.
-pub struct EffectTask<I, S>
+struct EffectTask<I, S>
 where
     I: Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
 {
     job: Job<I, S>,
+}
+
+/// Worker wrapper for job effect handlers.
+pub struct EffectWorker<I, S>
+where
+    I: Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
+{
+    worker: Worker<EffectTask<I, S>>,
+}
+
+impl<I, S> Clone for EffectWorker<I, S>
+where
+    I: Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
+{
+    fn clone(&self) -> Self {
+        Self {
+            worker: self.worker.clone(),
+        }
+    }
+}
+
+impl<I, S> EffectWorker<I, S>
+where
+    I: Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
+{
+    fn new(worker: Worker<EffectTask<I, S>>) -> Self {
+        Self { worker }
+    }
+
+    /// Sets the concurrency limit for this worker.
+    pub fn set_concurrency_limit(&mut self, concurrency_limit: usize) {
+        self.worker.set_concurrency_limit(concurrency_limit);
+    }
+
+    /// Sets the shutdown token.
+    pub fn set_shutdown_token(&mut self, shutdown_token: CancellationToken) {
+        self.worker.set_shutdown_token(shutdown_token);
+    }
+
+    /// Sets the backoff policy for PostgreSQL reconnection attempts.
+    pub fn set_reconnect_backoff(&mut self, backoff: RetryPolicy) {
+        self.worker.set_reconnect_backoff(backoff);
+    }
+
+    /// Cancels the shutdown token and begins a graceful shutdown of in-progress
+    /// tasks.
+    pub fn shutdown(&self) {
+        self.worker.shutdown();
+    }
+
+    /// Runs the worker, processing tasks as they become available.
+    pub async fn run(&self) -> std::result::Result<(), WorkerError> {
+        self.worker.run().await
+    }
+
+    /// Same as `run` but allows configuration of the delay between polls.
+    pub async fn run_every(&self, period: Span) -> std::result::Result<(), WorkerError> {
+        self.worker.run_every(period).await
+    }
+
+    /// Processes the next available task in the queue.
+    pub async fn process_next_task(&self) -> std::result::Result<Option<TaskId>, WorkerError> {
+        self.worker.process_next_task().await
+    }
 }
 
 impl<I, S> Job<I, S>
@@ -1697,8 +1760,7 @@ where
         Arc::clone(&self.queue)
     }
 
-    /// Returns this job's effect `Queue`.
-    pub fn effect_queue(&self) -> Arc<Queue<EffectTask<I, S>>> {
+    fn effect_queue(&self) -> Arc<Queue<EffectTask<I, S>>> {
         Arc::clone(&self.effect_queue)
     }
 
@@ -1735,8 +1797,8 @@ where
     }
 
     /// Creates a `Worker` for this job's effects.
-    pub fn effect_worker(&self) -> Worker<EffectTask<I, S>> {
-        Worker::new(self.effect_queue(), self.effect_task())
+    pub fn effect_worker(&self) -> EffectWorker<I, S> {
+        EffectWorker::new(Worker::new(self.effect_queue(), self.effect_task()))
     }
 
     /// Creates a `Scheduler` for this job.
@@ -1980,6 +2042,8 @@ where
         next_input: serde_json::Value,
         delay: Span,
     ) -> TaskResult<()> {
+        let executor = &mut **tx;
+
         if let Some(effect_index) = next_effect_index {
             self.validate_effect_index(effect_index)?;
 
@@ -1992,7 +2056,7 @@ where
             };
 
             self.effect_queue
-                .enqueue_after(&mut *tx, &effect_task, &effect_input, delay)
+                .enqueue_after(executor, &effect_task, &effect_input, delay)
                 .await
                 .map_err(|err| TaskError::Retryable(err.to_string()))?;
         } else {
@@ -2004,7 +2068,7 @@ where
             };
 
             self.queue
-                .enqueue_after(&mut *tx, self, &next_job_input, delay)
+                .enqueue_after(executor, self, &next_job_input, delay)
                 .await
                 .map_err(|err| TaskError::Retryable(err.to_string()))?;
         }
