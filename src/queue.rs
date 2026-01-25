@@ -252,6 +252,16 @@ use crate::{
 
 type Result<T = ()> = std::result::Result<T, Error>;
 
+#[derive(Clone, PartialEq)]
+struct BatchTaskConfig {
+    retry_policy: RetryPolicy,
+    timeout: StdDuration,
+    heartbeat: StdDuration,
+    ttl: StdDuration,
+    concurrency_key: Option<String>,
+    priority: i32,
+}
+
 /// Queue errors.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -669,113 +679,188 @@ impl<T: Task> Queue<T> {
         for chunk in inputs.chunks(chunk_size) {
             let mut ids = Vec::with_capacity(chunk.len());
             let mut input_values = Vec::with_capacity(chunk.len());
-            let mut timeouts = Vec::with_capacity(chunk.len());
-            let mut heartbeats = Vec::with_capacity(chunk.len());
-            let mut ttls = Vec::with_capacity(chunk.len());
             let mut delays = Vec::with_capacity(chunk.len());
-            let mut retry_max_attempts = Vec::with_capacity(chunk.len());
-            let mut retry_initial_interval_ms = Vec::with_capacity(chunk.len());
-            let mut retry_max_interval_ms = Vec::with_capacity(chunk.len());
-            let mut retry_backoff_coefficients = Vec::with_capacity(chunk.len());
-            let mut retry_jitter_factors = Vec::with_capacity(chunk.len());
-            let mut concurrency_keys = Vec::with_capacity(chunk.len());
-            let mut priorities = Vec::with_capacity(chunk.len());
+            let mut configs = Vec::with_capacity(chunk.len());
 
             for input in chunk {
                 ids.push(TaskId::new());
                 input_values.push(serde_json::to_value(input)?);
-                timeouts.push(StdDuration::try_from(task.timeout_for(input))?);
-                heartbeats.push(StdDuration::try_from(task.heartbeat_for(input))?);
-                ttls.push(StdDuration::try_from(task.ttl_for(input))?);
                 delays.push(StdDuration::try_from(task.delay_for(input))?);
-                let retry_policy = task.retry_policy_for(input);
-                retry_max_attempts.push(retry_policy.max_attempts);
-                retry_initial_interval_ms.push(retry_policy.initial_interval_ms);
-                retry_max_interval_ms.push(retry_policy.max_interval_ms);
-                retry_backoff_coefficients.push(retry_policy.backoff_coefficient);
-                retry_jitter_factors.push(retry_policy.jitter_factor);
-                concurrency_keys.push(task.concurrency_key_for(input));
-                priorities.push(task.priority_for(input));
+                configs.push(BatchTaskConfig {
+                    retry_policy: task.retry_policy_for(input),
+                    timeout: StdDuration::try_from(task.timeout_for(input))?,
+                    heartbeat: StdDuration::try_from(task.heartbeat_for(input))?,
+                    ttl: StdDuration::try_from(task.ttl_for(input))?,
+                    concurrency_key: task.concurrency_key_for(input),
+                    priority: task.priority_for(input),
+                });
             }
 
-            sqlx::query!(
-                r#"
-            insert into underway.task (
-              id,
-              task_queue_name,
-              input,
-              timeout,
-              heartbeat,
-              ttl,
-              delay,
-              retry_policy,
-              concurrency_key,
-              priority
-            )
-            select
-              t.id,
-              $1 as task_queue_name,
-              t.input,
-              t.timeout,
-              t.heartbeat,
-              t.ttl,
-              t.delay,
-              (
-                t.retry_max_attempts,
-                t.retry_initial_interval_ms,
-                t.retry_max_interval_ms,
-                t.retry_backoff_coefficient,
-                t.retry_jitter_factor
-              )::underway.task_retry_policy,
-              t.concurrency_key,
-              t.priority
-            from unnest(
-              $2::uuid[],
-              $3::jsonb[],
-              $4::interval[],
-              $5::interval[],
-              $6::interval[],
-              $7::interval[],
-              $8::int4[],
-              $9::int4[],
-              $10::int4[],
-              $11::float8[],
-              $12::float8[],
-              $13::text[],
-              $14::int4[]
-            ) as t(
-              id,
-              input,
-              timeout,
-              heartbeat,
-              ttl,
-              delay,
-              retry_max_attempts,
-              retry_initial_interval_ms,
-              retry_max_interval_ms,
-              retry_backoff_coefficient,
-              retry_jitter_factor,
-              concurrency_key,
-              priority
-            )
-            "#,
-                self.name,
-                &ids as _,
-                &input_values,
-                &timeouts as _,
-                &heartbeats as _,
-                &ttls as _,
-                &delays as _,
-                &retry_max_attempts as _,
-                &retry_initial_interval_ms as _,
-                &retry_max_interval_ms as _,
-                &retry_backoff_coefficients as _,
-                &retry_jitter_factors as _,
-                &concurrency_keys as _,
-                &priorities as _,
-            )
-            .execute(tx.as_mut())
-            .await?;
+            if configs.is_empty() {
+                continue;
+            }
+
+            let batch_config = configs.first().expect("Batch config should exist").clone();
+            let uniform_config = configs.iter().all(|config| config == &batch_config);
+
+            if uniform_config {
+                let BatchTaskConfig {
+                    retry_policy,
+                    timeout,
+                    heartbeat,
+                    ttl,
+                    concurrency_key,
+                    priority,
+                } = batch_config;
+
+                sqlx::query!(
+                    r#"
+                insert into underway.task (
+                  id,
+                  task_queue_name,
+                  input,
+                  timeout,
+                  heartbeat,
+                  ttl,
+                  delay,
+                  retry_policy,
+                  concurrency_key,
+                  priority
+                )
+                select
+                  t.id,
+                  $1 as task_queue_name,
+                  t.input,
+                  $2 as timeout,
+                  $3 as heartbeat,
+                  $4 as ttl,
+                  t.delay,
+                  $5 as retry_policy,
+                  $6 as concurrency_key,
+                  $7 as priority
+                from unnest(
+                  $8::uuid[],
+                  $9::jsonb[],
+                  $10::interval[]
+                ) as t(id, input, delay)
+                "#,
+                    self.name,
+                    timeout as _,
+                    heartbeat as _,
+                    ttl as _,
+                    retry_policy as RetryPolicy,
+                    concurrency_key,
+                    priority,
+                    &ids as _,
+                    &input_values,
+                    &delays as _,
+                )
+                .execute(tx.as_mut())
+                .await?;
+            } else {
+                let mut timeouts = Vec::with_capacity(chunk.len());
+                let mut heartbeats = Vec::with_capacity(chunk.len());
+                let mut ttls = Vec::with_capacity(chunk.len());
+                let mut retry_max_attempts = Vec::with_capacity(chunk.len());
+                let mut retry_initial_interval_ms = Vec::with_capacity(chunk.len());
+                let mut retry_max_interval_ms = Vec::with_capacity(chunk.len());
+                let mut retry_backoff_coefficients = Vec::with_capacity(chunk.len());
+                let mut retry_jitter_factors = Vec::with_capacity(chunk.len());
+                let mut concurrency_keys = Vec::with_capacity(chunk.len());
+                let mut priorities = Vec::with_capacity(chunk.len());
+
+                for config in &configs {
+                    timeouts.push(config.timeout);
+                    heartbeats.push(config.heartbeat);
+                    ttls.push(config.ttl);
+                    retry_max_attempts.push(config.retry_policy.max_attempts);
+                    retry_initial_interval_ms.push(config.retry_policy.initial_interval_ms);
+                    retry_max_interval_ms.push(config.retry_policy.max_interval_ms);
+                    retry_backoff_coefficients.push(config.retry_policy.backoff_coefficient);
+                    retry_jitter_factors.push(config.retry_policy.jitter_factor);
+                    concurrency_keys.push(config.concurrency_key.clone());
+                    priorities.push(config.priority);
+                }
+
+                sqlx::query!(
+                    r#"
+                insert into underway.task (
+                  id,
+                  task_queue_name,
+                  input,
+                  timeout,
+                  heartbeat,
+                  ttl,
+                  delay,
+                  retry_policy,
+                  concurrency_key,
+                  priority
+                )
+                select
+                  t.id,
+                  $1 as task_queue_name,
+                  t.input,
+                  t.timeout,
+                  t.heartbeat,
+                  t.ttl,
+                  t.delay,
+                  (
+                    t.retry_max_attempts,
+                    t.retry_initial_interval_ms,
+                    t.retry_max_interval_ms,
+                    t.retry_backoff_coefficient,
+                    t.retry_jitter_factor
+                  )::underway.task_retry_policy,
+                  t.concurrency_key,
+                  t.priority
+                from unnest(
+                  $2::uuid[],
+                  $3::jsonb[],
+                  $4::interval[],
+                  $5::interval[],
+                  $6::interval[],
+                  $7::interval[],
+                  $8::int4[],
+                  $9::int4[],
+                  $10::int4[],
+                  $11::float8[],
+                  $12::float8[],
+                  $13::text[],
+                  $14::int4[]
+                ) as t(
+                  id,
+                  input,
+                  timeout,
+                  heartbeat,
+                  ttl,
+                  delay,
+                  retry_max_attempts,
+                  retry_initial_interval_ms,
+                  retry_max_interval_ms,
+                  retry_backoff_coefficient,
+                  retry_jitter_factor,
+                  concurrency_key,
+                  priority
+                )
+                "#,
+                    self.name,
+                    &ids as _,
+                    &input_values,
+                    &timeouts as _,
+                    &heartbeats as _,
+                    &ttls as _,
+                    &delays as _,
+                    &retry_max_attempts as _,
+                    &retry_initial_interval_ms as _,
+                    &retry_max_interval_ms as _,
+                    &retry_backoff_coefficients as _,
+                    &retry_jitter_factors as _,
+                    &concurrency_keys as _,
+                    &priorities as _,
+                )
+                .execute(tx.as_mut())
+                .await?;
+            }
 
             task_ids.extend(ids);
         }
@@ -2097,6 +2182,7 @@ where
 mod tests {
     use std::{collections::HashSet, path::PathBuf};
 
+    use serde::{Deserialize, Serialize};
     use serde_json::json;
     use sqlx::{Postgres, Transaction};
 
@@ -2448,6 +2534,90 @@ mod tests {
             pg_interval_to_span(&scheduled_tasks[0].delay).compare(1.hour())?,
             std::cmp::Ordering::Equal
         );
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn enqueue_many_with_mixed_config(pool: PgPool) -> sqlx::Result<(), Error> {
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        struct Input {
+            delay_seconds: i64,
+            priority: i32,
+        }
+
+        let queue = Queue::builder()
+            .name("test_enqueue_many_mixed_config")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        struct MyConfigTask;
+
+        impl Task for MyConfigTask {
+            type Input = Input;
+            type Output = ();
+
+            async fn execute(
+                &self,
+                _tx: Transaction<'_, Postgres>,
+                _input: Self::Input,
+            ) -> TaskResult<Self::Output> {
+                Ok(())
+            }
+
+            fn delay_for(&self, input: &Self::Input) -> Span {
+                input.delay_seconds.seconds()
+            }
+
+            fn priority_for(&self, input: &Self::Input) -> i32 {
+                input.priority
+            }
+        }
+
+        let inputs = [
+            Input {
+                delay_seconds: 1,
+                priority: 1,
+            },
+            Input {
+                delay_seconds: 5,
+                priority: 2,
+            },
+            Input {
+                delay_seconds: 10,
+                priority: 3,
+            },
+        ];
+
+        let task_ids = queue.enqueue_many(&pool, &MyConfigTask, &inputs).await?;
+
+        assert_eq!(task_ids.len(), inputs.len());
+
+        let scheduled_tasks = sqlx::query!(
+            r#"
+            select input, delay, priority
+            from underway.task
+            where task_queue_name = $1
+            "#,
+            queue.name
+        )
+        .fetch_all(&pool)
+        .await?;
+
+        assert_eq!(scheduled_tasks.len(), inputs.len());
+
+        for task in scheduled_tasks {
+            let input: Input = serde_json::from_value(task.input)?;
+
+            assert_eq!(task.priority, input.priority);
+            assert_eq!(
+                pg_interval_to_span(&task.delay)
+                    .compare(input.delay_seconds.seconds())
+                    .expect("Delay span should compare"),
+                std::cmp::Ordering::Equal
+            );
+        }
 
         Ok(())
     }
