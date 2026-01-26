@@ -871,8 +871,13 @@ impl<T: Task + Sync> Worker<T> {
 
                     Err(ref error) => {
                         let retry_policy = &in_progress_task.retry_policy;
-                        self.handle_task_error(&mut tx, &in_progress_task, retry_policy, error)
-                            .await?;
+                        self.handle_task_error(
+                            &mut tx,
+                            &in_progress_task,
+                            retry_policy,
+                            error,
+                        )
+                        .await?;
                     }
                 }
             }
@@ -903,7 +908,9 @@ impl<T: Task + Sync> Worker<T> {
 
         // Short-circuit on fatal errors.
         if matches!(error, TaskError::Fatal(_)) {
-            return self.finalize_task_failure(conn, in_progress_task).await;
+            return self
+                .finalize_task_failure(conn, in_progress_task, error)
+                .await;
         }
 
         in_progress_task.record_failure(conn, error).await?;
@@ -913,7 +920,8 @@ impl<T: Task + Sync> Worker<T> {
             self.schedule_task_retry(conn, in_progress_task, retry_count, retry_policy)
                 .await?;
         } else {
-            self.finalize_task_failure(conn, in_progress_task).await?;
+            self.finalize_task_failure(conn, in_progress_task, error)
+                .await?;
         }
 
         Ok(())
@@ -937,7 +945,8 @@ impl<T: Task + Sync> Worker<T> {
             self.schedule_task_retry(conn, in_progress_task, retry_count, retry_policy)
                 .await?;
         } else {
-            self.finalize_task_failure(conn, in_progress_task).await?;
+            self.finalize_task_failure(conn, in_progress_task, error)
+                .await?;
         }
 
         Ok(())
@@ -962,6 +971,7 @@ impl<T: Task + Sync> Worker<T> {
         &self,
         conn: &mut PgConnection,
         in_progress_task: &InProgressTask,
+        error: &TaskError,
     ) -> Result {
         tracing::debug!("Retry policy exhausted, handling failed task");
 
@@ -971,6 +981,11 @@ impl<T: Task + Sync> Worker<T> {
             self.queue
                 .move_task_to_dlq(&mut *conn, in_progress_task.id, dlq_name)
                 .await?;
+        }
+
+        let task_input: T::Input = serde_json::from_value(in_progress_task.input.clone())?;
+        if let Err(err) = self.task.on_final_failure(conn, &task_input, error).await {
+            tracing::error!(err = %err, "Task failure hook failed");
         }
 
         Ok(())

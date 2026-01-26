@@ -3,7 +3,7 @@ use std::env;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use underway::{Job, To};
+use underway::{job::EffectOutcome, Job, To};
 
 const QUEUE_NAME: &str = "example-tracing";
 
@@ -36,14 +36,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .step(|_ctx, input| async move { To::effect(input) })
         .effect(
             |_ctx,
-             WelcomeEmail {
-                 user_id,
-                 email,
-                 name,
-             }| async move {
+            WelcomeEmail {
+                user_id,
+                email,
+                name,
+            }| async move {
                 // Simulate sending an email.
                 tracing::info!("Sending welcome email to {name} <{email}> (user_id: {user_id})");
-                To::done()
+                Ok(EffectOutcome::done())
             },
         )
         .name(QUEUE_NAME)
@@ -52,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     // Enqueue a job task.
-    let task_id = job
+    let _job = job
         .enqueue(&WelcomeEmail {
             user_id: 42,
             email: "ferris@example.com".to_string(),

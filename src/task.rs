@@ -85,7 +85,7 @@ use std::{
 
 use jiff::{SignedDuration, Span, ToSpan};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use sqlx::{Postgres, Transaction};
+use sqlx::{PgConnection, Postgres, Transaction};
 use ulid::Ulid;
 use uuid::Uuid;
 
@@ -271,6 +271,18 @@ pub trait Task: Send + 'static {
         tx: Transaction<'_, Postgres>,
         input: Self::Input,
     ) -> impl Future<Output = Result<Self::Output>> + Send;
+
+    /// Hook invoked after a task is marked failed with no retries remaining.
+    ///
+    /// This runs in the same transaction that marks the task failed.
+    fn on_final_failure(
+        &self,
+        _conn: &mut PgConnection,
+        _input: &Self::Input,
+        _error: &Error,
+    ) -> impl Future<Output = Result<()>> + Send {
+        async { Ok(()) }
+    }
 
     /// Defines the retry policy of the task.
     ///

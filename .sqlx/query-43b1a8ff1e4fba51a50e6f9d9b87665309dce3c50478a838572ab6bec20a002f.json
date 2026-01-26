@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            select\n              compensation_enqueued_at is not null as \"compensation_enqueued!: bool\",\n              compensated_at is not null as \"compensated!: bool\"\n            from underway.job_effect\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "compensation_enqueued!: bool",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 1,
+        "name": "compensated!: bool",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "43b1a8ff1e4fba51a50e6f9d9b87665309dce3c50478a838572ab6bec20a002f"
+}

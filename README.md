@@ -58,7 +58,7 @@ use std::env;
 
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use underway::{Job, To};
+use underway::{job::EffectOutcome, Job, To};
 
 // This is the input we'll provide to the job when we enqueue it.
 #[derive(Deserialize, Serialize)]
@@ -90,7 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Simulate sending an email.
                 println!("Sending welcome email to {name} <{email}> (user_id: {user_id})");
                 // Returning this indicates this is the final step.
-                To::done()
+                Ok(EffectOutcome::done())
             },
         )
         .name("welcome-email")
@@ -107,11 +107,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     // Start processing enqueued jobs.
-    job.start().await??;
+job.start().await??;
 
-    Ok(())
+Ok(())
 }
 ```
+
+When a step returns `To::effect`, the next step type is chosen by the effect
+handler. If you need to branch between `next`/`done` and an effect, use
+`To::effect_for` or `To::done_for` to keep the next step type explicit. Effect
+handlers can do the same with `EffectOutcome::effect_for`.
 
 ## Order receipts
 
@@ -130,7 +135,7 @@ use std::env;
 
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use underway::{Job, To};
+use underway::{job::EffectOutcome, Job, To};
 
 #[derive(Deserialize, Serialize)]
 struct GenerateReceipt {
@@ -166,7 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .effect(|_cx, EmailReceipt { receipt_key }| async move {
             // Retrieve the PDF from the object store, and send the email.
             println!("Emailing receipt for {receipt_key}");
-            To::done()
+            Ok(EffectOutcome::done())
         })
         .name("order-receipt")
         .pool(pool)

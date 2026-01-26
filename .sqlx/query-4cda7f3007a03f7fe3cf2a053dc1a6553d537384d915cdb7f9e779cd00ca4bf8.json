@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            with to_enqueue as (\n                update underway.job_effect\n                set compensation_enqueued_at = now(),\n                    updated_at = now()\n                where job_id = $1\n                  and compensation is not null\n                  and compensation_enqueued_at is null\n                  and compensated_at is null\n                returning effect_index, step_index, compensation\n            )\n            select\n              effect_index,\n              step_index,\n              compensation as \"compensation!: serde_json::Value\"\n            from to_enqueue\n            order by effect_index desc\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "effect_index",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "step_index",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "compensation!: serde_json::Value",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "4cda7f3007a03f7fe3cf2a053dc1a6553d537384d915cdb7f9e779cd00ca4bf8"
+}

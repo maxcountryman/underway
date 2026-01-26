@@ -9,7 +9,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sqlx::PgPool;
 use tokio::task::JoinSet;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use underway::{job::EffectContext, Job, To, ToTaskResult};
+use underway::{job::EffectOutcome, Job, To, ToTaskResult};
 
 const SYSTEM_PROMPT: &str = include_str!("../system-prompt.llm.txt");
 
@@ -160,7 +160,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let openai_client = Client::new();
 
     let job = Job::builder()
-        .state(State { openai_client })
+        .effect_state(State { openai_client })
         .step(|_cx, _| async move { To::effect(FetchTopStories) })
         .effect(|_cx, FetchTopStories| async move {
             tracing::info!("Retrieving the top five stories from Hacker News");
@@ -168,24 +168,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let top_stories = fetch_top_stories().await.retryable()?;
             let top_five = top_stories.into_iter().take(5).collect::<Vec<_>>();
 
-            To::effect(Summarize {
+            Ok(EffectOutcome::effect(Summarize {
                 top_stories: top_five,
-            })
+            }))
         })
-        .effect(
-            |EffectContext {
-                 state: State { openai_client },
-                 ..
-             },
-             Summarize { top_stories }| async move {
-                tracing::info!("Summarizing top five story discussions");
+        .effect(|cx, Summarize { top_stories }| async move {
+            tracing::info!("Summarizing top five story discussions");
 
-                let summary = summarize(&openai_client, &top_stories).await.retryable()?;
-                println!("{}", summary);
+            let state = cx.effect_state().expect("effect context");
+            let summary = summarize(&state.openai_client, &top_stories)
+                .await
+                .retryable()?;
+            println!("{}", summary);
 
-                To::done()
-            },
-        )
+            Ok(EffectOutcome::done())
+        })
         .name("example-rag")
         .pool(pool)
         .build()

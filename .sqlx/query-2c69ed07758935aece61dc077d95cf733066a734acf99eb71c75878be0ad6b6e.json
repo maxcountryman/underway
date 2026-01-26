@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            insert into underway.job_effect (\n              job_id,\n              step_index,\n              effect_index,\n              compensation,\n              compensated_at\n            )\n            values ($1, $2, $3, $4::jsonb, case when $4::jsonb is null then now() else null end)\n            on conflict (job_id, effect_index)\n            do update\n              set step_index = excluded.step_index,\n                  compensation = excluded.compensation,\n                  compensated_at = excluded.compensated_at,\n                  updated_at = now()\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Int4",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2c69ed07758935aece61dc077d95cf733066a734acf99eb71c75878be0ad6b6e"
+}

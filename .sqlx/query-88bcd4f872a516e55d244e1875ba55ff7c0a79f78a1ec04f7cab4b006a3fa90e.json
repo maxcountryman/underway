@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            update underway.job_effect\n            set compensated_at = now(),\n                updated_at = now()\n            where job_id = $1\n              and effect_index = $2\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "88bcd4f872a516e55d244e1875ba55ff7c0a79f78a1ec04f7cab4b006a3fa90e"
+}

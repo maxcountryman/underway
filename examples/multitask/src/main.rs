@@ -1,4 +1,4 @@
-use std::env;
+use std::{env, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, Transaction};
@@ -158,18 +158,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     underway::run_migrations(&pool).await?;
 
     // Create the task queue.
-    let queue = Queue::builder()
+    let queue = Arc::new(
+        Queue::builder()
         .name(QUEUE_NAME)
         .pool(pool.clone())
         .build()
-        .await?;
+        .await?,
+    );
 
     // Enqueue a welcome email task.
     let welcome_email_task = WelcomeEmailTask;
     let task_id = welcome_email_task
         .enqueue(
             &pool,
-            &queue,
+            queue.as_ref(),
             WelcomeEmail {
                 user_id: 42,
                 email: "ferris@example.com".to_string(),
@@ -185,7 +187,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let task_id = order_task
         .enqueue(
             &pool,
-            &queue,
+            queue.as_ref(),
             Order {
                 user_id: 42,
                 sku: "SKU0-0042".to_string(),
@@ -197,7 +199,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Run a worker that processes all tasks.
     let multitask = Multitask::new();
-    Worker::new(queue, multitask).run().await?;
+    Worker::new(queue.clone(), multitask).run().await?;
 
     Ok(())
 }

@@ -20,7 +20,7 @@
 //! Jobs are formed from at least one step function.
 //!
 //! ```rust
-//! use underway::{Job, To};
+//! use underway::{job::EffectOutcome, Job, To};
 //!
 //! let job_builder = Job::<(), ()>::builder().step(|_cx, _| async move { To::done() });
 //! ```
@@ -28,9 +28,9 @@
 //! Instead of a closure, we could also use a named function.
 //!
 //! ```rust
-//! use underway::{job::StepContext, task::Result as TaskResult, Job, To};
+//! use underway::{job::Context, task::Result as TaskResult, Job, To};
 //!
-//! async fn named_step(_cx: StepContext<()>, _: ()) -> TaskResult<To<()>> {
+//! async fn named_step(_cx: Context<(), ()>, _: ()) -> TaskResult<To<()>> {
 //!     To::done()
 //! }
 //!
@@ -38,10 +38,10 @@
 //! ```
 //!
 //! Notice that the first argument to our function is [a context
-//! binding](crate::job::StepContext). This provides access to fields like
-//! [`state`](crate::job::StepContext::state),
-//! [`step_index`](crate::job::StepContext::step_index),
-//! and [`job_id`](crate::job::StepContext::job_id).
+//! binding](crate::job::Context). This provides access to fields like
+//! [`step_state`](crate::job::Context::step_state),
+//! [`effect_state`](crate::job::Context::effect_state),
+//! and [`phase`](crate::job::Context::phase).
 //!
 //! The second argument is a type we provide as input to the step. In our
 //! example it's the unit type. But if we were to specify another type it would
@@ -211,7 +211,7 @@
 //! that all steps should have access to. The only requirement is that the state
 //! type be `Clone`, as it will be cloned into each step.
 //! ```rust
-//! use underway::{job::StepContext, Job, To};
+//! use underway::{Job, To};
 //!
 //! // A simple state that'll be provided to our steps.
 //! #[derive(Clone)]
@@ -225,7 +225,8 @@
 //!
 //! let job_builder = Job::<(), _>::builder()
 //!     .state(state) // Here we've set the state.
-//!     .step(|StepContext { state, .. }, _| async move {
+//!     .step(|cx, _| async move {
+//!         let state = cx.step_state().expect("step context");
 //!         println!("State data is: {}", state.data);
 //!         To::done()
 //!     });
@@ -257,9 +258,41 @@
 //! after the step's transaction commits, and only then enqueue the next step.
 //! Effect handlers should be idempotent since they may be retried.
 //!
+//! Returning `To::effect` delegates the next step type to the effect handler.
+//! If a step needs to branch between `next`, `done`, and `effect`, use
+//! [`To::effect_for`] or [`To::done_for`] to keep the next step type explicit.
+//! Effect handlers have the same pattern via [`EffectOutcome::effect_for`].
+//!
 //! ```rust
 //! use serde::{Deserialize, Serialize};
-//! use underway::{Job, To};
+//! use underway::{job::EffectOutcome, Job, To};
+//!
+//! #[derive(Serialize, Deserialize)]
+//! struct Step1 {
+//!     send_email: bool,
+//! }
+//!
+//! #[derive(Serialize, Deserialize)]
+//! struct SendEmail;
+//!
+//! #[derive(Serialize, Deserialize)]
+//! struct Step2;
+//!
+//! let job_builder = Job::<_, ()>::builder()
+//!     .step(|_cx, Step1 { send_email }| async move {
+//!         if send_email {
+//!             To::effect_for(SendEmail)
+//!         } else {
+//!             To::next(Step2)
+//!         }
+//!     })
+//!     .effect(|_cx, SendEmail| async move { Ok(EffectOutcome::next(Step2)) })
+//!     .step(|_cx, Step2| async move { To::done() });
+//! ```
+//!
+//! ```rust
+//! use serde::{Deserialize, Serialize};
+//! use underway::{job::EffectOutcome, Job, To};
 //!
 //! #[derive(Serialize, Deserialize)]
 //! struct UserSub {
@@ -284,7 +317,7 @@
 //!     .effect(|_cx, SendEmail { user_id }| async move {
 //!         // Perform the external side effect.
 //!         println!("Sending email for user {user_id}");
-//!         To::next(FinishSub { user_id })
+//!         Ok(EffectOutcome::next(FinishSub { user_id }))
 //!     })
 //!     .step(|_cx, FinishSub { user_id }| async move {
 //!         println!("Finished subscription for {user_id}");
@@ -643,11 +676,11 @@ use std::{
     sync::Arc, task::Poll,
 };
 
-use builder_states::{Initial, PoolSet, QueueNameSet, QueueSet, StateSet, StepSet};
+use builder_states::{Initial, PoolSet, QueueNameSet, QueueSet, StepSet};
 use jiff::{Span, ToSpan};
-use sealed::{EffectState, JobState};
+use sealed::{EffectState as EffectJobState, JobState};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use sqlx::{PgExecutor, PgPool, Postgres, Transaction};
+use sqlx::{PgConnection, PgExecutor, PgPool, Postgres, Transaction};
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
@@ -697,81 +730,97 @@ pub enum Error {
     Database(#[from] sqlx::Error),
 }
 
-type JobQueue<T, S> = Queue<Job<T, S>>;
-type EffectQueue<T, S> = Queue<EffectTask<T, S>>;
+type JobQueue<T, StepState, EffectState> = Queue<Job<T, StepState, EffectState>>;
+type EffectQueue<T, StepState, EffectState> = Queue<EffectTask<T, StepState, EffectState>>;
 
-/// Step context passed in to each step.
-pub struct StepContext<S> {
-    /// Shared step state.
-    ///
-    /// This value is set via [`state`](Builder::state).
-    ///
-    /// **Note:** State is not persisted and therefore should not be
-    /// relied on when durability is needed.
-    pub state: S,
-
-    /// Current index of the step being executed zero-based.
-    ///
-    /// In multi-step job definitions, this points to the current step the job
-    /// is processing currently.
-    pub step_index: usize,
-
-    /// Total steps count.
-    ///
-    /// The number of steps in this job definition.
-    pub step_count: usize,
-
-    /// This `JobId`.
-    pub job_id: JobId,
-
-    /// Queue name.
-    ///
-    /// Name of the queue the current step is currently running on.
-    pub queue_name: String,
+/// The execution phase for a job context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum Phase {
+    /// A step is executing.
+    Step,
+    /// An effect is executing.
+    EffectExecute,
+    /// A compensation is executing.
+    EffectCompensate,
 }
 
-/// Effect context passed in to each effect handler.
-pub struct EffectContext<S> {
-    /// Shared step state.
-    ///
-    /// This value is set via [`state`](Builder::state).
-    ///
-    /// **Note:** State is not persisted and therefore should not be
-    /// relied on when durability is needed.
-    pub state: S,
-
-    /// Current index of the step that produced this effect, zero-based.
-    pub step_index: usize,
-
-    /// Total steps count.
-    ///
-    /// The number of steps in this job definition.
-    pub step_count: usize,
-
-    /// Current index of the effect being executed, zero-based.
-    pub effect_index: usize,
-
-    /// This `JobId`.
-    pub job_id: JobId,
-
-    /// Queue name.
-    ///
-    /// Name of the queue the job step is currently running on.
-    pub queue_name: String,
-
-    /// Effect queue name.
-    ///
-    /// Name of the queue the effect handler is running on.
-    pub effect_queue_name: String,
+/// Context passed into steps and effects.
+pub enum Context<StepState, EffectState> {
+    /// Context for steps.
+    Step {
+        /// Shared step state.
+        ///
+        /// This value is set via [`state`](Builder::state).
+        ///
+        /// **Note:** State is not persisted and therefore should not be
+        /// relied on when durability is needed.
+        state: StepState,
+        /// Current index of the step being executed zero-based.
+        step_index: usize,
+        /// Total steps count.
+        step_count: usize,
+        /// This `JobId`.
+        job_id: JobId,
+        /// Queue name.
+        queue_name: String,
+    },
+    /// Context for effects and compensations.
+    Effect {
+        /// Shared effect state.
+        ///
+        /// This value is set via [`effect_state`](Builder::effect_state).
+        ///
+        /// **Note:** State is not persisted and therefore should not be
+        /// relied on when durability is needed.
+        state: EffectState,
+        /// Phase for the effect context.
+        phase: Phase,
+        /// Current index of the step that produced this effect, zero-based.
+        step_index: usize,
+        /// Current index of the effect being executed, zero-based.
+        effect_index: usize,
+        /// This `JobId`.
+        job_id: JobId,
+        /// Queue name.
+        queue_name: String,
+        /// Effect queue name.
+        effect_queue_name: String,
+    },
 }
 
-enum StageExecutor<S> {
-    Step(Box<dyn StepExecutor<S>>),
-    Effect(Box<dyn EffectExecutor<S>>),
+impl<StepState, EffectState> Context<StepState, EffectState> {
+    /// Returns the current phase for the context.
+    pub fn phase(&self) -> Phase {
+        match self {
+            Self::Step { .. } => Phase::Step,
+            Self::Effect { phase, .. } => *phase,
+        }
+    }
+
+    /// Returns the step state, if available.
+    pub fn step_state(&self) -> Option<&StepState> {
+        match self {
+            Self::Step { state, .. } => Some(state),
+            _ => None,
+        }
+    }
+
+    /// Returns the effect state, if available.
+    pub fn effect_state(&self) -> Option<&EffectState> {
+        match self {
+            Self::Effect { state, .. } => Some(state),
+            _ => None,
+        }
+    }
 }
 
-struct StageConfig<S> {
-    executor: StageExecutor<S>,
+enum StageExecutor<StepState, EffectState> {
+    Step(Box<dyn StepExecutor<StepState, EffectState>>),
+    Effect(Box<dyn EffectExecutor<StepState, EffectState>>),
+}
+
+struct StageConfig<StepState, EffectState> {
+    executor: StageExecutor<StepState, EffectState>,
     task_config: StepTaskConfig,
     next_effect_index: Option<usize>,
 }
@@ -804,7 +853,7 @@ impl Default for StepTaskConfig {
 mod sealed {
     use serde::{Deserialize, Serialize};
 
-    use super::JobId;
+    use super::{JobId, Phase};
 
     #[derive(Debug, Serialize, Deserialize, PartialEq)]
     pub struct JobState {
@@ -818,13 +867,14 @@ mod sealed {
         pub effect_index: usize,
         pub step_index: usize,
         pub effect_input: serde_json::Value,
+        pub phase: Phase,
         pub(crate) job_id: JobId,
     }
 }
 
 enum StageInput {
     Step(JobState),
-    Effect(EffectState),
+    Effect(EffectJobState),
 }
 
 trait TaskConfig {
@@ -998,12 +1048,22 @@ impl Deref for JobId {
     }
 }
 
+type CompensationHook = Arc<
+    dyn for<'a> Fn(
+            &'a mut PgConnection,
+            JobId,
+        ) -> Pin<Box<dyn Future<Output = TaskResult<()>> + Send + 'a>>
+        + Send
+        + Sync,
+>;
+
 /// Represents a specific job that's been enqueued.
 ///
 /// This handle allows for manipulating the state of the job in the queue.
 pub struct EnqueuedJob<T: Task> {
     id: JobId,
     queue: Arc<Queue<T>>,
+    compensator: Option<CompensationHook>,
 }
 
 impl<T: Task> EnqueuedJob<T> {
@@ -1081,6 +1141,12 @@ impl<T: Task> EnqueuedJob<T> {
                 cancelled = true;
             }
         }
+
+        if cancelled {
+            if let Some(compensator) = &self.compensator {
+                compensator(tx.as_mut(), self.id).await?;
+            }
+        }
         tx.commit().await?;
 
         Ok(cancelled)
@@ -1089,40 +1155,45 @@ impl<T: Task> EnqueuedJob<T> {
 
 /// Sequential set of functions, where the output of the last is the input to
 /// the next.
-pub struct Job<I, S>
+pub struct Job<I, StepState = (), EffectState = ()>
 where
     I: Sync + Send + 'static,
-    S: Clone + Sync + Send + 'static,
+    StepState: Clone + Sync + Send + 'static,
+    EffectState: Clone + Sync + Send + 'static,
 {
-    queue: Arc<JobQueue<I, S>>,
-    effect_queue: Arc<EffectQueue<I, S>>,
-    steps: Arc<Vec<StageConfig<S>>>,
-    effects: Arc<Vec<StageConfig<S>>>,
-    state: S,
+    queue: Arc<JobQueue<I, StepState, EffectState>>,
+    effect_queue: Arc<EffectQueue<I, StepState, EffectState>>,
+    steps: Arc<Vec<StageConfig<StepState, EffectState>>>,
+    effects: Arc<Vec<StageConfig<StepState, EffectState>>>,
+    step_state: StepState,
+    effect_state: EffectState,
     _marker: PhantomData<I>,
 }
 
-struct EffectTask<I, S>
+struct EffectTask<I, StepState, EffectState>
 where
     I: Send + Sync + 'static,
-    S: Clone + Send + Sync + 'static,
+    StepState: Clone + Send + Sync + 'static,
+    EffectState: Clone + Send + Sync + 'static,
 {
-    job: Job<I, S>,
+    job: Job<I, StepState, EffectState>,
 }
 
 /// Worker wrapper for job effect handlers.
-pub struct EffectWorker<I, S>
+pub struct EffectWorker<I, StepState, EffectState>
 where
     I: Send + Sync + 'static,
-    S: Clone + Send + Sync + 'static,
+    StepState: Clone + Send + Sync + 'static,
+    EffectState: Clone + Send + Sync + 'static,
 {
-    worker: Worker<EffectTask<I, S>>,
+    worker: Worker<EffectTask<I, StepState, EffectState>>,
 }
 
-impl<I, S> Clone for EffectWorker<I, S>
+impl<I, StepState, EffectState> Clone for EffectWorker<I, StepState, EffectState>
 where
     I: Send + Sync + 'static,
-    S: Clone + Send + Sync + 'static,
+    StepState: Clone + Send + Sync + 'static,
+    EffectState: Clone + Send + Sync + 'static,
 {
     fn clone(&self) -> Self {
         Self {
@@ -1131,12 +1202,13 @@ where
     }
 }
 
-impl<I, S> EffectWorker<I, S>
+impl<I, StepState, EffectState> EffectWorker<I, StepState, EffectState>
 where
     I: Send + Sync + 'static,
-    S: Clone + Send + Sync + 'static,
+    StepState: Clone + Send + Sync + 'static,
+    EffectState: Clone + Send + Sync + 'static,
 {
-    fn new(worker: Worker<EffectTask<I, S>>) -> Self {
+    fn new(worker: Worker<EffectTask<I, StepState, EffectState>>) -> Self {
         Self { worker }
     }
 
@@ -1177,10 +1249,9 @@ where
     }
 }
 
-impl<I, S> Job<I, S>
+impl<I> Job<I, (), ()>
 where
     I: Serialize + Sync + Send + 'static,
-    S: Clone + Send + Sync + 'static,
 {
     /// Creates a new job builder.
     ///
@@ -1210,9 +1281,17 @@ where
     /// # });
     /// # }
     /// ```
-    pub fn builder() -> Builder<I, I, S, Initial> {
+    pub fn builder() -> Builder<I, I, NoEffect, (), (), Initial> {
         Builder::new()
     }
+}
+
+impl<I, StepState, EffectState> Job<I, StepState, EffectState>
+where
+    I: Serialize + Sync + Send + 'static,
+    StepState: Clone + Send + Sync + 'static,
+    EffectState: Clone + Send + Sync + 'static,
+{
 
     /// Enqueue the job using a connection from the queue's pool.
     ///
@@ -1411,11 +1490,13 @@ where
 
         self.queue.enqueue_many(executor, self, &job_inputs).await?;
 
+        let compensator = Some(self.compensation_hook());
         let enqueued = job_inputs
             .into_iter()
             .map(|job_input| EnqueuedJob {
                 id: job_input.job_id,
                 queue: self.queue.clone(),
+                compensator: compensator.clone(),
             })
             .collect();
 
@@ -1535,6 +1616,7 @@ where
         let enqueue = EnqueuedJob {
             id: job_input.job_id,
             queue: self.queue.clone(),
+            compensator: Some(self.compensation_hook()),
         };
 
         Ok(enqueue)
@@ -1760,7 +1842,7 @@ where
         Arc::clone(&self.queue)
     }
 
-    fn effect_queue(&self) -> Arc<Queue<EffectTask<I, S>>> {
+    fn effect_queue(&self) -> Arc<Queue<EffectTask<I, StepState, EffectState>>> {
         Arc::clone(&self.effect_queue)
     }
 
@@ -1797,7 +1879,7 @@ where
     }
 
     /// Creates a `Worker` for this job's effects.
-    pub fn effect_worker(&self) -> EffectWorker<I, S> {
+    pub fn effect_worker(&self) -> EffectWorker<I, StepState, EffectState> {
         EffectWorker::new(Worker::new(self.effect_queue(), self.effect_task()))
     }
 
@@ -1967,13 +2049,22 @@ where
     }
 }
 
-impl<I, S> Job<I, S>
+impl<I, StepState, EffectState> Job<I, StepState, EffectState>
 where
     I: Send + Sync + 'static,
-    S: Clone + Send + Sync + 'static,
+    StepState: Clone + Send + Sync + 'static,
+    EffectState: Clone + Send + Sync + 'static,
 {
-    fn effect_task(&self) -> EffectTask<I, S> {
+    fn effect_task(&self) -> EffectTask<I, StepState, EffectState> {
         EffectTask { job: self.clone() }
+    }
+
+    fn compensation_hook(&self) -> CompensationHook {
+        let job = self.clone();
+        Arc::new(move |conn, job_id| {
+            let job = job.clone();
+            Box::pin(async move { job.enqueue_compensations(conn, job_id).await })
+        })
     }
 
     fn step_task_config(&self, step_index: usize) -> StepTaskConfig {
@@ -1983,16 +2074,28 @@ where
             .unwrap_or_default()
     }
 
-    fn effect_task_config(&self, effect_index: usize) -> StepTaskConfig {
-        self.effects
+    fn effect_task_config(&self, effect_index: usize, phase: Phase) -> StepTaskConfig {
+        let mut config = self
+            .effects
             .get(effect_index)
             .map(|effect| effect.task_config.clone())
-            .unwrap_or_default()
+            .unwrap_or_default();
+
+        if phase == Phase::EffectCompensate {
+            if let Some(effect_config) = self.effects.get(effect_index) {
+                let StageExecutor::Effect(effect) = &effect_config.executor else {
+                    return config;
+                };
+                config.retry_policy = effect.compensation_policy();
+            }
+        }
+
+        config
     }
 
-    fn step_context(&self, job_id: JobId, step_index: usize) -> StepContext<S> {
-        StepContext {
-            state: self.state.clone(),
+    fn step_context(&self, job_id: JobId, step_index: usize) -> Context<StepState, EffectState> {
+        Context::Step {
+            state: self.step_state.clone(),
             step_index,
             step_count: self.steps.len(),
             job_id,
@@ -2005,11 +2108,12 @@ where
         job_id: JobId,
         step_index: usize,
         effect_index: usize,
-    ) -> EffectContext<S> {
-        EffectContext {
-            state: self.state.clone(),
+        phase: Phase,
+    ) -> Context<StepState, EffectState> {
+        Context::Effect {
+            state: self.effect_state.clone(),
+            phase,
             step_index,
-            step_count: self.steps.len(),
             effect_index,
             job_id,
             queue_name: self.queue.name.clone(),
@@ -2048,10 +2152,11 @@ where
             self.validate_effect_index(effect_index)?;
 
             let effect_task = self.effect_task();
-            let effect_input = EffectState {
+            let effect_input = EffectJobState {
                 effect_index,
                 step_index,
                 effect_input: next_input,
+                phase: Phase::EffectExecute,
                 job_id,
             };
 
@@ -2076,11 +2181,133 @@ where
         Ok(())
     }
 
+    async fn record_effect(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        job_id: JobId,
+        step_index: usize,
+        effect_index: usize,
+        compensation: Option<serde_json::Value>,
+    ) -> TaskResult<()> {
+        sqlx::query!(
+            r#"
+            insert into underway.job_effect (
+              job_id,
+              step_index,
+              effect_index,
+              compensation,
+              compensated_at
+            )
+            values ($1, $2, $3, $4::jsonb, case when $4::jsonb is null then now() else null end)
+            on conflict (job_id, effect_index)
+            do update
+              set step_index = excluded.step_index,
+                  compensation = excluded.compensation,
+                  compensated_at = excluded.compensated_at,
+                  updated_at = now()
+            "#,
+            *job_id,
+            step_index as i32,
+            effect_index as i32,
+            compensation
+        )
+        .execute(&mut **tx)
+        .await
+        .map_err(|err| TaskError::Retryable(err.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn mark_effect_compensated(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        job_id: JobId,
+        effect_index: usize,
+    ) -> TaskResult<()> {
+        let result = sqlx::query!(
+            r#"
+            update underway.job_effect
+            set compensated_at = now(),
+                updated_at = now()
+            where job_id = $1
+              and effect_index = $2
+            "#,
+            *job_id,
+            effect_index as i32
+        )
+        .execute(&mut **tx)
+        .await
+        .map_err(|err| TaskError::Retryable(err.to_string()))?;
+
+        if result.rows_affected() == 0 {
+            return Err(TaskError::Fatal("Missing effect log entry.".into()));
+        }
+
+        Ok(())
+    }
+
+    async fn enqueue_compensations(
+        &self,
+        conn: &mut PgConnection,
+        job_id: JobId,
+    ) -> TaskResult<()> {
+        let rows = sqlx::query!(
+            r#"
+            with to_enqueue as (
+                update underway.job_effect
+                set compensation_enqueued_at = now(),
+                    updated_at = now()
+                where job_id = $1
+                  and compensation is not null
+                  and compensation_enqueued_at is null
+                  and compensated_at is null
+                returning effect_index, step_index, compensation
+            )
+            select
+              effect_index,
+              step_index,
+              compensation as "compensation!: serde_json::Value"
+            from to_enqueue
+            order by effect_index desc
+            "#,
+            *job_id
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|err| TaskError::Retryable(err.to_string()))?;
+
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let effect_task = self.effect_task();
+
+        for row in rows {
+            let effect_input = EffectJobState {
+                effect_index: row.effect_index as usize,
+                step_index: row.step_index as usize,
+                effect_input: row.compensation,
+                phase: Phase::EffectCompensate,
+                job_id,
+            };
+
+            self.effect_queue
+                .enqueue_after(&mut *conn, &effect_task, &effect_input, Span::new())
+                .await
+                .map_err(|err| TaskError::Retryable(err.to_string()))?;
+        }
+
+        Ok(())
+    }
+
     async fn execute_stage(
         &self,
         mut tx: Transaction<'_, Postgres>,
         input: StageInput,
     ) -> TaskResult<()> {
+        let mut current_effect_index = None;
+        let mut current_phase = None;
+
         let (step_index, job_id, next_effect_index, stage_result) = match input {
             StageInput::Step(JobState {
                 step_index,
@@ -2109,47 +2336,112 @@ where
                     stage_result,
                 )
             }
-            StageInput::Effect(EffectState {
+            StageInput::Effect(EffectJobState {
                 effect_index,
                 step_index,
                 effect_input,
+                phase,
                 job_id,
             }) => {
                 self.validate_step_index(step_index)?;
                 self.validate_effect_index(effect_index)?;
 
                 let effect_config = &self.effects[effect_index];
-                let cx = self.effect_context(job_id, step_index, effect_index);
+                let cx = self.effect_context(job_id, step_index, effect_index, phase);
                 let StageExecutor::Effect(effect) = &effect_config.executor else {
                     return Err(TaskError::Fatal("Invalid effect executor.".into()));
                 };
-                let stage_result = match effect.execute_effect(cx, effect_input).await {
-                    Ok(result) => result,
-                    Err(err) => {
-                        tx.commit().await?;
-                        return Err(err);
+                let stage_result = match phase {
+                    Phase::EffectExecute => match effect.execute_effect(cx, effect_input).await {
+                        Ok(result) => result,
+                        Err(err) => {
+                            tx.commit().await?;
+                            return Err(err);
+                        }
+                    },
+                    Phase::EffectCompensate => match effect.compensate_effect(cx, effect_input).await {
+                        Ok(()) => StageResult {
+                            transition: StageTransition::Done,
+                            delay: Span::new(),
+                            compensation: None,
+                        },
+                        Err(err) => {
+                            tx.commit().await?;
+                            return Err(err);
+                        }
+                    },
+                    Phase::Step => {
+                        return Err(TaskError::Fatal("Invalid effect phase.".into()));
                     }
                 };
+
+                current_effect_index = Some(effect_index);
+                current_phase = Some(phase);
 
                 (
                     step_index,
                     job_id,
-                    effect_config.next_effect_index,
+                    if phase == Phase::EffectExecute {
+                        effect_config.next_effect_index
+                    } else {
+                        None
+                    },
                     stage_result,
                 )
             }
         };
 
-        if let Some((next_input, delay)) = stage_result {
-            self.enqueue_transition(
-                &mut tx,
-                job_id,
-                step_index,
-                next_effect_index,
-                next_input,
-                delay,
-            )
-            .await?;
+        let StageResult {
+            transition,
+            delay,
+            compensation,
+        } = stage_result;
+
+        if let Some(effect_index) = current_effect_index {
+            match current_phase {
+                Some(Phase::EffectExecute) => {
+                    self.record_effect(&mut tx, job_id, step_index, effect_index, compensation)
+                        .await?;
+                }
+                Some(Phase::EffectCompensate) => {
+                    let _ = compensation;
+                    self.mark_effect_compensated(&mut tx, job_id, effect_index)
+                        .await?;
+                }
+                _ => {
+                    let _ = compensation;
+                }
+            }
+        } else {
+            let _ = compensation;
+        }
+
+        match transition {
+            StageTransition::NextStep(next_input) => {
+                self.enqueue_transition(
+                    &mut tx,
+                    job_id,
+                    step_index,
+                    None,
+                    next_input,
+                    delay,
+                )
+                .await?;
+            }
+            StageTransition::NextEffect(next_input) => {
+                let next_effect_index = next_effect_index
+                    .ok_or_else(|| TaskError::Fatal("Missing effect for transition.".into()))?;
+                self.enqueue_transition(
+                    &mut tx,
+                    job_id,
+                    step_index,
+                    Some(next_effect_index),
+                    next_input,
+                    delay,
+                )
+                .await?;
+            }
+            StageTransition::Done => {}
         }
 
         tx.commit().await?;
@@ -2158,10 +2450,11 @@ where
     }
 }
 
-impl<I, S> TaskConfig for Job<I, S>
+impl<I, StepState, EffectState> TaskConfig for Job<I, StepState, EffectState>
 where
     I: Send + Sync + 'static,
-    S: Clone + Send + Sync + 'static,
+    StepState: Clone + Send + Sync + 'static,
+    EffectState: Clone + Send + Sync + 'static,
 {
     type Input = JobState;
 
@@ -2174,26 +2467,28 @@ where
     }
 }
 
-impl<I, S> TaskConfig for EffectTask<I, S>
+impl<I, StepState, EffectState> TaskConfig for EffectTask<I, StepState, EffectState>
 where
     I: Send + Sync + 'static,
-    S: Clone + Send + Sync + 'static,
+    StepState: Clone + Send + Sync + 'static,
+    EffectState: Clone + Send + Sync + 'static,
 {
-    type Input = EffectState;
+    type Input = EffectJobState;
 
     fn task_config_default(&self) -> StepTaskConfig {
-        self.job.effect_task_config(0)
+        self.job.effect_task_config(0, Phase::EffectExecute)
     }
 
     fn task_config_for(&self, input: &Self::Input) -> StepTaskConfig {
-        self.job.effect_task_config(input.effect_index)
+        self.job.effect_task_config(input.effect_index, input.phase)
     }
 }
 
-impl<I, S> Task for Job<I, S>
+impl<I, StepState, EffectState> Task for Job<I, StepState, EffectState>
 where
     I: Send + Sync + 'static,
-    S: Clone + Send + Sync + 'static,
+    StepState: Clone + Send + Sync + 'static,
+    EffectState: Clone + Send + Sync + 'static,
 {
     type Input = JobState;
     type Output = ();
@@ -2215,15 +2510,25 @@ where
         self.execute_stage(tx, StageInput::Step(input)).await
     }
 
+    fn on_final_failure(
+        &self,
+        conn: &mut PgConnection,
+        input: &Self::Input,
+        _error: &TaskError,
+    ) -> impl Future<Output = TaskResult<()>> + Send {
+        self.enqueue_compensations(conn, input.job_id)
+    }
+
     impl_task_config!();
 }
 
-impl<I, S> Task for EffectTask<I, S>
+impl<I, StepState, EffectState> Task for EffectTask<I, StepState, EffectState>
 where
     I: Send + Sync + 'static,
-    S: Clone + Send + Sync + 'static,
+    StepState: Clone + Send + Sync + 'static,
+    EffectState: Clone + Send + Sync + 'static,
 {
-    type Input = EffectState;
+    type Input = EffectJobState;
     type Output = ();
 
     #[instrument(
@@ -2232,6 +2537,7 @@ where
             job.id = %input.job_id.as_hyphenated(),
             step = input.step_index + 1,
             effect = input.effect_index + 1,
+            phase = ?input.phase,
             steps = self.job.steps.len()
         ),
         err
@@ -2244,37 +2550,81 @@ where
         self.job.execute_stage(tx, StageInput::Effect(input)).await
     }
 
+    fn on_final_failure(
+        &self,
+        conn: &mut PgConnection,
+        input: &Self::Input,
+        _error: &TaskError,
+    ) -> impl Future<Output = TaskResult<()>> + Send {
+        async move {
+            if input.phase == Phase::EffectCompensate {
+                return Ok(());
+            }
+
+            self.job.enqueue_compensations(conn, input.job_id).await
+        }
+    }
+
     impl_task_config!();
 }
 
-impl<I, S> Clone for Job<I, S>
+impl<I, StepState, EffectState> Clone for Job<I, StepState, EffectState>
 where
     I: Send + Sync + 'static,
-    S: Clone + Send + Sync + 'static,
+    StepState: Clone + Send + Sync + 'static,
+    EffectState: Clone + Send + Sync + 'static,
 {
     fn clone(&self) -> Self {
         Self {
             queue: self.queue.clone(),
             effect_queue: self.effect_queue.clone(),
-            state: self.state.clone(),
             steps: self.steps.clone(),
             effects: self.effects.clone(),
+            step_state: self.step_state.clone(),
+            effect_state: self.effect_state.clone(),
             _marker: PhantomData,
         }
     }
 }
 
+/// Marker type used when no effect follows a step or effect.
+#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize)]
+pub struct NoEffect;
+
+/// Marker type used when the next step is defined by an effect handler.
+///
+/// This is returned by [`To::effect`] and [`EffectOutcome::effect`] when the
+/// next step will be determined by the effect handler itself.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct PendingStep {
+    _private: (),
+}
+
 /// Marker type for effect inputs.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(transparent)]
-pub struct Effect<E>(
-    /// The effect payload.
-    pub E,
-);
+pub struct EffectInput<E>(pub E);
+
+/// Marker type used when no compensation payload is produced.
+#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize)]
+pub struct NoCompensation;
+
+/// Marker trait for pending effects returned from steps or effects.
+pub trait EffectPending {
+    /// Input type provided to the effect handler.
+    type Input: DeserializeOwned + Serialize + Send + Sync + 'static;
+}
+
+impl<E> EffectPending for EffectInput<E>
+where
+    E: DeserializeOwned + Serialize + Send + Sync + 'static,
+{
+    type Input = E;
+}
 
 /// Represents the state after executing a step.
 #[derive(Deserialize, Serialize)]
-pub enum To<N> {
+pub enum To<N, E = NoEffect> {
     /// The next step to transition to.
     Next(N),
 
@@ -2287,55 +2637,271 @@ pub enum To<N> {
         delay: Span,
     },
 
+    /// The next effect to transition to.
+    Effect(E),
+
     /// The terminal state.
     Done,
 }
 
-impl<S> To<S> {
+impl<N, E> To<N, E> {
     /// Transitions from the current step to the next step.
-    pub fn next(step: S) -> TaskResult<Self> {
+    pub fn next(step: N) -> TaskResult<Self> {
         Ok(Self::Next(step))
     }
 
-    /// Transitions from the current step to the next step, but after the given
-    /// delay.
-    ///
-    /// The next step will be enqueued immediately, but won't be dequeued until
-    /// the span has elapsed.
-    pub fn delay_for(step: S, delay: Span) -> TaskResult<Self> {
+    /// Transitions from the current step to the next step, but after the given delay.
+    pub fn delay_for(step: N, delay: Span) -> TaskResult<Self> {
         Ok(Self::Delay { next: step, delay })
     }
+
 }
 
-impl<E> To<Effect<E>> {
-    /// Transitions to an effect handler.
-    pub fn effect(effect: E) -> TaskResult<Self> {
-        Ok(Self::Next(Effect(effect)))
+impl<N> To<N, NoEffect> {
+    /// Transitions from the current step to an effect handler when the next
+    /// step type is already known.
+    ///
+    /// Use this when branching between `next`, `done`, and `effect` in a single
+    /// step so the next step type stays explicit.
+    pub fn effect_for<EffectInputT>(
+        effect: EffectInputT,
+    ) -> TaskResult<To<N, EffectInput<EffectInputT>>> {
+        Ok(To::Effect(EffectInput(effect)))
     }
 }
 
-impl To<()> {
-    /// Signals that this is the final step and no more steps will follow.
-    pub fn done() -> TaskResult<To<()>> {
+impl To<PendingStep, NoEffect> {
+    /// Transitions from the current step to an effect handler.
+    ///
+    /// Use [`Self::effect_for`] when the next step type is already known (for
+    /// example, when branching between `next` and `effect`).
+    pub fn effect<EffectInputT>(
+        effect: EffectInputT,
+    ) -> TaskResult<To<PendingStep, EffectInput<EffectInputT>>> {
+        Ok(To::Effect(EffectInput(effect)))
+    }
+}
+
+impl<E> To<(), E> {
+    /// Signals that this is the final step when the next step type is already known.
+    ///
+    /// This is useful for branching between `next`, `done`, and `effect` within a
+    /// single step.
+    pub fn done_for<N>() -> TaskResult<To<N, E>> {
         Ok(To::Done)
     }
 }
 
+impl To<(), NoEffect> {
+    /// Signals that this is the final step and no more steps will follow.
+    pub fn done() -> TaskResult<Self> {
+        Ok(Self::Done)
+    }
+}
+
+/// Outcome of executing an effect.
+#[derive(Debug)]
+pub enum EffectOutcome<N, E = NoEffect, C = NoCompensation> {
+    /// Transition to the next step.
+    Next {
+        /// Input for the next step.
+        next: N,
+        /// Delay before the next step executes.
+        delay: Span,
+        /// Optional compensation payload.
+        compensation: Option<C>,
+    },
+    /// Transition to the next effect.
+    Effect {
+        /// Input for the next effect.
+        effect: E,
+        /// Delay before the next effect executes.
+        delay: Span,
+        /// Optional compensation payload.
+        compensation: Option<C>,
+    },
+    /// Finish the job.
+    Done {
+        /// Optional compensation payload.
+        compensation: Option<C>,
+    },
+}
+
+impl<N, E, C> EffectOutcome<N, E, C> {
+    /// Transition to the next step.
+    pub fn next(next: N) -> Self {
+        Self::Next {
+            next,
+            delay: Span::new(),
+            compensation: None,
+        }
+    }
+
+    /// Transition to the next step with compensation.
+    pub fn next_with_compensation(next: N, compensation: C) -> Self {
+        Self::Next {
+            next,
+            delay: Span::new(),
+            compensation: Some(compensation),
+        }
+    }
+
+    /// Delay the next step.
+    pub fn delay_for(next: N, delay: Span) -> Self {
+        Self::Next {
+            next,
+            delay,
+            compensation: None,
+        }
+    }
+
+    /// Delay the next step with compensation.
+    pub fn delay_with_compensation(next: N, delay: Span, compensation: C) -> Self {
+        Self::Next {
+            next,
+            delay,
+            compensation: Some(compensation),
+        }
+    }
+
+    /// Finish the job.
+    pub fn done() -> Self {
+        Self::Done { compensation: None }
+    }
+
+    /// Finish the job with compensation.
+    pub fn done_with_compensation(compensation: C) -> Self {
+        Self::Done {
+            compensation: Some(compensation),
+        }
+    }
+
+}
+
+impl<C> EffectOutcome<PendingStep, NoEffect, C> {
+    /// Transition to the next effect.
+    ///
+    /// Use [`EffectOutcome::effect_for`] when the next step type is already
+    /// known (for example, when branching between `next` and `effect`).
+    pub fn effect<E>(effect: E) -> EffectOutcome<PendingStep, EffectInput<E>, C>
+    where
+        E: Send,
+    {
+        EffectOutcome::Effect {
+            effect: EffectInput(effect),
+            delay: Span::new(),
+            compensation: None,
+        }
+    }
+
+    /// Transition to the next effect with compensation.
+    pub fn effect_with_compensation<E>(
+        effect: E,
+        compensation: C,
+    ) -> EffectOutcome<PendingStep, EffectInput<E>, C>
+    where
+        E: Send,
+    {
+        EffectOutcome::Effect {
+            effect: EffectInput(effect),
+            delay: Span::new(),
+            compensation: Some(compensation),
+        }
+    }
+}
+
+impl<N, C> EffectOutcome<N, NoEffect, C> {
+    /// Transition to the next effect when the next step type is already known.
+    ///
+    /// Use this when branching between `next`, `done`, and `effect` in a single
+    /// effect handler so the next step type stays explicit.
+    pub fn effect_for<EffectInputT>(
+        effect: EffectInputT,
+    ) -> EffectOutcome<N, EffectInput<EffectInputT>, C>
+    where
+        EffectInputT: Send,
+    {
+        EffectOutcome::Effect {
+            effect: EffectInput(effect),
+            delay: Span::new(),
+            compensation: None,
+        }
+    }
+
+    /// Transition to the next effect with compensation when the next step type
+    /// is already known.
+    pub fn effect_with_compensation_for<EffectInputT>(
+        effect: EffectInputT,
+        compensation: C,
+    ) -> EffectOutcome<N, EffectInput<EffectInputT>, C>
+    where
+        EffectInputT: Send,
+    {
+        EffectOutcome::Effect {
+            effect: EffectInput(effect),
+            delay: Span::new(),
+            compensation: Some(compensation),
+        }
+    }
+}
+
+/// Trait describing an effect with optional compensation.
+pub trait Effect: Send + Sync + 'static {
+    /// Shared step state type.
+    type StepState: Clone + Send + Sync + 'static;
+    /// Shared effect state type.
+    type EffectState: Clone + Send + Sync + 'static;
+    /// Input passed to the effect handler.
+    type Input: DeserializeOwned + Serialize + Send + Sync + 'static;
+    /// Output for the next step.
+    type Next: Serialize + Send + Sync + 'static;
+    /// Output for the next effect.
+    type NextEffect: Serialize + Send + Sync + 'static;
+    /// Compensation payload for rollback.
+    type Compensation: DeserializeOwned + Serialize + Send + Sync + 'static;
+
+    /// Execute the effect and decide the next transition.
+    fn execute(
+        &self,
+        cx: Context<Self::StepState, Self::EffectState>,
+        input: Self::Input,
+    ) -> impl Future<Output = TaskResult<EffectOutcome<Self::Next, Self::NextEffect, Self::Compensation>>>
+           + Send;
+
+    /// Execute the compensation handler.
+    fn compensate(
+        &self,
+        cx: Context<Self::StepState, Self::EffectState>,
+        input: Self::Compensation,
+    ) -> impl Future<Output = TaskResult<()>> + Send {
+        let _ = cx;
+        let _ = input;
+        async { Ok(()) }
+    }
+
+    /// Retry policy to apply to compensations.
+    fn compensation_policy(&self) -> RetryPolicy {
+        RetryPolicy::default()
+    }
+}
+
 // A concrete implementation of a step using a closure.
-struct StepFn<I, O, S, F>
+struct StepFn<I, O, E, StepState, EffectState, F>
 where
-    F: Fn(StepContext<S>, I) -> Pin<Box<dyn Future<Output = TaskResult<To<O>>> + Send>>
+    F: Fn(Context<StepState, EffectState>, I)
+            -> Pin<Box<dyn Future<Output = TaskResult<To<O, E>>> + Send>>
         + Send
         + Sync
         + 'static,
 {
     func: Arc<F>,
-    _marker: PhantomData<(I, O, S)>,
+    _marker: PhantomData<(I, O, E, StepState, EffectState)>,
 }
 
-impl<I, O, S, F> StepFn<I, O, S, F>
+impl<I, O, E, StepState, EffectState, F> StepFn<I, O, E, StepState, EffectState, F>
 where
-    F: Fn(StepContext<S>, I) -> Pin<Box<dyn Future<Output = TaskResult<To<O>>> + Send>>
+    F: Fn(Context<StepState, EffectState>, I)
+            -> Pin<Box<dyn Future<Output = TaskResult<To<O, E>>> + Send>>
         + Send
         + Sync
         + 'static,
@@ -2348,72 +2914,176 @@ where
     }
 }
 
-// A concrete implementation of an effect using a closure.
-struct EffectFn<I, O, S, F>
-where
-    F: Fn(EffectContext<S>, I) -> Pin<Box<dyn Future<Output = TaskResult<To<O>>> + Send>>
-        + Send
-        + Sync
-        + 'static,
-{
-    func: Arc<F>,
-    _marker: PhantomData<(I, O, S)>,
+struct NoCompensate;
+
+trait CompensateFn<StepState, EffectState, CompInput>: Send + Sync + 'static {
+    type Fut: Future<Output = TaskResult<()>> + Send;
+
+    fn call(&self, cx: Context<StepState, EffectState>, input: CompInput) -> Self::Fut;
 }
 
-impl<I, O, S, F> EffectFn<I, O, S, F>
-where
-    F: Fn(EffectContext<S>, I) -> Pin<Box<dyn Future<Output = TaskResult<To<O>>> + Send>>
-        + Send
-        + Sync
-        + 'static,
+impl<StepState, EffectState> CompensateFn<StepState, EffectState, NoCompensation>
+    for NoCompensate
 {
-    fn new(func: F) -> Self {
+    type Fut = Pin<Box<dyn Future<Output = TaskResult<()>> + Send>>;
+
+    fn call(&self, _cx: Context<StepState, EffectState>, _input: NoCompensation) -> Self::Fut {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+impl<F, Fut, StepState, EffectState, CompInput> CompensateFn<StepState, EffectState, CompInput>
+    for F
+where
+    F: Fn(Context<StepState, EffectState>, CompInput) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = TaskResult<()>> + Send + 'static,
+{
+    type Fut = Fut;
+
+    fn call(&self, cx: Context<StepState, EffectState>, input: CompInput) -> Self::Fut {
+        (self)(cx, input)
+    }
+}
+
+struct EffectClosure<Exec, Comp, StepState, EffectState, Input, Next, NextEffect, CompInput> {
+    exec: Exec,
+    compensate: Comp,
+    _marker: PhantomData<(StepState, EffectState, Input, Next, NextEffect, CompInput)>,
+}
+
+impl<Exec, StepState, EffectState, Input, Next, NextEffect>
+    EffectClosure<Exec, NoCompensate, StepState, EffectState, Input, Next, NextEffect, NoCompensation>
+{
+    fn new(exec: Exec) -> Self {
         Self {
-            func: Arc::new(func),
+            exec,
+            compensate: NoCompensate,
+            _marker: PhantomData,
+        }
+    }
+
+    fn with_compensation<Comp, CompInput>(
+        self,
+        compensate: Comp,
+    ) -> EffectClosure<Exec, Comp, StepState, EffectState, Input, Next, NextEffect, CompInput> {
+        EffectClosure {
+            exec: self.exec,
+            compensate,
             _marker: PhantomData,
         }
     }
 }
 
-type StepResult = TaskResult<Option<(serde_json::Value, Span)>>;
+impl<
+        Exec,
+        Comp,
+        StepState,
+        EffectState,
+        Input,
+        Next,
+        NextEffect,
+        CompInput,
+        ExecFut,
+    > Effect for EffectClosure<Exec, Comp, StepState, EffectState, Input, Next, NextEffect, CompInput>
+where
+    StepState: Clone + Send + Sync + 'static,
+    EffectState: Clone + Send + Sync + 'static,
+    Input: DeserializeOwned + Serialize + Send + Sync + 'static,
+    Next: Serialize + Send + Sync + 'static,
+    NextEffect: Serialize + Send + Sync + 'static,
+    CompInput: DeserializeOwned + Serialize + Send + Sync + 'static,
+    Exec: Fn(Context<StepState, EffectState>, Input) -> ExecFut + Send + Sync + 'static,
+    ExecFut: Future<Output = TaskResult<EffectOutcome<Next, NextEffect, CompInput>>> + Send + 'static,
+    Comp: CompensateFn<StepState, EffectState, CompInput>,
+{
+    type StepState = StepState;
+    type EffectState = EffectState;
+    type Input = Input;
+    type Next = Next;
+    type NextEffect = NextEffect;
+    type Compensation = CompInput;
+
+    fn execute(
+        &self,
+        cx: Context<Self::StepState, Self::EffectState>,
+        input: Self::Input,
+    ) -> impl Future<Output = TaskResult<EffectOutcome<Self::Next, Self::NextEffect, Self::Compensation>>>
+           + Send {
+        (self.exec)(cx, input)
+    }
+
+    fn compensate(
+        &self,
+        cx: Context<Self::StepState, Self::EffectState>,
+        input: Self::Compensation,
+    ) -> impl Future<Output = TaskResult<()>> + Send {
+        self.compensate.call(cx, input)
+    }
+}
+
+enum StageTransition {
+    NextStep(serde_json::Value),
+    NextEffect(serde_json::Value),
+    Done,
+}
+
+struct StageResult {
+    transition: StageTransition,
+    delay: Span,
+    compensation: Option<serde_json::Value>,
+}
+
+type StageResultFuture<'a> = Pin<Box<dyn Future<Output = TaskResult<StageResult>> + Send + 'a>>;
 
 // A trait object wrapper for steps to allow heterogeneous step types in a
 // vector.
-trait StepExecutor<S>: Send + Sync {
+trait StepExecutor<StepState, EffectState>: Send + Sync {
     // Execute the step with the given input serialized as JSON.
     fn execute_step(
         &self,
-        cx: StepContext<S>,
+        cx: Context<StepState, EffectState>,
         input: serde_json::Value,
-    ) -> Pin<Box<dyn Future<Output = StepResult> + Send>>;
+    ) -> StageResultFuture<'_>;
 }
 
 // A trait object wrapper for effects to allow heterogeneous effect types in a
 // vector.
-trait EffectExecutor<S>: Send + Sync {
+trait EffectExecutor<StepState, EffectState>: Send + Sync {
     // Execute the effect with the given input serialized as JSON.
     fn execute_effect(
         &self,
-        cx: EffectContext<S>,
+        cx: Context<StepState, EffectState>,
         input: serde_json::Value,
-    ) -> Pin<Box<dyn Future<Output = StepResult> + Send>>;
+    ) -> StageResultFuture<'_>;
+    #[allow(dead_code)]
+    fn compensate_effect(
+        &self,
+        cx: Context<StepState, EffectState>,
+        input: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = TaskResult<()>> + Send + '_>>;
+    #[allow(dead_code)]
+    fn compensation_policy(&self) -> RetryPolicy;
 }
 
-impl<I, O, S, F> StepExecutor<S> for StepFn<I, O, S, F>
+impl<I, O, E, StepState, EffectState, F> StepExecutor<StepState, EffectState>
+    for StepFn<I, O, E, StepState, EffectState, F>
 where
     I: DeserializeOwned + Serialize + Send + Sync + 'static,
     O: Serialize + Send + Sync + 'static,
-    S: Send + Sync + 'static,
-    F: Fn(StepContext<S>, I) -> Pin<Box<dyn Future<Output = TaskResult<To<O>>> + Send>>
+    E: Serialize + Send + Sync + 'static,
+    StepState: Send + Sync + 'static,
+    EffectState: Send + Sync + 'static,
+    F: Fn(Context<StepState, EffectState>, I)
+            -> Pin<Box<dyn Future<Output = TaskResult<To<O, E>>> + Send>>
         + Send
         + Sync
         + 'static,
 {
     fn execute_step(
         &self,
-        cx: StepContext<S>,
+        cx: Context<StepState, EffectState>,
         input: serde_json::Value,
-    ) -> Pin<Box<dyn Future<Output = StepResult> + Send>> {
+    ) -> StageResultFuture<'_> {
         let deserialized_input: I = match serde_json::from_value(input) {
             Ok(val) => val,
             Err(e) => return Box::pin(async move { Err(TaskError::Fatal(e.to_string())) }),
@@ -2425,19 +3095,38 @@ where
                 Ok(To::Next(output)) => {
                     let serialized_output = serde_json::to_value(output)
                         .map_err(|e| TaskError::Fatal(e.to_string()))?;
-                    Ok(Some((serialized_output, Span::new())))
+                    Ok(StageResult {
+                        transition: StageTransition::NextStep(serialized_output),
+                        delay: Span::new(),
+                        compensation: None,
+                    })
                 }
 
-                Ok(To::Delay {
-                    next: output,
-                    delay,
-                }) => {
-                    let serialized_output = serde_json::to_value(output)
+                Ok(To::Delay { next, delay }) => {
+                    let serialized_output = serde_json::to_value(next)
                         .map_err(|e| TaskError::Fatal(e.to_string()))?;
-                    Ok(Some((serialized_output, delay)))
+                    Ok(StageResult {
+                        transition: StageTransition::NextStep(serialized_output),
+                        delay,
+                        compensation: None,
+                    })
                 }
 
-                Ok(To::Done) => Ok(None),
+                Ok(To::Effect(effect)) => {
+                    let serialized_output = serde_json::to_value(effect)
+                        .map_err(|e| TaskError::Fatal(e.to_string()))?;
+                    Ok(StageResult {
+                        transition: StageTransition::NextEffect(serialized_output),
+                        delay: Span::new(),
+                        compensation: None,
+                    })
+                }
+
+                Ok(To::Done) => Ok(StageResult {
+                    transition: StageTransition::Done,
+                    delay: Span::new(),
+                    compensation: None,
+                }),
 
                 Err(e) => Err(e),
             }
@@ -2445,49 +3134,103 @@ where
     }
 }
 
-impl<I, O, S, F> EffectExecutor<S> for EffectFn<I, O, S, F>
+impl<E, StepState, EffectState> EffectExecutor<StepState, EffectState> for E
 where
-    I: DeserializeOwned + Serialize + Send + Sync + 'static,
-    O: Serialize + Send + Sync + 'static,
-    S: Send + Sync + 'static,
-    F: Fn(EffectContext<S>, I) -> Pin<Box<dyn Future<Output = TaskResult<To<O>>> + Send>>
-        + Send
-        + Sync
-        + 'static,
+    E: Effect<StepState = StepState, EffectState = EffectState>,
+    StepState: Clone + Send + Sync + 'static,
+    EffectState: Clone + Send + Sync + 'static,
+    E::Input: Serialize + Send + Sync + 'static,
+    E::Next: Serialize + Send + Sync + 'static,
+    E::NextEffect: Serialize + Send + Sync + 'static,
+    E::Compensation: Serialize + Send + Sync + 'static,
 {
     fn execute_effect(
         &self,
-        cx: EffectContext<S>,
+        cx: Context<StepState, EffectState>,
         input: serde_json::Value,
-    ) -> Pin<Box<dyn Future<Output = StepResult> + Send>> {
-        let deserialized_input: I = match serde_json::from_value(input) {
+    ) -> StageResultFuture<'_> {
+        let deserialized_input: E::Input = match serde_json::from_value(input) {
             Ok(val) => val,
             Err(e) => return Box::pin(async move { Err(TaskError::Fatal(e.to_string())) }),
         };
-        let fut = (self.func)(cx, deserialized_input);
+        let fut = self.execute(cx, deserialized_input);
 
         Box::pin(async move {
             match fut.await {
-                Ok(To::Next(output)) => {
-                    let serialized_output = serde_json::to_value(output)
-                        .map_err(|e| TaskError::Fatal(e.to_string()))?;
-                    Ok(Some((serialized_output, Span::new())))
-                }
-
-                Ok(To::Delay {
-                    next: output,
+                Ok(EffectOutcome::Next {
+                    next,
                     delay,
+                    compensation,
                 }) => {
-                    let serialized_output = serde_json::to_value(output)
+                    let serialized_output = serde_json::to_value(next)
                         .map_err(|e| TaskError::Fatal(e.to_string()))?;
-                    Ok(Some((serialized_output, delay)))
+                    let serialized_comp = match compensation {
+                        Some(comp) => Some(
+                            serde_json::to_value(comp)
+                                .map_err(|e| TaskError::Fatal(e.to_string()))?,
+                        ),
+                        None => None,
+                    };
+                    Ok(StageResult {
+                        transition: StageTransition::NextStep(serialized_output),
+                        delay,
+                        compensation: serialized_comp,
+                    })
                 }
-
-                Ok(To::Done) => Ok(None),
-
+                Ok(EffectOutcome::Effect {
+                    effect,
+                    delay,
+                    compensation,
+                }) => {
+                    let serialized_output = serde_json::to_value(effect)
+                        .map_err(|e| TaskError::Fatal(e.to_string()))?;
+                    let serialized_comp = match compensation {
+                        Some(comp) => Some(
+                            serde_json::to_value(comp)
+                                .map_err(|e| TaskError::Fatal(e.to_string()))?,
+                        ),
+                        None => None,
+                    };
+                    Ok(StageResult {
+                        transition: StageTransition::NextEffect(serialized_output),
+                        delay,
+                        compensation: serialized_comp,
+                    })
+                }
+                Ok(EffectOutcome::Done { compensation }) => {
+                    let serialized_comp = match compensation {
+                        Some(comp) => Some(
+                            serde_json::to_value(comp)
+                                .map_err(|e| TaskError::Fatal(e.to_string()))?,
+                        ),
+                        None => None,
+                    };
+                    Ok(StageResult {
+                        transition: StageTransition::Done,
+                        delay: Span::new(),
+                        compensation: serialized_comp,
+                    })
+                }
                 Err(e) => Err(e),
             }
         })
+    }
+
+    fn compensate_effect(
+        &self,
+        cx: Context<StepState, EffectState>,
+        input: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = TaskResult<()>> + Send + '_>> {
+        let deserialized_input: E::Compensation = match serde_json::from_value(input) {
+            Ok(val) => val,
+            Err(e) => return Box::pin(async move { Err(TaskError::Fatal(e.to_string())) }),
+        };
+
+        Box::pin(self.compensate(cx, deserialized_input))
+    }
+
+    fn compensation_policy(&self) -> RetryPolicy {
+        Effect::compensation_policy(self)
     }
 }
 
@@ -2500,31 +3243,24 @@ mod builder_states {
 
     pub struct Initial;
 
-    pub struct StateSet<S> {
-        pub state: S,
+    pub struct StepSet<Current, Effect> {
+        pub _marker: PhantomData<(Current, Effect)>,
     }
 
-    pub struct StepSet<Current, S> {
-        pub state: S,
-        pub _marker: PhantomData<Current>,
-    }
-
-    pub struct QueueSet<I, S>
+    pub struct QueueSet<I, StepState, EffectState>
     where
         I: Send + Sync + 'static,
-        S: Clone + Send + Sync + 'static,
+        StepState: Clone + Send + Sync + 'static,
+        EffectState: Clone + Send + Sync + 'static,
     {
-        pub state: S,
-        pub queue: JobQueue<I, S>,
+        pub queue: JobQueue<I, StepState, EffectState>,
     }
 
-    pub struct QueueNameSet<S> {
-        pub state: S,
+    pub struct QueueNameSet {
         pub queue_name: String,
     }
 
-    pub struct PoolSet<S> {
-        pub state: S,
+    pub struct PoolSet {
         pub queue_name: String,
         pub pool: PgPool,
     }
@@ -2537,22 +3273,24 @@ enum ConfigTarget {
 }
 
 /// Builder for constructing a `Job` with a sequence of steps.
-pub struct Builder<I, O, S, B> {
+pub struct Builder<I, O, E, StepState, EffectState, B> {
     builder_state: B,
-    steps: Vec<StageConfig<S>>,
-    effects: Vec<StageConfig<S>>,
+    step_state: StepState,
+    effect_state: EffectState,
+    steps: Vec<StageConfig<StepState, EffectState>>,
+    effects: Vec<StageConfig<StepState, EffectState>>,
     last_config: Option<ConfigTarget>,
     effect_queue_name: Option<String>,
-    _marker: PhantomData<(I, O, S)>,
+    _marker: PhantomData<(I, O, E)>,
 }
 
-impl<I, S> Default for Builder<I, I, S, Initial> {
+impl<I> Default for Builder<I, I, NoEffect, (), (), Initial> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<I, O, S, B> Builder<I, O, S, B> {
+impl<I, O, E, StepState, EffectState, B> Builder<I, O, E, StepState, EffectState, B> {
     /// Sets the queue name for effects.
     ///
     /// Defaults to `"<queue_name>__effects"` when not provided.
@@ -2560,9 +3298,46 @@ impl<I, O, S, B> Builder<I, O, S, B> {
         self.effect_queue_name = Some(name.into());
         self
     }
+
 }
 
-impl<I, S> Builder<I, I, S, Initial> {
+impl<I, StepState, EffectState> Builder<I, I, NoEffect, StepState, EffectState, Initial> {
+    /// Provides a state shared amongst all steps.
+    pub fn state<NewStepState>(
+        self,
+        state: NewStepState,
+    ) -> Builder<I, I, NoEffect, NewStepState, EffectState, Initial> {
+        Builder {
+            builder_state: self.builder_state,
+            step_state: state,
+            effect_state: self.effect_state,
+            steps: Vec::new(),
+            effects: Vec::new(),
+            last_config: self.last_config,
+            effect_queue_name: self.effect_queue_name,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Provides a state shared amongst all effects.
+    pub fn effect_state<NewEffectState>(
+        self,
+        state: NewEffectState,
+    ) -> Builder<I, I, NoEffect, StepState, NewEffectState, Initial> {
+        Builder {
+            builder_state: self.builder_state,
+            step_state: self.step_state,
+            effect_state: state,
+            steps: Vec::new(),
+            effects: Vec::new(),
+            last_config: self.last_config,
+            effect_queue_name: self.effect_queue_name,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<I> Builder<I, I, NoEffect, (), (), Initial> {
     /// Create a new builder.
     ///
     /// # Example
@@ -2573,9 +3348,11 @@ impl<I, S> Builder<I, I, S, Initial> {
     /// // Instantiate a new builder from the `Job` method.
     /// let job_builder = Job::<(), ()>::builder();
     /// ```
-    pub fn new() -> Builder<I, I, S, Initial> {
-        Builder::<I, I, S, _> {
+    pub fn new() -> Builder<I, I, NoEffect, (), (), Initial> {
+        Builder::<I, I, NoEffect, (), (), _> {
             builder_state: Initial,
+            step_state: (),
+            effect_state: (),
             steps: Vec::new(),
             effects: Vec::new(),
             last_config: None,
@@ -2584,95 +3361,14 @@ impl<I, S> Builder<I, I, S, Initial> {
         }
     }
 
-    /// Provides a state shared amongst all steps.
-    ///
-    /// The state type must be `Clone`.
-    ///
-    /// State is useful for providing shared resources to steps. This could
-    /// include shared connections, clients, or other configuration that may be
-    /// used throughout step functions.
-    ///
-    /// **Note:** State is not persisted and therefore should not be relied on
-    /// when durability is needed.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use underway::Job;
-    ///
-    /// #[derive(Clone)]
-    /// struct State {
-    ///     data: String,
-    /// }
-    ///
-    /// // Set state.
-    /// let job_builder = Job::<(), _>::builder().state(State {
-    ///     data: "foo".to_string(),
-    /// });
-    /// ```
-    pub fn state(self, state: S) -> Builder<I, I, S, StateSet<S>> {
-        Builder {
-            builder_state: StateSet { state },
-            steps: self.steps,
-            effects: self.effects,
-            last_config: self.last_config,
-            effect_queue_name: self.effect_queue_name,
-            _marker: PhantomData,
-        }
-    }
-
-    /// Add a step to the job.
-    ///
-    /// A step function should take the job context as its first argument
-    /// followed by some type that's `Serialize` and `Deserialize` as its
-    /// second argument.
-    ///
-    /// It should also return one of the [`To`] variants. For convenience, `To`
-    /// provides methods that return the correct types. Most commonly these
-    /// will be [`To::next`], when going on to another step, or [`To::done`],
-    /// when there are no more steps.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use underway::{Job, To};
-    ///
-    /// // Set a step.
-    /// let job_builder = Job::<(), ()>::builder().step(|_cx, _| async move { To::done() });
-    /// ```
-    pub fn step<F, O, Fut>(mut self, func: F) -> Builder<I, O, S, StepSet<O, ()>>
-    where
-        I: DeserializeOwned + Serialize + Send + Sync + 'static,
-        O: Serialize + Send + Sync + 'static,
-        S: Send + Sync + 'static,
-        F: Fn(StepContext<S>, I) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = TaskResult<To<O>>> + Send + 'static,
-    {
-        let step_fn = StepFn::new(move |cx, input| Box::pin(func(cx, input)));
-        let step_index = self.steps.len();
-        self.steps.push(StageConfig {
-            executor: StageExecutor::Step(Box::new(step_fn)),
-            task_config: StepTaskConfig::default(),
-            next_effect_index: None,
-        });
-        self.last_config = Some(ConfigTarget::Step(step_index));
-
-        Builder {
-            builder_state: StepSet {
-                state: (),
-                _marker: PhantomData,
-            },
-            steps: self.steps,
-            effects: self.effects,
-            last_config: self.last_config,
-            effect_queue_name: self.effect_queue_name,
-            _marker: PhantomData,
-        }
-    }
 }
 
 // After state set, before first step set.
-impl<I, S> Builder<I, I, S, StateSet<S>> {
+impl<I, StepState, EffectState> Builder<I, I, NoEffect, StepState, EffectState, Initial>
+where
+    StepState: Clone + Send + Sync + 'static,
+    EffectState: Clone + Send + Sync + 'static,
+{
     /// Add a step to the job.
     ///
     /// A step function should take the job context as its first argument
@@ -2700,17 +3396,18 @@ impl<I, S> Builder<I, I, S, StateSet<S>> {
     ///         data: "foo".to_string(),
     ///     })
     ///     .step(|cx, _| async move {
-    ///         println!("State data: {}", cx.state.data);
+    ///         let state = cx.step_state().expect("step context");
+    ///         println!("State data: {}", state.data);
     ///         To::done()
     ///     });
     /// ```
-    pub fn step<F, O, Fut>(mut self, func: F) -> Builder<I, O, S, StepSet<O, S>>
+    pub fn step<F, O, E, Fut>(mut self, func: F) -> Builder<I, O, E, StepState, EffectState, StepSet<O, E>>
     where
         I: DeserializeOwned + Serialize + Send + Sync + 'static,
         O: Serialize + Send + Sync + 'static,
-        S: Send + Sync + 'static,
-        F: Fn(StepContext<S>, I) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = TaskResult<To<O>>> + Send + 'static,
+        E: Serialize + Send + Sync + 'static,
+        F: Fn(Context<StepState, EffectState>, I) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = TaskResult<To<O, E>>> + Send + 'static,
     {
         let step_fn = StepFn::new(move |cx, input| Box::pin(func(cx, input)));
         let step_index = self.steps.len();
@@ -2723,9 +3420,10 @@ impl<I, S> Builder<I, I, S, StateSet<S>> {
 
         Builder {
             builder_state: StepSet {
-                state: self.builder_state.state,
                 _marker: PhantomData,
             },
+            step_state: self.step_state,
+            effect_state: self.effect_state,
             steps: self.steps,
             effects: self.effects,
             last_config: self.last_config,
@@ -2736,7 +3434,12 @@ impl<I, S> Builder<I, I, S, StateSet<S>> {
 }
 
 // After first step set.
-impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
+impl<I, Current, StepState, EffectState>
+    Builder<I, Current, NoEffect, StepState, EffectState, StepSet<Current, NoEffect>>
+where
+    StepState: Clone + Send + Sync + 'static,
+    EffectState: Clone + Send + Sync + 'static,
+{
     /// Add a subsequent step to the job.
     ///
     /// This method ensures that the input type of the new step matches the
@@ -2758,13 +3461,13 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
     ///     .step(|_cx, _| async move { To::next(Step2 { n: 42 }) })
     ///     .step(|_cx, Step2 { n }| async move { To::done() });
     /// ```
-    pub fn step<F, New, Fut>(mut self, func: F) -> Builder<I, New, S, StepSet<New, S>>
+    pub fn step<F, New, E, Fut>(mut self, func: F) -> Builder<I, New, E, StepState, EffectState, StepSet<New, E>>
     where
         Current: DeserializeOwned + Serialize + Send + Sync + 'static,
         New: Serialize + Send + Sync + 'static,
-        S: Send + Sync + 'static,
-        F: Fn(StepContext<S>, Current) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = TaskResult<To<New>>> + Send + 'static,
+        E: Serialize + Send + Sync + 'static,
+        F: Fn(Context<StepState, EffectState>, Current) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = TaskResult<To<New, E>>> + Send + 'static,
     {
         let step_fn = StepFn::new(move |cx, input| Box::pin(func(cx, input)));
         let step_index = self.steps.len();
@@ -2777,9 +3480,10 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
 
         Builder {
             builder_state: StepSet {
-                state: self.builder_state.state,
                 _marker: PhantomData,
             },
+            step_state: self.step_state,
+            effect_state: self.effect_state,
             steps: self.steps,
             effects: self.effects,
             last_config: self.last_config,
@@ -2787,7 +3491,11 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
             _marker: PhantomData,
         }
     }
+}
 
+impl<I, Current, Effect, StepState, EffectState>
+    Builder<I, Current, Effect, StepState, EffectState, StepSet<Current, Effect>>
+{
     fn update_task_config(&mut self, update: impl FnOnce(&mut StepTaskConfig)) {
         let target = self.last_config.expect("Steps should not be empty");
 
@@ -2829,7 +3537,7 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
     pub fn retry_policy(
         mut self,
         retry_policy: RetryPolicy,
-    ) -> Builder<I, Current, S, StepSet<Current, S>> {
+    ) -> Builder<I, Current, Effect, StepState, EffectState, StepSet<Current, Effect>> {
         self.update_task_config(|task_config| task_config.retry_policy = retry_policy);
         self
     }
@@ -2846,7 +3554,10 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
     ///     .step(|_cx, _| async move { To::done() })
     ///     .timeout(1.minute());
     /// ```
-    pub fn timeout(mut self, timeout: Span) -> Builder<I, Current, S, StepSet<Current, S>> {
+    pub fn timeout(
+        mut self,
+        timeout: Span,
+    ) -> Builder<I, Current, Effect, StepState, EffectState, StepSet<Current, Effect>> {
         self.update_task_config(|task_config| task_config.timeout = timeout);
         self
     }
@@ -2863,7 +3574,10 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
     ///     .step(|_cx, _| async move { To::done() })
     ///     .ttl(7.days());
     /// ```
-    pub fn ttl(mut self, ttl: Span) -> Builder<I, Current, S, StepSet<Current, S>> {
+    pub fn ttl(
+        mut self,
+        ttl: Span,
+    ) -> Builder<I, Current, Effect, StepState, EffectState, StepSet<Current, Effect>> {
         self.update_task_config(|task_config| task_config.ttl = ttl);
         self
     }
@@ -2882,7 +3596,10 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
     ///     .step(|_cx, _| async move { To::done() })
     ///     .delay(30.seconds());
     /// ```
-    pub fn delay(mut self, delay: Span) -> Builder<I, Current, S, StepSet<Current, S>> {
+    pub fn delay(
+        mut self,
+        delay: Span,
+    ) -> Builder<I, Current, Effect, StepState, EffectState, StepSet<Current, Effect>> {
         self.update_task_config(|task_config| task_config.delay = delay);
         self
     }
@@ -2899,7 +3616,10 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
     ///     .step(|_cx, _| async move { To::done() })
     ///     .heartbeat(5.seconds());
     /// ```
-    pub fn heartbeat(mut self, heartbeat: Span) -> Builder<I, Current, S, StepSet<Current, S>> {
+    pub fn heartbeat(
+        mut self,
+        heartbeat: Span,
+    ) -> Builder<I, Current, Effect, StepState, EffectState, StepSet<Current, Effect>> {
         self.update_task_config(|task_config| task_config.heartbeat = heartbeat);
         self
     }
@@ -2918,7 +3638,7 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
     pub fn concurrency_key(
         mut self,
         concurrency_key: impl Into<String>,
-    ) -> Builder<I, Current, S, StepSet<Current, S>> {
+    ) -> Builder<I, Current, Effect, StepState, EffectState, StepSet<Current, Effect>> {
         let concurrency_key = concurrency_key.into();
         self.update_task_config(|task_config| task_config.concurrency_key = Some(concurrency_key));
         self
@@ -2935,17 +3655,22 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
     ///     .step(|_cx, _| async move { To::done() })
     ///     .priority(10);
     /// ```
-    pub fn priority(mut self, priority: i32) -> Builder<I, Current, S, StepSet<Current, S>> {
+    pub fn priority(
+        mut self,
+        priority: i32,
+    ) -> Builder<I, Current, Effect, StepState, EffectState, StepSet<Current, Effect>> {
         self.update_task_config(|task_config| task_config.priority = priority);
         self
     }
 }
 
 // Encapsulate queue creation.
-impl<I, S> Builder<I, (), S, StepSet<(), S>>
+impl<I, StepState, EffectState>
+    Builder<I, (), NoEffect, StepState, EffectState, StepSet<(), NoEffect>>
 where
     I: Send + Sync + 'static,
-    S: Clone + Send + Sync + 'static,
+    StepState: Clone + Send + Sync + 'static,
+    EffectState: Clone + Send + Sync + 'static,
 {
     /// Set the name of the job's queue.
     ///
@@ -2967,12 +3692,16 @@ where
     ///     .step(|_cx, _| async move { To::done() })
     ///     .name("example");
     /// ```
-    pub fn name(self, name: impl Into<String>) -> Builder<I, (), S, QueueNameSet<S>> {
+    pub fn name(
+        self,
+        name: impl Into<String>,
+    ) -> Builder<I, (), NoEffect, StepState, EffectState, QueueNameSet> {
         Builder {
             builder_state: QueueNameSet {
-                state: self.builder_state.state,
                 queue_name: name.into(),
             },
+            step_state: self.step_state,
+            effect_state: self.effect_state,
             steps: self.steps,
             effects: self.effects,
             last_config: self.last_config,
@@ -2982,50 +3711,27 @@ where
     }
 }
 
-impl<I, E, S> Builder<I, Effect<E>, S, StepSet<Effect<E>, S>> {
-    /// Add an effect handler after the previous step.
-    ///
-    /// Effects are intended for external side effects (HTTP calls, emails,
-    /// etc.) and are executed on a dedicated effect queue. The next step is
-    /// only enqueued after the effect handler succeeds.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use serde::{Deserialize, Serialize};
-    /// use underway::{Job, To};
-    ///
-    /// #[derive(Deserialize, Serialize)]
-    /// struct SendEmail {
-    ///     user_id: i64,
-    /// }
-    ///
-    /// #[derive(Deserialize, Serialize)]
-    /// struct NextStep {
-    ///     user_id: i64,
-    /// }
-    ///
-    /// let job_builder = Job::<(), ()>::builder()
-    ///     .step(|_cx, _| async move { To::effect(SendEmail { user_id: 42 }) })
-    ///     .effect(|_cx, SendEmail { user_id }| async move {
-    ///         // send the email
-    ///         To::next(NextStep { user_id })
-    ///     })
-    ///     .step(|_cx, _| async move { To::done() });
-    /// ```
-    pub fn effect<F, New, Fut>(mut self, func: F) -> Builder<I, New, S, StepSet<New, S>>
+impl<I, Current, Pending, StepState, EffectState>
+    Builder<I, Current, Pending, StepState, EffectState, StepSet<Current, Pending>>
+where
+    Pending: EffectPending,
+    StepState: Clone + Send + Sync + 'static,
+    EffectState: Clone + Send + Sync + 'static,
+{
+    fn effect_handler<Eff>(
+        mut self,
+        effect: Eff,
+    ) -> Builder<I, Eff::Next, Eff::NextEffect, StepState, EffectState, StepSet<Eff::Next, Eff::NextEffect>>
     where
-        E: DeserializeOwned + Serialize + Send + Sync + 'static,
-        New: Serialize + Send + Sync + 'static,
-        S: Send + Sync + 'static,
-        F: Fn(EffectContext<S>, E) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = TaskResult<To<New>>> + Send + 'static,
+        Eff: Effect<StepState = StepState, EffectState = EffectState, Input = Pending::Input>,
+        Eff::Next: Serialize + Send + Sync + 'static,
+        Eff::NextEffect: Serialize + Send + Sync + 'static,
+        Eff::Compensation: DeserializeOwned + Serialize + Send + Sync + 'static,
     {
-        let effect_fn = EffectFn::new(move |cx, input| Box::pin(func(cx, input)));
         let next_effect_index = self.effects.len();
 
         self.effects.push(StageConfig {
-            executor: StageExecutor::Effect(Box::new(effect_fn)),
+            executor: StageExecutor::Effect(Box::new(effect)),
             task_config: StepTaskConfig::default(),
             next_effect_index: None,
         });
@@ -3052,9 +3758,10 @@ impl<I, E, S> Builder<I, Effect<E>, S, StepSet<Effect<E>, S>> {
 
         Builder {
             builder_state: StepSet {
-                state: self.builder_state.state,
                 _marker: PhantomData,
             },
+            step_state: self.step_state,
+            effect_state: self.effect_state,
             steps: self.steps,
             effects: self.effects,
             last_config: self.last_config,
@@ -3062,12 +3769,80 @@ impl<I, E, S> Builder<I, Effect<E>, S, StepSet<Effect<E>, S>> {
             _marker: PhantomData,
         }
     }
+
+    /// Add an effect handler after the previous step or effect.
+    ///
+    /// Effects are intended for external side effects (HTTP calls, emails,
+    /// etc.) and are executed on a dedicated effect queue. The next step is
+    /// only enqueued after the effect handler succeeds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use serde::{Deserialize, Serialize};
+    /// use underway::{job::EffectOutcome, Job, To};
+    ///
+    /// #[derive(Deserialize, Serialize)]
+    /// struct SendEmail {
+    ///     user_id: i64,
+    /// }
+    ///
+    /// #[derive(Deserialize, Serialize)]
+    /// struct NextStep {
+    ///     user_id: i64,
+    /// }
+    ///
+    /// let job_builder = Job::<(), ()>::builder()
+    ///     .step(|_cx, _| async move { To::effect(SendEmail { user_id: 42 }) })
+    ///     .effect(|_cx, SendEmail { user_id }| async move {
+    ///         // send the email
+    ///         Ok(EffectOutcome::next(NextStep { user_id }))
+    ///     })
+    ///     .step(|_cx, _| async move { To::done() });
+    /// ```
+    pub fn effect<F, Fut, Next, NextEffect>(
+        self,
+        func: F,
+    ) -> Builder<I, Next, NextEffect, StepState, EffectState, StepSet<Next, NextEffect>>
+    where
+        F: Fn(Context<StepState, EffectState>, Pending::Input) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = TaskResult<EffectOutcome<Next, NextEffect, NoCompensation>>>
+            + Send
+            + 'static,
+        Next: Serialize + Send + Sync + 'static,
+        NextEffect: Serialize + Send + Sync + 'static,
+    {
+        let effect = EffectClosure::new(func);
+        self.effect_handler(effect)
+    }
+
+    /// Add an effect handler with a compensation callback.
+    pub fn effect_with_compensation<F, Fut, Comp, CompFut, Next, NextEffect, CompInput>(
+        self,
+        func: F,
+        compensate: Comp,
+    ) -> Builder<I, Next, NextEffect, StepState, EffectState, StepSet<Next, NextEffect>>
+    where
+        F: Fn(Context<StepState, EffectState>, Pending::Input) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = TaskResult<EffectOutcome<Next, NextEffect, CompInput>>>
+            + Send
+            + 'static,
+        Comp: Fn(Context<StepState, EffectState>, CompInput) -> CompFut + Send + Sync + 'static,
+        CompFut: Future<Output = TaskResult<()>> + Send + 'static,
+        Next: Serialize + Send + Sync + 'static,
+        NextEffect: Serialize + Send + Sync + 'static,
+        CompInput: DeserializeOwned + Serialize + Send + Sync + 'static,
+    {
+        let effect = EffectClosure::new(func).with_compensation(compensate);
+        self.effect_handler(effect)
+    }
 }
 
-impl<I, S> Builder<I, (), S, QueueNameSet<S>>
+impl<I, StepState, EffectState> Builder<I, (), NoEffect, StepState, EffectState, QueueNameSet>
 where
     I: Send + Sync + 'static,
-    S: Clone + Send + Sync + 'static,
+    StepState: Clone + Send + Sync + 'static,
+    EffectState: Clone + Send + Sync + 'static,
 {
     /// Set the pool of the job's queue.
     ///
@@ -3097,14 +3872,12 @@ where
     /// # });
     /// # }
     /// ```
-    pub fn pool(self, pool: PgPool) -> Builder<I, (), S, PoolSet<S>> {
-        let QueueNameSet { queue_name, state } = self.builder_state;
+    pub fn pool(self, pool: PgPool) -> Builder<I, (), NoEffect, StepState, EffectState, PoolSet> {
+        let QueueNameSet { queue_name } = self.builder_state;
         Builder {
-            builder_state: PoolSet {
-                state,
-                queue_name,
-                pool,
-            },
+            builder_state: PoolSet { queue_name, pool },
+            step_state: self.step_state,
+            effect_state: self.effect_state,
             steps: self.steps,
             effects: self.effects,
             last_config: self.last_config,
@@ -3114,10 +3887,11 @@ where
     }
 }
 
-impl<I, S> Builder<I, (), S, PoolSet<S>>
+impl<I, StepState, EffectState> Builder<I, (), NoEffect, StepState, EffectState, PoolSet>
 where
     I: Send + Sync + 'static,
-    S: Clone + Send + Sync + 'static,
+    StepState: Clone + Send + Sync + 'static,
+    EffectState: Clone + Send + Sync + 'static,
 {
     /// Finalize the builder into a `Job`.
     ///
@@ -3146,12 +3920,8 @@ where
     /// # });
     /// # }
     /// ```
-    pub async fn build(self) -> Result<Job<I, S>> {
-        let PoolSet {
-            state,
-            queue_name,
-            pool,
-        } = self.builder_state;
+    pub async fn build(self) -> Result<Job<I, StepState, EffectState>> {
+        let PoolSet { queue_name, pool } = self.builder_state;
         let effect_queue_name = self
             .effect_queue_name
             .unwrap_or_else(|| format!("{queue_name}__effects"));
@@ -3170,17 +3940,20 @@ where
             effect_queue: Arc::new(effect_queue),
             steps: Arc::new(self.steps),
             effects: Arc::new(self.effects),
-            state,
+            step_state: self.step_state,
+            effect_state: self.effect_state,
             _marker: PhantomData,
         })
     }
 }
 
 // Directly provide queue.
-impl<I, S> Builder<I, (), S, StepSet<(), S>>
+impl<I, StepState, EffectState>
+    Builder<I, (), NoEffect, StepState, EffectState, StepSet<(), NoEffect>>
 where
     I: Send + Sync + 'static,
-    S: Clone + Send + Sync + 'static,
+    StepState: Clone + Send + Sync + 'static,
+    EffectState: Clone + Send + Sync + 'static,
 {
     /// Set the queue.
     ///
@@ -3214,12 +3987,14 @@ where
     /// # });
     /// # }
     /// ```
-    pub fn queue(self, queue: JobQueue<I, S>) -> Builder<I, (), S, QueueSet<I, S>> {
+    pub fn queue(
+        self,
+        queue: JobQueue<I, StepState, EffectState>,
+    ) -> Builder<I, (), NoEffect, StepState, EffectState, QueueSet<I, StepState, EffectState>> {
         Builder {
-            builder_state: QueueSet {
-                state: self.builder_state.state,
-                queue,
-            },
+            builder_state: QueueSet { queue },
+            step_state: self.step_state,
+            effect_state: self.effect_state,
             steps: self.steps,
             effects: self.effects,
             last_config: self.last_config,
@@ -3229,10 +4004,12 @@ where
     }
 }
 
-impl<I, S> Builder<I, (), S, QueueSet<I, S>>
+impl<I, StepState, EffectState>
+    Builder<I, (), NoEffect, StepState, EffectState, QueueSet<I, StepState, EffectState>>
 where
     I: Send + Sync + 'static,
-    S: Clone + Send + Sync + 'static,
+    StepState: Clone + Send + Sync + 'static,
+    EffectState: Clone + Send + Sync + 'static,
 {
     /// Finalize the builder into a `Job`.
     ///
@@ -3262,8 +4039,8 @@ where
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
     /// # }
-    pub async fn build(self) -> Result<Job<I, S>> {
-        let QueueSet { state, queue } = self.builder_state;
+    pub async fn build(self) -> Result<Job<I, StepState, EffectState>> {
+        let QueueSet { queue } = self.builder_state;
         let effect_queue_name = self
             .effect_queue_name
             .unwrap_or_else(|| format!("{}__effects", queue.name));
@@ -3278,7 +4055,8 @@ where
             effect_queue: Arc::new(effect_queue),
             steps: Arc::new(self.steps),
             effects: Arc::new(self.effects),
-            state,
+            step_state: self.step_state,
+            effect_state: self.effect_state,
             _marker: PhantomData,
         })
     }
@@ -3346,7 +4124,7 @@ mod tests {
             message: String,
         }
 
-        async fn step(_cx: StepContext<()>, Input { message }: Input) -> TaskResult<To<()>> {
+        async fn step(_cx: Context<(), ()>, Input { message }: Input) -> TaskResult<To<()>> {
             println!("Executing job with message: {message}");
             To::done()
         }
@@ -3405,9 +4183,12 @@ mod tests {
                 data: "data".to_string(),
             })
             .step(|cx, Input { message }| async move {
+                let Context::Step { state, .. } = cx else {
+                    return Err(TaskError::Fatal("Expected step context.".into()));
+                };
                 println!(
                     "Executing job with message: {message} and state: {state}",
-                    state = cx.state.data
+                    state = state.data
                 );
                 To::done()
             })
@@ -3448,7 +4229,10 @@ mod tests {
         let job = Job::builder()
             .state(state.clone())
             .step(|cx, _| async move {
-                let mut data = cx.state.data.lock().expect("Mutex should not be poisoned");
+                let Context::Step { state, .. } = cx else {
+                    return Err(TaskError::Fatal("Expected step context.".into()));
+                };
+                let mut data = state.data.lock().expect("Mutex should not be poisoned");
                 *data = "bar".to_string();
                 To::done()
             })
@@ -3481,10 +4265,13 @@ mod tests {
             message: String,
         }
 
-        async fn step(cx: StepContext<State>, Input { message }: Input) -> TaskResult<To<()>> {
+        async fn step(cx: Context<State, ()>, Input { message }: Input) -> TaskResult<To<()>> {
+            let Context::Step { state, .. } = cx else {
+                return Err(TaskError::Fatal("Expected step context.".into()));
+            };
             println!(
                 "Executing job with message: {message} and state: {data}",
-                data = cx.state.data
+                data = state.data
             );
             To::done()
         }
@@ -3891,10 +4678,19 @@ mod tests {
     #[sqlx::test]
     async fn one_step_context_attributes(pool: PgPool) -> sqlx::Result<(), Error> {
         let job = Job::builder()
-            .step(|ctx, _| async move {
-                assert_eq!(ctx.step_index, 0);
-                assert_eq!(ctx.step_count, 1);
-                assert_eq!(ctx.queue_name.as_str(), "one_step_context_attributes");
+            .step(|cx, _| async move {
+                let Context::Step {
+                    step_index,
+                    step_count,
+                    queue_name,
+                    ..
+                } = cx
+                else {
+                    return Err(TaskError::Fatal("Expected step context.".into()));
+                };
+                assert_eq!(step_index, 0);
+                assert_eq!(step_count, 1);
+                assert_eq!(queue_name.as_str(), "one_step_context_attributes");
                 To::done()
             })
             .name("one_step_context_attributes")
@@ -4087,18 +4883,24 @@ mod tests {
                 data: "data".to_string(),
             })
             .step(|cx, Step1 { message }| async move {
+                let Context::Step { state, .. } = cx else {
+                    return Err(TaskError::Fatal("Expected step context.".into()));
+                };
                 println!(
                     "Executing job with message: {message} and state: {state}",
-                    state = cx.state.data
+                    state = state.data
                 );
                 To::next(Step2 {
                     data: message.as_bytes().into(),
                 })
             })
             .step(|cx, Step2 { data }| async move {
+                let Context::Step { state, .. } = cx else {
+                    return Err(TaskError::Fatal("Expected step context.".into()));
+                };
                 println!(
                     "Executing job with data: {data:?} and state: {state}",
-                    state = cx.state.data
+                    state = state.data
                 );
                 To::done()
             })
@@ -4266,9 +5068,13 @@ mod tests {
         };
 
         let job = Job::builder()
-            .state(state)
+            .state(state.clone())
+            .effect_state(state)
             .step(|cx, Step1 { message }| async move {
-                cx.state
+                let Context::Step { state, .. } = cx else {
+                    return Err(TaskError::Fatal("Expected step context.".into()));
+                };
+                state
                     .events
                     .lock()
                     .expect("Mutex should not be poisoned")
@@ -4276,15 +5082,21 @@ mod tests {
                 To::effect(SendEmail { message })
             })
             .effect(|cx, SendEmail { message }| async move {
-                cx.state
+                let Context::Effect { state, .. } = cx else {
+                    return Err(TaskError::Fatal("Expected effect context.".into()));
+                };
+                state
                     .events
                     .lock()
                     .expect("Mutex should not be poisoned")
                     .push("effect".to_string());
-                To::next(Step2 { message })
+                Ok(EffectOutcome::next(Step2 { message }))
             })
             .step(|cx, Step2 { message }| async move {
-                cx.state
+                let Context::Step { state, .. } = cx else {
+                    return Err(TaskError::Fatal("Expected step context.".into()));
+                };
+                state
                     .events
                     .lock()
                     .expect("Mutex should not be poisoned")
@@ -4313,6 +5125,129 @@ mod tests {
                 "step2:hello".to_string()
             ]
         );
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn compensation_runs_on_failure(pool: PgPool) -> sqlx::Result<(), Error> {
+        #[derive(Clone)]
+        struct State {
+            events: Arc<Mutex<Vec<String>>>,
+        }
+
+        #[derive(Serialize, Deserialize)]
+        struct Step1 {
+            message: String,
+        }
+
+        #[derive(Serialize, Deserialize)]
+        struct Step2 {
+            message: String,
+        }
+
+        #[derive(Serialize, Deserialize)]
+        struct SendEmail {
+            message: String,
+        }
+
+        #[derive(Serialize, Deserialize)]
+        struct UndoEmail {
+            message: String,
+        }
+
+        let queue = Queue::builder()
+            .name("compensation_runs_on_failure")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let state = State {
+            events: Arc::clone(&events),
+        };
+
+        let job = Job::builder()
+            .state(state.clone())
+            .effect_state(state)
+            .step(|cx, Step1 { message }| async move {
+                let Context::Step { state, .. } = cx else {
+                    return Err(TaskError::Fatal("Expected step context.".into()));
+                };
+                state
+                    .events
+                    .lock()
+                    .expect("Mutex should not be poisoned")
+                    .push("step1".to_string());
+                To::effect(SendEmail { message })
+            })
+            .effect_with_compensation(
+                |cx, SendEmail { message }| async move {
+                    let Context::Effect { state, .. } = cx else {
+                        return Err(TaskError::Fatal("Expected effect context.".into()));
+                    };
+                    state
+                        .events
+                        .lock()
+                        .expect("Mutex should not be poisoned")
+                        .push(format!("effect:{message}"));
+                    Ok(EffectOutcome::next_with_compensation(
+                        Step2 {
+                            message: message.clone(),
+                        },
+                        UndoEmail { message },
+                    ))
+                },
+                |cx, UndoEmail { message }| async move {
+                    let Context::Effect { state, .. } = cx else {
+                        return Err(TaskError::Fatal("Expected effect context.".into()));
+                    };
+                    state
+                        .events
+                        .lock()
+                        .expect("Mutex should not be poisoned")
+                        .push(format!("compensate:{message}"));
+                    Ok(())
+                },
+            )
+            .step(|_cx, _input: Step2| async move { Err(TaskError::Fatal("boom".into())) })
+            .queue(queue.clone())
+            .build()
+            .await?;
+
+        job.enqueue(&Step1 {
+            message: "hello".to_string(),
+        })
+        .await?;
+
+        job.worker().process_next_task().await?;
+        job.effect_worker().process_next_task().await?;
+        job.worker().process_next_task().await?;
+        job.effect_worker().process_next_task().await?;
+
+        let events = events.lock().expect("Mutex should not be poisoned").clone();
+        assert_eq!(
+            events,
+            vec![
+                "step1".to_string(),
+                "effect:hello".to_string(),
+                "compensate:hello".to_string()
+            ]
+        );
+
+        let job_effect = sqlx::query!(
+            r#"
+            select
+              compensation_enqueued_at is not null as "compensation_enqueued!: bool",
+              compensated_at is not null as "compensated!: bool"
+            from underway.job_effect
+            "#,
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert!(job_effect.compensation_enqueued);
+        assert!(job_effect.compensated);
 
         Ok(())
     }
