@@ -17,7 +17,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build the job.
     let job = Job::builder()
         .step(|_ctx, input| async move { To::effect(input) })
-        .effect(|_ctx, ()| async move {
+        .effect_fn(|_ctx, ()| async move {
             println!("Hello, World!");
             Ok(EffectOutcome::done())
         })

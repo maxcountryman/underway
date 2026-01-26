@@ -162,7 +162,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let job = Job::builder()
         .effect_state(State { openai_client })
         .step(|_cx, _| async move { To::effect(FetchTopStories) })
-        .effect(|_cx, FetchTopStories| async move {
+        .effect_fn(|_cx, FetchTopStories| async move {
             tracing::info!("Retrieving the top five stories from Hacker News");
 
             let top_stories = fetch_top_stories().await.retryable()?;
@@ -172,7 +172,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 top_stories: top_five,
             }))
         })
-        .effect(|cx, Summarize { top_stories }| async move {
+        .effect_fn(|cx, Summarize { top_stories }| async move {
             tracing::info!("Summarizing top five story discussions");
 
             let state = cx.effect_state().expect("effect context");

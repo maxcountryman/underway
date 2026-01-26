@@ -80,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build the job.
     let job = Job::builder()
         .step(|_cx, input| async move { To::effect(input) })
-        .effect(
+        .effect_fn(
             |_cx,
              WelcomeEmail {
                  user_id,
@@ -116,7 +116,8 @@ Ok(())
 When a step returns `To::effect`, the next step type is chosen by the effect
 handler. If you need to branch between `next`/`done` and an effect, use
 `To::effect_for` or `To::done_for` to keep the next step type explicit. Effect
-handlers can do the same with `EffectOutcome::effect_for`.
+handlers can do the same with `EffectOutcome::effect_for`. Effects are types
+that implement `Effect`; use `effect_fn` or `EffectFn` to adapt closures.
 
 ## Order receipts
 
@@ -168,7 +169,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // We proceed to the effect handler with the receipt_key as its input.
             To::effect(EmailReceipt { receipt_key })
         })
-        .effect(|_cx, EmailReceipt { receipt_key }| async move {
+        .effect_fn(|_cx, EmailReceipt { receipt_key }| async move {
             // Retrieve the PDF from the object store, and send the email.
             println!("Emailing receipt for {receipt_key}");
             Ok(EffectOutcome::done())

@@ -25,13 +25,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build the job.
     let job = Job::builder()
         .step(|_ctx, input| async move { To::effect(input) })
-        .effect(
+        .effect_fn(
             |_ctx,
-            WelcomeEmail {
-                user_id,
-                email,
-                name,
-            }| async move {
+             WelcomeEmail {
+                 user_id,
+                 email,
+                 name,
+             }| async move {
                 // Simulate sending an email.
                 println!("Sending welcome email to {name} <{email}> (user_id: {user_id})");
                 Ok(EffectOutcome::done())

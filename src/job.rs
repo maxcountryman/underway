@@ -262,6 +262,8 @@
 //! If a step needs to branch between `next`, `done`, and `effect`, use
 //! [`To::effect_for`] or [`To::done_for`] to keep the next step type explicit.
 //! Effect handlers have the same pattern via [`EffectOutcome::effect_for`].
+//! Effects are defined by types that implement [`Effect`]. Use `effect_fn` or
+//! [`EffectFn`] to adapt closures when you don't want a named type.
 //!
 //! ```rust
 //! use serde::{Deserialize, Serialize};
@@ -286,7 +288,7 @@
 //!             To::next(Step2)
 //!         }
 //!     })
-//!     .effect(|_cx, SendEmail| async move { Ok(EffectOutcome::next(Step2)) })
+//!     .effect_fn(|_cx, SendEmail| async move { Ok(EffectOutcome::next(Step2)) })
 //!     .step(|_cx, Step2| async move { To::done() });
 //! ```
 //!
@@ -314,7 +316,7 @@
 //!         // Persist state to the database here.
 //!         To::effect(SendEmail { user_id })
 //!     })
-//!     .effect(|_cx, SendEmail { user_id }| async move {
+//!     .effect_fn(|_cx, SendEmail { user_id }| async move {
 //!         // Perform the external side effect.
 //!         println!("Sending email for user {user_id}");
 //!         Ok(EffectOutcome::next(FinishSub { user_id }))
@@ -2846,6 +2848,8 @@ impl<N, C> EffectOutcome<N, NoEffect, C> {
 }
 
 /// Trait describing an effect with optional compensation.
+///
+/// Use [`NoCompensation`] when the effect does not require rollback.
 pub trait Effect: Send + Sync + 'static {
     /// Shared step state type.
     type StepState: Clone + Send + Sync + 'static;
@@ -2914,7 +2918,8 @@ where
     }
 }
 
-struct NoCompensate;
+#[doc(hidden)]
+pub struct NoCompensate;
 
 trait CompensateFn<StepState, EffectState, CompInput>: Send + Sync + 'static {
     type Fut: Future<Output = TaskResult<()>> + Send;
@@ -2945,16 +2950,21 @@ where
     }
 }
 
-struct EffectClosure<Exec, Comp, StepState, EffectState, Input, Next, NextEffect, CompInput> {
+/// Closure adapter for [`Effect`] handlers.
+///
+/// Use [`EffectFn::new`] for a simple effect handler, or
+/// [`EffectFn::with_compensation`] to register a compensation callback.
+pub struct EffectFn<Exec, Comp, StepState, EffectState, Input, Next, NextEffect, CompInput> {
     exec: Exec,
     compensate: Comp,
     _marker: PhantomData<(StepState, EffectState, Input, Next, NextEffect, CompInput)>,
 }
 
 impl<Exec, StepState, EffectState, Input, Next, NextEffect>
-    EffectClosure<Exec, NoCompensate, StepState, EffectState, Input, Next, NextEffect, NoCompensation>
+    EffectFn<Exec, NoCompensate, StepState, EffectState, Input, Next, NextEffect, NoCompensation>
 {
-    fn new(exec: Exec) -> Self {
+    /// Create an effect handler from a closure.
+    pub fn new(exec: Exec) -> Self {
         Self {
             exec,
             compensate: NoCompensate,
@@ -2962,11 +2972,12 @@ impl<Exec, StepState, EffectState, Input, Next, NextEffect>
         }
     }
 
-    fn with_compensation<Comp, CompInput>(
+    /// Attach a compensation handler to this effect.
+    pub fn with_compensation<Comp, CompInput>(
         self,
         compensate: Comp,
-    ) -> EffectClosure<Exec, Comp, StepState, EffectState, Input, Next, NextEffect, CompInput> {
-        EffectClosure {
+    ) -> EffectFn<Exec, Comp, StepState, EffectState, Input, Next, NextEffect, CompInput> {
+        EffectFn {
             exec: self.exec,
             compensate,
             _marker: PhantomData,
@@ -2984,7 +2995,7 @@ impl<
         NextEffect,
         CompInput,
         ExecFut,
-    > Effect for EffectClosure<Exec, Comp, StepState, EffectState, Input, Next, NextEffect, CompInput>
+    > Effect for EffectFn<Exec, Comp, StepState, EffectState, Input, Next, NextEffect, CompInput>
 where
     StepState: Clone + Send + Sync + 'static,
     EffectState: Clone + Send + Sync + 'static,
@@ -3794,13 +3805,27 @@ where
     ///
     /// let job_builder = Job::<(), ()>::builder()
     ///     .step(|_cx, _| async move { To::effect(SendEmail { user_id: 42 }) })
-    ///     .effect(|_cx, SendEmail { user_id }| async move {
+    ///     .effect_fn(|_cx, SendEmail { user_id }| async move {
     ///         // send the email
     ///         Ok(EffectOutcome::next(NextStep { user_id }))
     ///     })
     ///     .step(|_cx, _| async move { To::done() });
     /// ```
-    pub fn effect<F, Fut, Next, NextEffect>(
+    pub fn effect<Eff>(
+        self,
+        effect: Eff,
+    ) -> Builder<I, Eff::Next, Eff::NextEffect, StepState, EffectState, StepSet<Eff::Next, Eff::NextEffect>>
+    where
+        Eff: Effect<StepState = StepState, EffectState = EffectState, Input = Pending::Input>,
+        Eff::Next: Serialize + Send + Sync + 'static,
+        Eff::NextEffect: Serialize + Send + Sync + 'static,
+        Eff::Compensation: DeserializeOwned + Serialize + Send + Sync + 'static,
+    {
+        self.effect_handler(effect)
+    }
+
+    /// Add an effect handler using a closure.
+    pub fn effect_fn<F, Fut, Next, NextEffect>(
         self,
         func: F,
     ) -> Builder<I, Next, NextEffect, StepState, EffectState, StepSet<Next, NextEffect>>
@@ -3812,11 +3837,10 @@ where
         Next: Serialize + Send + Sync + 'static,
         NextEffect: Serialize + Send + Sync + 'static,
     {
-        let effect = EffectClosure::new(func);
-        self.effect_handler(effect)
+        self.effect(EffectFn::new(func))
     }
 
-    /// Add an effect handler with a compensation callback.
+    /// Add an effect handler with a compensation callback using closures.
     pub fn effect_with_compensation<F, Fut, Comp, CompFut, Next, NextEffect, CompInput>(
         self,
         func: F,
@@ -3833,8 +3857,7 @@ where
         NextEffect: Serialize + Send + Sync + 'static,
         CompInput: DeserializeOwned + Serialize + Send + Sync + 'static,
     {
-        let effect = EffectClosure::new(func).with_compensation(compensate);
-        self.effect_handler(effect)
+        self.effect(EffectFn::new(func).with_compensation(compensate))
     }
 }
 
@@ -5081,7 +5104,7 @@ mod tests {
                     .push("step1".to_string());
                 To::effect(SendEmail { message })
             })
-            .effect(|cx, SendEmail { message }| async move {
+            .effect_fn(|cx, SendEmail { message }| async move {
                 let Context::Effect { state, .. } = cx else {
                     return Err(TaskError::Fatal("Expected effect context.".into()));
                 };

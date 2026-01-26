@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 To::next(Finalize { user_id })
             }
         })
-        .effect(|_cx, SendEmail { user_id }| async move {
+        .effect_fn(|_cx, SendEmail { user_id }| async move {
             tracing::info!("Sending email for user {user_id}");
             Ok(EffectOutcome::next(Finalize { user_id }))
         })
