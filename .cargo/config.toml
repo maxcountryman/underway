@@ -1,0 +1,2 @@
+[env]
+DATABASE_URL = { value = "postgres://postgres:postgres@localhost:5432/underway", force = false }

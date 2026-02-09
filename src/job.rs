@@ -40,7 +40,8 @@
 //! Notice that the first argument to our function is [a context
 //! binding](crate::job::Context). This provides access to fields like
 //! [`state`](crate::job::Context::state) and
-//! [`tx`](crate::job::Context::tx).
+//! [`job_id`](crate::job::Context::job_id), as well as workflow helpers like
+//! [`call`](crate::job::Context::call) and [`emit`](crate::job::Context::emit).
 //!
 //! The second argument is a type we provide as input to the step. In our
 //! example it's the unit type. But if we were to specify another type it would
@@ -248,47 +249,15 @@
 //! will have access to the same state. For this reason, this pattern is
 //! discouraged.
 //!
-//! # Atomicity
+//! # Durable side effects
 //!
-//! Apart from state, context also provides another useful field: a transaction
-//! that's shared with the worker.
+//! Step context intentionally avoids exposing a database transaction directly.
+//! This keeps step execution sound while preserving closure ergonomics for
+//! `step`.
 //!
-//! Access to this transaction means we can make updates to the database that
-//! are only visible if the execution itself succeeds and the transaction is
-//! committed by the worker.
-//!
-//! ```rust
-//! use serde::{Deserialize, Serialize};
-//! use underway::{job::Context, Job, To};
-//!
-//! #[derive(Serialize, Deserialize)]
-//! struct UserSub {
-//!     user_id: i64,
-//! }
-//!
-//! let job_builder =
-//!     Job::<_, ()>::builder().step(|Context { mut tx, .. }, UserSub { user_id }| async move {
-//!         sqlx::query(
-//!             r#"
-//!             update user
-//!             set subscribed_at = now()
-//!             where id = $1
-//!             "#,
-//!         )
-//!         .bind(user_id)
-//!         .fetch_one(&mut *tx)
-//!         .await?;
-//!
-//!         tx.commit().await?;
-//!
-//!         To::done()
-//!     });
-//! ```
-//!
-//! The special thing about this code is that we've leveraged the transaction
-//! provided by the context to make an update to the user table. What this means
-//! is the execution either succeeds and this update becomes visible or it
-//! doesn't and it's like nothing ever happened.
+//! If a workflow needs direct transaction-level database semantics, implement
+//! [`Task`] directly and use its `execute` method, which receives
+//! a transaction.
 //!
 //! # Retry policies
 //!
@@ -646,15 +615,21 @@
 //! desired.
 
 use std::{
-    future::Future, marker::PhantomData, mem, ops::Deref, pin::Pin, result::Result as StdResult,
-    sync::Arc, task::Poll,
+    collections::HashMap,
+    future::Future,
+    marker::PhantomData,
+    ops::Deref,
+    pin::Pin,
+    result::Result as StdResult,
+    sync::{Arc, Mutex},
+    task::Poll,
 };
 
 use builder_states::{Initial, PoolSet, QueueNameSet, QueueSet, StateSet, StepSet};
 use jiff::{Span, ToSpan};
 use sealed::JobState;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use sqlx::{PgExecutor, PgPool, Postgres, Transaction};
+use sqlx::{PgConnection, PgExecutor, PgPool, Postgres, Transaction};
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
@@ -662,7 +637,9 @@ use ulid::Ulid;
 use uuid::Uuid;
 
 use crate::{
+    activity,
     queue::{Error as QueueError, InProgressTask, Queue},
+    runtime::Runtime,
     scheduler::{Error as SchedulerError, Scheduler, ZonedSchedule},
     task::{
         Error as TaskError, Result as TaskResult, RetryPolicy, State as TaskState, Task, TaskId,
@@ -716,16 +693,6 @@ pub struct Context<S> {
     /// relied on when durability is needed.
     pub state: S,
 
-    /// A savepoint that originates from the worker executing the task.
-    ///
-    /// This is useful for ensuring atomicity: writes made to the database with
-    /// this handle are only realized if the worker succeeds in processing
-    /// the task.
-    ///
-    /// Put another way, this savepoint is derived from the same transaction
-    /// that holds the lock on the underlying task row.
-    pub tx: Transaction<'static, Postgres>,
-
     /// Current index of the step being executed zero-based.
     ///
     /// In multi-step job definitions, this points to the current step the job
@@ -744,6 +711,189 @@ pub struct Context<S> {
     ///
     /// Name of the queue the current step is currently running on.
     pub queue_name: String,
+
+    activity_call_buffer: Arc<Mutex<ActivityCallBuffer>>,
+}
+
+#[derive(Clone, sqlx::FromRow)]
+struct ActivityCallRecord {
+    call_key: String,
+    activity: String,
+    input: serde_json::Value,
+    output: Option<serde_json::Value>,
+    error: Option<serde_json::Value>,
+    state: String,
+}
+
+#[derive(Clone)]
+struct ActivityCallCommand {
+    call_key: String,
+    activity: String,
+    input: serde_json::Value,
+}
+
+#[derive(Default)]
+struct ActivityCallBuffer {
+    records: HashMap<String, ActivityCallRecord>,
+    commands: Vec<ActivityCallCommand>,
+}
+
+impl ActivityCallBuffer {
+    fn new(records: Vec<ActivityCallRecord>) -> Self {
+        Self {
+            records: records
+                .into_iter()
+                .map(|record| (record.call_key.clone(), record))
+                .collect(),
+            commands: Vec::new(),
+        }
+    }
+
+    fn register_call(
+        &mut self,
+        key: &str,
+        activity: &str,
+        input: &serde_json::Value,
+    ) -> TaskResult<ActivityCallRecord> {
+        if let Some(record) = self.records.get(key) {
+            if record.activity != activity {
+                return Err(TaskError::Fatal(format!(
+                    "Non-deterministic activity call detected: key `{key}` was previously bound \
+                     to `{previous}` but now `{current}`.",
+                    previous = record.activity,
+                    current = activity,
+                )));
+            }
+
+            if record.input != *input {
+                return Err(TaskError::Fatal(format!(
+                    "Non-deterministic activity call input detected for key `{key}`."
+                )));
+            }
+
+            return Ok(record.clone());
+        }
+
+        let record = ActivityCallRecord {
+            call_key: key.to_string(),
+            activity: activity.to_string(),
+            input: input.clone(),
+            output: None,
+            error: None,
+            state: "pending".to_string(),
+        };
+
+        self.records.insert(key.to_string(), record.clone());
+        self.commands.push(ActivityCallCommand {
+            call_key: key.to_string(),
+            activity: activity.to_string(),
+            input: input.clone(),
+        });
+
+        Ok(record)
+    }
+
+    fn drain_commands(&mut self) -> Vec<ActivityCallCommand> {
+        std::mem::take(&mut self.commands)
+    }
+}
+
+impl<S> Context<S> {
+    /// Emits a durable fire-and-forget activity call.
+    pub async fn emit<T>(
+        &self,
+        key: impl Into<String>,
+        activity: impl Into<String>,
+        input: &T,
+    ) -> TaskResult<()>
+    where
+        T: Serialize + ?Sized,
+    {
+        let key = key.into();
+        let activity = activity.into();
+        let input = serde_json::to_value(input).map_err(|err| TaskError::Fatal(err.to_string()))?;
+
+        self.register_activity_call(&key, &activity, &input)?;
+
+        Ok(())
+    }
+
+    /// Calls an activity and waits for its durable result.
+    ///
+    /// If the call has not completed yet this returns
+    /// [`task::Error::Suspended`](crate::task::Error::Suspended).
+    pub async fn call<O, T>(
+        &self,
+        key: impl Into<String>,
+        activity: impl Into<String>,
+        input: &T,
+    ) -> TaskResult<O>
+    where
+        O: DeserializeOwned,
+        T: Serialize + ?Sized,
+    {
+        let key = key.into();
+        let activity = activity.into();
+        let input = serde_json::to_value(input).map_err(|err| TaskError::Fatal(err.to_string()))?;
+
+        let record = self.register_activity_call(&key, &activity, &input)?;
+
+        match record.state.as_str() {
+            "succeeded" => {
+                let output = record.output.ok_or_else(|| {
+                    TaskError::Fatal(format!(
+                        "Missing output for activity call `{activity}` with key `{key}`."
+                    ))
+                })?;
+
+                serde_json::from_value(output).map_err(|err| TaskError::Fatal(err.to_string()))
+            }
+
+            "failed" => {
+                let error = record
+                    .error
+                    .and_then(|value| serde_json::from_value::<activity::Error>(value).ok())
+                    .unwrap_or_else(|| {
+                        activity::Error::fatal(
+                            "activity_call_failed",
+                            format!(
+                                "Activity call `{activity}` with key `{key}` failed without an \
+                                 error envelope."
+                            ),
+                        )
+                    });
+
+                if error.retryable {
+                    Err(TaskError::Retryable(error.to_string()))
+                } else {
+                    Err(TaskError::Fatal(error.to_string()))
+                }
+            }
+
+            "pending" | "in_progress" => Err(TaskError::Suspended(format!(
+                "Waiting on activity call `{activity}` with key `{key}`"
+            ))),
+
+            state => Err(TaskError::Fatal(format!(
+                "Unexpected activity call state `{state}` for activity `{activity}` with key \
+                 `{key}`."
+            ))),
+        }
+    }
+
+    fn register_activity_call(
+        &self,
+        key: &str,
+        activity: &str,
+        input: &serde_json::Value,
+    ) -> TaskResult<ActivityCallRecord> {
+        let mut activity_call_buffer = self
+            .activity_call_buffer
+            .lock()
+            .map_err(|_| TaskError::Fatal("Activity call buffer lock was poisoned.".to_string()))?;
+
+        activity_call_buffer.register_call(key, activity, input)
+    }
 }
 
 struct StepConfig<S> {
@@ -1578,6 +1728,38 @@ where
         Arc::clone(&self.queue)
     }
 
+    /// Creates a [`Runtime`] for this job.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use sqlx::PgPool;
+    /// # use underway::{Job, To};
+    /// # use tokio::runtime::Runtime as TokioRuntime;
+    /// # fn main() {
+    /// # let rt = TokioRuntime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    /// # let job = Job::<(), _>::builder()
+    /// #     .step(|_cx, _| async move { To::done() })
+    /// #     .name("example")
+    /// #     .pool(pool)
+    /// #     .build()
+    /// #     .await?;
+    /// # /*
+    /// let job = { /* A `Job`. */ };
+    /// # */
+    /// #
+    /// let runtime = job.runtime();
+    /// runtime.run().await?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # });
+    /// # }
+    /// ```
+    pub fn runtime(&self) -> Runtime<I, S> {
+        Runtime::new(self.clone())
+    }
+
     /// Creates a `Worker` for this job.
     ///
     /// # Example
@@ -1779,6 +1961,81 @@ where
             .map(|step| step.task_config.clone())
             .unwrap_or_default()
     }
+
+    async fn fetch_activity_calls(
+        &self,
+        conn: &mut PgConnection,
+        job_id: JobId,
+        step_index: usize,
+    ) -> TaskResult<Vec<ActivityCallRecord>> {
+        sqlx::query_as!(
+            ActivityCallRecord,
+            r#"
+            select
+                call_key,
+                activity,
+                input,
+                output,
+                error,
+                state::text as "state!"
+            from underway.activity_call
+            where task_queue_name = $1
+              and job_id = $2
+              and step_index = $3
+            "#,
+            self.queue.name,
+            *job_id,
+            step_index as i32,
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(TaskError::from)
+    }
+
+    async fn persist_activity_call_commands(
+        &self,
+        conn: &mut PgConnection,
+        job_id: JobId,
+        step_index: usize,
+        activity_call_buffer: &Arc<Mutex<ActivityCallBuffer>>,
+    ) -> TaskResult<()> {
+        let commands = {
+            let mut activity_call_buffer = activity_call_buffer.lock().map_err(|_| {
+                TaskError::Fatal("Activity call buffer lock was poisoned.".to_string())
+            })?;
+            activity_call_buffer.drain_commands()
+        };
+
+        for command in commands {
+            sqlx::query!(
+                r#"
+                insert into underway.activity_call (
+                    id,
+                    task_queue_name,
+                    job_id,
+                    step_index,
+                    call_key,
+                    activity,
+                    input,
+                    state
+                ) values ($1, $2, $3, $4, $5, $6, $7, 'pending'::underway.activity_call_state)
+                on conflict (task_queue_name, job_id, step_index, call_key) do nothing
+                "#,
+                Uuid::new_v4(),
+                self.queue.name,
+                *job_id,
+                step_index as i32,
+                command.call_key,
+                command.activity,
+                command.input,
+            )
+            .execute(&mut *conn)
+            .await
+            .map_err(TaskError::from)?;
+        }
+
+        Ok(())
+    }
 }
 
 impl<I, S> Task for Job<I, S>
@@ -1814,39 +2071,32 @@ where
         }
 
         let step = &self.steps[step_index].executor;
-
-        // SAFETY:
-        //
-        // We are extending the lifetime of `tx` to `'static` to satisfy the trait
-        // object requirements in `StepExecutor`. This is sound because:
-        //
-        // 1. The `execute` method awaits the future returned by `execute_step`
-        //    immediately, ensuring that `tx` remains valid during the entire operation.
-        // 2. `step_tx` does not escape the scope of the `execute` method; it is not
-        //    stored or moved elsewhere.
-        // 3. The `Context` and any data derived from `step_tx` are used only within the
-        //    `execute_step` method and its returned future.
-        //
-        // As a result, even though we are claiming a `'static` lifetime for `tx`, we
-        // ensure that it does not actually outlive its true lifetime, maintaining
-        // soundness.
-        //
-        // Note: This is a workaround due to limitations with trait objects and
-        // lifetimes in async contexts. Be cautious with any changes that might
-        // allow `step_tx` to outlive `tx`.
-        let step_tx: Transaction<'static, Postgres> = unsafe { mem::transmute_copy(&tx) };
+        let activity_call_buffer = Arc::new(Mutex::new(ActivityCallBuffer::new(
+            self.fetch_activity_calls(&mut tx, job_id, step_index)
+                .await?,
+        )));
 
         let cx = Context {
             state: self.state.clone(),
-            tx: step_tx,
             step_index,
             job_id,
             step_count: self.steps.len(),
             queue_name: self.queue.name.clone(),
+            activity_call_buffer: Arc::clone(&activity_call_buffer),
         };
 
         // Execute the step and handle any errors.
-        let step_result = match step.execute_step(cx, step_input).await {
+        let step_result = step.execute_step(cx, step_input).await;
+
+        // Persist activity call intents only when step execution reached a
+        // transactional boundary (`Ok`) or intentionally suspended.
+        if matches!(step_result.as_ref(), Ok(_) | Err(TaskError::Suspended(_))) {
+            self.persist_activity_call_commands(&mut tx, job_id, step_index, &activity_call_buffer)
+                .await?;
+        }
+
+        // Execute the step and handle any errors.
+        let step_result = match step_result {
             Ok(result) => result,
             Err(err) => {
                 // N.B.: Commit the transaction to ensure attempt rows are persisted.
@@ -3366,6 +3616,154 @@ mod tests {
         let task_id = job.worker().process_next_task().await?;
 
         assert!(task_id.is_some());
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn call_suspends_and_persists_activity_intent(pool: PgPool) -> sqlx::Result<(), Error> {
+        #[derive(Serialize, Deserialize)]
+        struct Input {
+            message: String,
+        }
+
+        let job = Job::builder()
+            .step(|cx, Input { message }| async move {
+                let _: String = cx.call("echo-main", "echo", &message).await?;
+                To::done()
+            })
+            .name("call_suspends_and_persists_activity_intent")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let enqueued = job
+            .enqueue(&Input {
+                message: "hello".to_string(),
+            })
+            .await?;
+
+        job.worker().process_next_task().await?;
+
+        let task_state = sqlx::query_scalar!(
+            r#"
+            select state as "state: TaskState"
+            from underway.task
+            where task_queue_name = $1
+              and (input->>'job_id')::uuid = $2
+            "#,
+            job.queue.name,
+            *enqueued.id,
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(task_state, TaskState::Waiting);
+
+        let call_row = sqlx::query!(
+            r#"
+            select state::text as "state!"
+            from underway.activity_call
+            where task_queue_name = $1
+              and job_id = $2
+              and step_index = $3
+              and call_key = $4
+            "#,
+            job.queue.name,
+            *enqueued.id,
+            0_i32,
+            "echo-main",
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(call_row.state, "pending");
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn emit_not_persisted_on_retryable_failure(pool: PgPool) -> sqlx::Result<(), Error> {
+        #[derive(Serialize, Deserialize)]
+        struct Input {
+            message: String,
+        }
+
+        let job = Job::builder()
+            .step(|cx, Input { message }| async move {
+                cx.emit("notify", "email", &message).await?;
+                Err(TaskError::Retryable("retry me".to_string()))
+            })
+            .name("emit_not_persisted_on_retryable_failure")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let enqueued = job
+            .enqueue(&Input {
+                message: "hello".to_string(),
+            })
+            .await?;
+
+        job.worker().process_next_task().await?;
+
+        let activity_call_count = sqlx::query_scalar!(
+            r#"
+            select count(*)::int as "count!"
+            from underway.activity_call
+            where task_queue_name = $1
+              and job_id = $2
+            "#,
+            job.queue.name,
+            *enqueued.id,
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(activity_call_count, 0);
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn emit_persisted_on_success(pool: PgPool) -> sqlx::Result<(), Error> {
+        #[derive(Serialize, Deserialize)]
+        struct Input {
+            message: String,
+        }
+
+        let job = Job::builder()
+            .step(|cx, Input { message }| async move {
+                cx.emit("notify", "email", &message).await?;
+                To::done()
+            })
+            .name("emit_persisted_on_success")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let enqueued = job
+            .enqueue(&Input {
+                message: "hello".to_string(),
+            })
+            .await?;
+
+        job.worker().process_next_task().await?;
+
+        let activity_call_count = sqlx::query_scalar!(
+            r#"
+            select count(*)::int as "count!"
+            from underway.activity_call
+            where task_queue_name = $1
+              and job_id = $2
+            "#,
+            job.queue.name,
+            *enqueued.id,
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(activity_call_count, 1);
 
         Ok(())
     }

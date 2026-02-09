@@ -138,6 +138,13 @@ pub enum Error {
     #[error("Task timed out after {0} during execution")]
     TimedOut(SignedDuration),
 
+    /// Indicates execution has suspended while waiting for external work.
+    ///
+    /// This is used by workflow-style tasks that need to pause until a durable
+    /// side effect completes.
+    #[error("{0}")]
+    Suspended(String),
+
     /// Error indicating that the task has encountered an unrecoverable error
     /// state.
     ///
@@ -619,6 +626,9 @@ pub enum State {
 
     /// Currently being processed.
     InProgress,
+
+    /// Execution suspended while waiting for external activity completion.
+    Waiting,
 
     /// Execute completed successfully.
     Succeeded,

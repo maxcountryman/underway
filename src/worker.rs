@@ -901,6 +901,12 @@ impl<T: Task + Sync> Worker<T> {
     ) -> Result {
         tracing::error!(err = %error, "Task execution encountered an error");
 
+        if let TaskError::Suspended(reason) = error {
+            tracing::info!(%reason, "Task execution suspended");
+            in_progress_task.mark_waiting(conn).await?;
+            return Ok(());
+        }
+
         // Short-circuit on fatal errors.
         if matches!(error, TaskError::Fatal(_)) {
             return self.finalize_task_failure(conn, in_progress_task).await;

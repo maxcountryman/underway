@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            update underway.task\n            set state = 'pending'::underway.task_state,\n                delay = interval '0',\n                updated_at = now()\n            where task_queue_name = $1\n              and state = 'waiting'::underway.task_state\n              and (input->>'job_id')::uuid = $2\n              and (input->>'step_index')::integer = $3\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1941d0b76c0bd110eef40337b184c27d37ae9140899cdadb2ac543fc079f532a"
+}

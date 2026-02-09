@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            select state as \"state: TaskState\", completed_at as \"completed_at: i64\"\n            from underway.task where id = $1\n            ",
+  "query": "\n            select state as \"state: TaskState\"\n            from underway.task\n            where task_queue_name = $1\n              and (input->>'job_id')::uuid = $2\n            ",
   "describe": {
     "columns": [
       {
@@ -21,22 +21,17 @@
             }
           }
         }
-      },
-      {
-        "ordinal": 1,
-        "name": "completed_at: i64",
-        "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
+        "Text",
         "Uuid"
       ]
     },
     "nullable": [
-      false,
-      true
+      false
     ]
   },
-  "hash": "040f20db39c70255af32875141672da4cc97ae685f948cbd7798dd287b1dabfb"
+  "hash": "92a57fbed42294333b6b8438d8d735f74dad8a76df7029737212fab9e2176c8d"
 }

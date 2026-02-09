@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            update underway.activity_call_attempt\n            set state = 'succeeded'::underway.activity_call_state,\n                updated_at = now(),\n                completed_at = now()\n            where activity_call_id = $1\n              and attempt_number = $2\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "fd9a853649dd8000798a96b00fb885dc68043ee5f7d4c4aba004f794c0034f2a"
+}

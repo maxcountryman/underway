@@ -1421,6 +1421,67 @@ impl InProgressTask {
         Ok(())
     }
 
+    pub(crate) async fn mark_waiting(&self, conn: &mut PgConnection) -> Result {
+        // Update the task attempt row.
+        let result = sqlx::query!(
+            r#"
+            update underway.task_attempt
+            set state = $3,
+                updated_at = now()
+            where task_id = $1
+              and task_queue_name = $2
+              and attempt_number = $4
+              and attempt_number = (
+                  select attempt_number
+                  from underway.task_attempt
+                  where task_id = $1
+                    and task_queue_name = $2
+                  order by attempt_number desc
+                  limit 1
+              )
+            "#,
+            self.id as TaskId,
+            self.queue_name,
+            TaskState::Waiting as TaskState,
+            self.attempt_number,
+        )
+        .execute(&mut *conn)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(Error::TaskNotFound(self.id));
+        }
+
+        // Update the task row.
+        let result = sqlx::query!(
+            r#"
+            update underway.task
+            set state = $2,
+                updated_at = now()
+            where id = $1
+              and task_queue_name = $3
+              and $4 = (
+                  select max(attempt_number)
+                  from underway.task_attempt
+                  where task_id = $1
+                    and task_queue_name = $3
+              )
+            "#,
+            self.id as TaskId,
+            TaskState::Waiting as TaskState,
+            self.queue_name,
+            self.attempt_number,
+        )
+        .execute(&mut *conn)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(Error::TaskNotFound(self.id));
+        }
+
+        Ok(())
+    }
+
     pub(crate) async fn mark_cancelled(&self, conn: &mut PgConnection) -> Result<bool> {
         // Update task attempt row if one exists.
         //

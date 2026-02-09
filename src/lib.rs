@@ -14,7 +14,9 @@
 //! - **PostgreSQL-Backed** Leverages PostgreSQL with `FOR UPDATE SKIP LOCKED`
 //!   for reliable task storage and coordination.
 //! - **Atomic Task Management**: Enqueue tasks within your transactions and use
-//!   the worker's transaction within your tasks for atomic queries.
+//!   the `Task` API transaction for atomic database queries.
+//! - **Durable Workflow Effects**: Use workflow context call/emit primitives
+//!   with registered activities for durable side-effect execution.
 //! - **Automatic Retries**: Configurable retry strategies ensure tasks are
 //!   reliably completed, even after transient failures.
 //! - **Cron-Like Scheduling**: Schedule recurring tasks with cron-like
@@ -304,19 +306,25 @@
 //!
 //! [SoC]: https://en.wikipedia.org/wiki/Separation_of_concerns
 #![warn(clippy::all, nonstandard_style, future_incompatible, missing_docs)]
+#![forbid(unsafe_code)]
 
 use sqlx::{migrate::Migrator, Acquire, Postgres};
 
 pub use crate::{
+    activity::{Activity, Error as ActivityError},
     job::{Job, To},
     queue::Queue,
+    runtime::Runtime,
     scheduler::{Scheduler, ZonedSchedule},
     task::{Task, ToTaskResult},
     worker::Worker,
 };
 
+pub mod activity;
+mod activity_worker;
 pub mod job;
 pub mod queue;
+pub mod runtime;
 mod scheduler;
 pub mod task;
 pub mod worker;
