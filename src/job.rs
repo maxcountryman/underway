@@ -549,9 +549,8 @@
 //!
 //! # Running jobs
 //!
-//! Jobs are run via workers and schedulers, where the former processes tasks
-//! and the latter processes schedules for enqueuing tasks. Starting both is
-//! encapsulated by the job interface.
+//! Jobs are run via [`Runtime`], which orchestrates workers,
+//! schedulers, and activity execution.
 //!
 //! ```rust,no_run
 //! # use sqlx::PgPool;
@@ -574,15 +573,15 @@
 //!     .build()
 //!     .await?;
 //!
-//! // This starts the worker and scheduler in the background (non-blocking).
-//! job.start();
+//! // This starts runtime workers in the background (non-blocking).
+//! let runtime_handle = job.runtime().start();
+//! runtime_handle.shutdown().await?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! # });
 //! # }
 //! ```
 //!
-//! Typically starting the job such that our program isn't blocked is desirable.
-//! However, we can also run the job in a blocking manner directly.
+//! We can also run the runtime in a blocking manner directly.
 //!
 //! ```rust,no_run
 //! # use sqlx::PgPool;
@@ -605,8 +604,8 @@
 //!     .build()
 //!     .await?;
 //!
-//! // This starts the worker and scheduler and blocks.
-//! job.run().await?;
+//! // This starts runtime workers and blocks.
+//! job.runtime().run().await?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! # });
 //! # }
@@ -672,7 +671,8 @@
 //! let weekly = "@weekly[America/Los_Angeles]".parse()?;
 //! job.schedule(&weekly, &()).await?;
 //!
-//! job.start();
+//! let runtime_handle = job.runtime().start();
+//! runtime_handle.shutdown().await?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! # });
 //! # }
@@ -690,9 +690,7 @@ use std::{
     marker::PhantomData,
     ops::Deref,
     pin::Pin,
-    result::Result as StdResult,
     sync::{Arc, Mutex},
-    task::Poll,
 };
 
 use builder_states::{Initial, PoolSet, QueueNameSet, QueueSet, StateSet, StepSet};
@@ -700,15 +698,12 @@ use jiff::{Span, ToSpan};
 use sealed::JobState;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sqlx::{PgConnection, PgExecutor, PgPool, Postgres, Transaction};
-use tokio::task::{JoinError, JoinSet};
-use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 use ulid::Ulid;
 use uuid::Uuid;
 
 use crate::{
     activity::{self, registration::Contains, CallState},
-    activity_worker::ActivityWorker,
     queue::{Error as QueueError, InProgressTask, Queue},
     runtime::Runtime,
     scheduler::{Error as SchedulerError, Scheduler, ZonedSchedule},
@@ -739,10 +734,6 @@ pub enum Error {
     #[error(transparent)]
     Scheduler(#[from] SchedulerError),
 
-    /// Error returned from Tokio task joins.
-    #[error(transparent)]
-    Join(#[from] tokio::task::JoinError),
-
     /// Error returned from serde_json.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
@@ -751,9 +742,6 @@ pub enum Error {
     #[error(transparent)]
     Database(#[from] sqlx::Error),
 
-    /// Errors produced while running the activity side-effect worker.
-    #[error("{0}")]
-    Runtime(String),
 }
 
 type JobQueue<T, S, A> = Queue<Job<T, S, A>>;
@@ -1049,85 +1037,6 @@ mod sealed {
         pub step_input: serde_json::Value,
         pub(crate) job_id: JobId,
     } // TODO: Versioning?
-}
-
-/// Container for the runtime of the job instance.
-///
-/// Provides a method to gracefully stop the worker, scheduler, and activity worker.
-pub struct JobHandle {
-    workers: JoinSet<StdResult<Result<()>, JoinError>>,
-    shutdown_token: CancellationToken,
-}
-
-impl JobHandle {
-    /// Signals runtime workers to shutdown and waits for them to finish.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # use sqlx::PgPool;
-    /// # use underway::{Job, To};
-    /// # use tokio::runtime::Runtime;
-    /// # fn main() {
-    /// # let rt = Runtime::new().unwrap();
-    /// # rt.block_on(async {
-    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
-    /// # let job = Job::<(), ()>::builder()
-    /// #     .step(|_cx, _| async move { To::done() })
-    /// #     .name("example")
-    /// #     .pool(pool)
-    /// #     .build()
-    /// #     .await?;
-    /// # /*
-    /// let job = { /* A `Job`. */ };
-    /// # */
-    /// #
-    ///
-    /// let job_handle = job.start();
-    ///
-    /// // Gracefully stop runtime workers.
-    /// job_handle.shutdown().await?;
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// # });
-    /// # }
-    /// ```
-    pub async fn shutdown(mut self) -> Result<()> {
-        self.shutdown_token.cancel();
-
-        // Await all tasks in the join set
-        while let Some(result) = self.workers.join_next().await {
-            match result? {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => return Err(err),
-                Err(join_err) => return Err(join_err.into()),
-            }
-        }
-
-        Ok(())
-    }
-}
-
-impl Unpin for JobHandle {}
-
-impl Future for JobHandle {
-    type Output = StdResult<Result<()>, JoinError>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        // Poll the join set to see if all tasks are done
-        while let Poll::Ready(Some(result)) = self.workers.poll_join_next(cx) {
-            match result? {
-                Ok(Ok(())) => continue,
-                Ok(Err(err)) => return Poll::Ready(Ok(Err(err))),
-                Err(join_err) => return Poll::Ready(Err(join_err)),
-            }
-        }
-
-        if self.workers.is_empty() {
-            Poll::Ready(Ok(Ok(())))
-        } else {
-            Poll::Pending
-        }
-    }
 }
 
 /// Unique identifier of a job.
@@ -1946,137 +1855,6 @@ where
     /// # }
     pub fn scheduler(&self) -> Scheduler<Self> {
         Scheduler::new(self.queue(), self.clone())
-    }
-
-    /// Runs a worker, scheduler, and activity worker for the job.
-    ///
-    /// # Errors
-    ///
-    /// This has the same error conditions as [`Worker::run`] and
-    /// [`Scheduler::run`]. It will also return an error if any spawned runtime
-    /// worker cannot be joined.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # use sqlx::PgPool;
-    /// # use underway::{Job, To};
-    /// # use tokio::runtime::Runtime;
-    /// # fn main() {
-    /// # let rt = Runtime::new().unwrap();
-    /// # rt.block_on(async {
-    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
-    /// # let job = Job::<(), _>::builder()
-    /// #     .step(|_cx, _| async move { To::done() })
-    /// #     .name("example")
-    /// #     .pool(pool)
-    /// #     .build()
-    /// #     .await?;
-    /// # /*
-    /// let job = { /* A `Job`. */ };
-    /// # */
-    /// #
-    ///
-    /// job.run().await?;
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// # });
-    /// # }
-    /// ```
-    pub async fn run(&self) -> Result {
-        let worker = self.worker();
-        let scheduler = self.scheduler();
-        let activity_worker =
-            ActivityWorker::with_registry(self.queue.pool.clone(), self.activity_registry());
-
-        let mut workers = JoinSet::new();
-        workers.spawn(async move { worker.run().await.map_err(Error::from) });
-        workers.spawn(async move { scheduler.run().await.map_err(Error::from) });
-        workers.spawn(async move {
-            activity_worker
-                .run()
-                .await
-                .map_err(|err| Error::Runtime(err.to_string()))
-        });
-
-        while let Some(ret) = workers.join_next().await {
-            match ret {
-                Ok(Err(err)) => return Err(err),
-                Err(err) => return Err(Error::from(err)),
-                _ => continue,
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Starts runtime workers for the job and returns a handle.
-    ///
-    /// The returned handle may be used to gracefully shutdown runtime workers.
-    ///
-    /// # Errors
-    ///
-    /// This has the same error conditions as [`Worker::run`] and
-    /// [`Scheduler::run`]. It will also return an error if any spawned runtime
-    /// worker cannot be joined.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # use sqlx::PgPool;
-    /// # use underway::{Job, To};
-    /// # use tokio::runtime::Runtime;
-    /// # fn main() {
-    /// # let rt = Runtime::new().unwrap();
-    /// # rt.block_on(async {
-    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
-    /// # let job = Job::<(), _>::builder()
-    /// #     .step(|_cx, _| async move { To::done() })
-    /// #     .name("example")
-    /// #     .pool(pool)
-    /// #     .build()
-    /// #     .await?;
-    /// # /*
-    /// let job = { /* A `Job`. */ };
-    /// # */
-    /// #
-    ///
-    /// job.start().await??;
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// # });
-    /// # }
-    /// ```
-    pub fn start(&self) -> JobHandle {
-        let shutdown_token = CancellationToken::new();
-        let mut workers = JoinSet::new();
-
-        let mut worker = self.worker();
-        worker.set_shutdown_token(shutdown_token.clone());
-        let mut scheduler = self.scheduler();
-        scheduler.set_shutdown_token(shutdown_token.clone());
-        let mut activity_worker =
-            ActivityWorker::with_registry(self.queue.pool.clone(), self.activity_registry());
-        activity_worker.set_shutdown_token(shutdown_token.clone());
-
-        // Spawn the tasks using `tokio::spawn` to decouple them from polling the
-        // `Future`.
-        let worker_handle = tokio::spawn(async move { worker.run().await.map_err(Error::from) });
-        let scheduler_handle =
-            tokio::spawn(async move { scheduler.run().await.map_err(Error::from) });
-        let activity_worker_handle = tokio::spawn(async move {
-            activity_worker
-                .run()
-                .await
-                .map_err(|err| Error::Runtime(err.to_string()))
-        });
-
-        workers.spawn(worker_handle);
-        workers.spawn(scheduler_handle);
-        workers.spawn(activity_worker_handle);
-
-        JobHandle {
-            workers,
-            shutdown_token,
-        }
     }
 
     fn first_job_input(&self, input: &I) -> Result<JobState> {
@@ -3421,7 +3199,7 @@ mod tests {
 
         job.enqueue(&()).await?;
 
-        job.start();
+        let runtime_handle = job.runtime().start();
 
         // Give the job a moment to process.
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -3432,6 +3210,10 @@ mod tests {
         );
 
         // Shutdown and wait for a bit to ensure the test can exit.
+        runtime_handle
+            .shutdown()
+            .await
+            .expect("Runtime should shutdown cleanly");
         tokio::spawn(async move { graceful_shutdown(&pool).await });
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 

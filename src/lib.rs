@@ -158,7 +158,8 @@
 //!     .await?;
 //!
 //!     // Start processing enqueued jobs.
-//!     job.start().await??;
+//!     let runtime_handle = job.runtime().start();
+//!     runtime_handle.shutdown().await?;
 //!
 //!     Ok(())
 //! }
@@ -228,7 +229,8 @@
 //!     job.enqueue(&GenerateReceipt { order_id: 42 }).await?;
 //!
 //!     // Start processing enqueued jobs.
-//!     job.start().await??;
+//!     let runtime_handle = job.runtime().start();
+//!     runtime_handle.shutdown().await?;
 //!
 //!     Ok(())
 //! }
@@ -279,7 +281,8 @@
 //!     job.schedule(&daily, &DailyReport).await?;
 //!
 //!     // Start processing enqueued jobs.
-//!     job.start().await??;
+//!     let runtime_handle = job.runtime().start();
+//!     runtime_handle.shutdown().await?;
 //!
 //!     Ok(())
 //! }

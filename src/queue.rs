@@ -66,10 +66,10 @@
 //! their workers, respectively.
 //!
 //! For example, `Job` provides an [`enqueue`](crate::Job::enqueue) method,
-//! which wraps its queue's enqueue method. Likewise, when a job spins up a
-//! worker via its [`run`](crate::Job::run) method, that worker uses its queue's
-//! dequeue method and in both cases there's no need to use the queue methods
-//! directly.
+//! which wraps its queue's enqueue method. Likewise, when a job runtime starts
+//! workers via [`Runtime::run`](crate::Runtime::run), those workers use the
+//! queue's dequeue method and in both cases there's no need to use the queue
+//! methods directly.
 //!
 //! With that said, a queue may be interfaced with directly and operated
 //! manually if desired:
