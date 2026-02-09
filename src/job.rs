@@ -637,7 +637,7 @@ use ulid::Ulid;
 use uuid::Uuid;
 
 use crate::{
-    activity,
+    activity::{self, CallState},
     queue::{Error as QueueError, InProgressTask, Queue},
     runtime::Runtime,
     scheduler::{Error as SchedulerError, Scheduler, ZonedSchedule},
@@ -723,7 +723,7 @@ struct ActivityCallRecord {
     input: serde_json::Value,
     output: Option<serde_json::Value>,
     error: Option<serde_json::Value>,
-    state: String,
+    state: CallState,
 }
 
 #[derive(Clone)]
@@ -786,7 +786,7 @@ impl ActivityCallBuffer {
             input: input.clone(),
             output: None,
             error: None,
-            state: "pending".to_string(),
+            state: CallState::Pending,
         };
 
         self.records.insert(key.to_string(), record.clone());
@@ -844,8 +844,8 @@ impl<S> Context<S> {
 
         let record = self.register_activity_call(&key, &activity, &input)?;
 
-        match record.state.as_str() {
-            "succeeded" => {
+        match record.state {
+            CallState::Succeeded => {
                 let output = record.output.ok_or_else(|| {
                     TaskError::Fatal(format!(
                         "Missing output for activity call `{activity}` with key `{key}`."
@@ -855,7 +855,7 @@ impl<S> Context<S> {
                 serde_json::from_value(output).map_err(|err| TaskError::Fatal(err.to_string()))
             }
 
-            "failed" => {
+            CallState::Failed => {
                 let error = record
                     .error
                     .and_then(|value| serde_json::from_value::<activity::Error>(value).ok())
@@ -876,18 +876,13 @@ impl<S> Context<S> {
                 }
             }
 
-            "pending" | "in_progress" => {
+            CallState::Pending | CallState::InProgress => {
                 self.register_call_sequence_wait(&key)?;
 
                 Err(TaskError::Suspended(format!(
                     "Waiting on activity call `{activity}` with key `{key}`"
                 )))
             }
-
-            state => Err(TaskError::Fatal(format!(
-                "Unexpected activity call state `{state}` for activity `{activity}` with key \
-                 `{key}`."
-            ))),
         }
     }
 
@@ -906,9 +901,10 @@ impl<S> Context<S> {
     }
 
     fn register_call_sequence_wait(&self, key: &str) -> TaskResult<()> {
-        let mut call_sequence_state = self.call_sequence_state.lock().map_err(|_| {
-            TaskError::Fatal("Call sequence state lock was poisoned.".to_string())
-        })?;
+        let mut call_sequence_state = self
+            .call_sequence_state
+            .lock()
+            .map_err(|_| TaskError::Fatal("Call sequence state lock was poisoned.".to_string()))?;
 
         if let Some(existing) = &call_sequence_state.unresolved_call_key {
             if existing != key {
@@ -2007,7 +2003,7 @@ where
                 input,
                 output,
                 error,
-                state::text as "state!"
+                state as "state: CallState"
             from underway.activity_call
             where task_queue_name = $1
               and job_id = $2
@@ -3694,7 +3690,7 @@ mod tests {
 
         let call_row = sqlx::query!(
             r#"
-            select state::text as "state!"
+            select state as "state: CallState"
             from underway.activity_call
             where task_queue_name = $1
               and job_id = $2
@@ -3709,7 +3705,7 @@ mod tests {
         .fetch_one(&pool)
         .await?;
 
-        assert_eq!(call_row.state, "pending");
+        assert_eq!(call_row.state, CallState::Pending);
 
         Ok(())
     }

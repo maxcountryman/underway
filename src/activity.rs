@@ -14,6 +14,23 @@ use crate::task::RetryPolicy;
 /// A type alias for activity execution results.
 pub type Result<T> = StdResult<T, Error>;
 
+/// Durable activity call state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+#[sqlx(type_name = "underway.activity_call_state", rename_all = "snake_case")]
+pub enum CallState {
+    /// Activity call is queued and waiting to be processed.
+    Pending,
+
+    /// Activity call is currently being processed.
+    InProgress,
+
+    /// Activity call completed successfully.
+    Succeeded,
+
+    /// Activity call completed unsuccessfully.
+    Failed,
+}
+
 /// Standard activity error envelope.
 #[derive(Debug, Clone, Deserialize, Serialize, thiserror::Error)]
 #[error("[{code}] {message}")]

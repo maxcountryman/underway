@@ -187,7 +187,7 @@ mod tests {
 
     use super::Runtime;
     use crate::{
-        activity::{Activity, Result as ActivityResult},
+        activity::{Activity, CallState, Result as ActivityResult},
         Job, To,
     };
 
@@ -264,7 +264,7 @@ mod tests {
 
         let attempt_state = sqlx::query_scalar!(
             r#"
-            select a.state::text as "state!"
+            select a.state as "state: CallState"
             from underway.activity_call_attempt a
             inner join underway.activity_call c
               on c.id = a.activity_call_id
@@ -279,7 +279,7 @@ mod tests {
         .fetch_one(&pool)
         .await?;
 
-        assert_eq!(attempt_state, "succeeded");
+        assert_eq!(attempt_state, CallState::Succeeded);
 
         handle.shutdown().await?;
 

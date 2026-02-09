@@ -311,7 +311,7 @@
 use sqlx::{migrate::Migrator, Acquire, Postgres};
 
 pub use crate::{
-    activity::{Activity, Error as ActivityError},
+    activity::{Activity, CallState as ActivityCallState, Error as ActivityError},
     job::{Job, To},
     queue::Queue,
     runtime::Runtime,
