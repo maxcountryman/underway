@@ -255,6 +255,48 @@
 //! This keeps step execution sound while preserving closure ergonomics for
 //! `step`.
 //!
+//! Instead, durable side effects are modeled with workflow helpers:
+//! - [`Context::emit`] for fire-and-forget intents, and
+//! - [`Context::call`] for request/response effects.
+//!
+//! A `call` does **not** require user polling loops. When a call has not
+//! completed yet, it suspends the current step. The worker marks the task as
+//! waiting, and once the activity completes the step is replayed and the same
+//! call key resolves to the persisted result.
+//!
+//! ```rust
+//! use serde::{Deserialize, Serialize};
+//! use underway::{Job, To};
+//!
+//! #[derive(Serialize, Deserialize)]
+//! struct Step1 {
+//!     user_id: i64,
+//! }
+//!
+//! #[derive(Serialize, Deserialize)]
+//! struct Step2 {
+//!     profile_id: i64,
+//! }
+//!
+//! let job_builder = Job::<_, ()>::builder()
+//!     .step(|cx, Step1 { user_id }| async move {
+//!         // Fire-and-forget effect intent.
+//!         cx.emit("audit", "write-audit-log", &user_id).await?;
+//!
+//!         // Suspends/resumes durably until completion.
+//!         let profile_id: i64 = cx.call("profile", "create-profile", &user_id).await?;
+//!         To::next(Step2 { profile_id })
+//!     })
+//!     .step(|_cx, Step2 { profile_id: _ }| async move { To::done() });
+//! ```
+//!
+//! Call keys should be stable and deterministic for a given step execution.
+//! Reusing a key with a different activity name or input is treated as
+//! non-deterministic and fails execution.
+//!
+//! For v1 semantics, only one unresolved `call` is allowed at a time in a
+//! step execution; issue calls sequentially as `call(...).await?`.
+//!
 //! If a workflow needs direct transaction-level database semantics, implement
 //! [`Task`] directly and use its `execute` method, which receives
 //! a transaction.
@@ -806,6 +848,12 @@ impl ActivityCallBuffer {
 
 impl<S> Context<S> {
     /// Emits a durable fire-and-forget activity call.
+    ///
+    /// The call is persisted as part of the current step transaction boundary.
+    /// If the step fails and retries before that boundary is reached, the emit
+    /// intent is not recorded.
+    ///
+    /// `key` should be deterministic for this step execution.
     pub async fn emit<T>(
         &self,
         key: impl Into<String>,
@@ -828,6 +876,14 @@ impl<S> Context<S> {
     ///
     /// If the call has not completed yet this returns
     /// [`task::Error::Suspended`](crate::task::Error::Suspended).
+    ///
+    /// In normal step code you should propagate that with `?` instead of
+    /// looping manually. The worker marks the task as waiting and re-runs the
+    /// step after the activity completes, at which point this call returns the
+    /// durable result for the same call key.
+    ///
+    /// For v1 semantics, calls are sequential: only one unresolved call is
+    /// permitted at a time in a single step execution.
     pub async fn call<O, T>(
         &self,
         key: impl Into<String>,

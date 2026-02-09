@@ -1,8 +1,68 @@
 //! Runtime orchestration for workflows.
 //!
-//! `Runtime` is the high-level entrypoint for running a workflow.
-//! It wraps a [`Job`] and exposes a single interface to run or
-//! start processing.
+//! [`Runtime`] is the high-level entrypoint for workflow execution.
+//! It wraps a [`Job`] and coordinates:
+//! - the job worker,
+//! - the job scheduler,
+//! - and the activity worker used by workflow calls/emit.
+//!
+//! # Why runtime?
+//!
+//! A workflow step may suspend while waiting on an activity call.
+//! [`Runtime`] is responsible for running both sides of that interaction so a
+//! suspended step can be resumed once the activity completes.
+//!
+//! # Example
+//!
+//! ```rust,no_run
+//! use serde::{Deserialize, Serialize};
+//! use sqlx::PgPool;
+//! use underway::{Activity, ActivityError, Job, Runtime, To};
+//!
+//! #[derive(Deserialize, Serialize)]
+//! struct FetchUser {
+//!     user_id: i64,
+//! }
+//!
+//! struct LookupEmail;
+//!
+//! impl Activity for LookupEmail {
+//!     const NAME: &'static str = "lookup-email";
+//!
+//!     type Input = i64;
+//!     type Output = String;
+//!
+//!     async fn execute(&self, user_id: Self::Input) -> underway::activity::Result<Self::Output> {
+//!         if user_id <= 0 {
+//!             return Err(ActivityError::fatal(
+//!                 "invalid_user",
+//!                 "user_id must be positive",
+//!             ));
+//!         }
+//!
+//!         Ok(format!("user-{user_id}@example.com"))
+//!     }
+//! }
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+//!     let workflow = Job::builder()
+//!         .step(|cx, FetchUser { user_id }| async move {
+//!             let email: String = cx.call("lookup", LookupEmail::NAME, &user_id).await?;
+//!             println!("Got email {email}");
+//!             To::done()
+//!         })
+//!         .name("lookup-email-workflow")
+//!         .pool(pool)
+//!         .build()
+//!         .await?;
+//!
+//!     let runtime = Runtime::new(workflow).activity(LookupEmail);
+//!     runtime.run().await?;
+//!     Ok(())
+//! }
+//! ```
 
 use serde::Serialize;
 use tokio::task::JoinSet;
@@ -47,6 +107,9 @@ pub struct RuntimeHandle {
 
 impl RuntimeHandle {
     /// Signals all runtime workers to shutdown and waits for them to terminate.
+    ///
+    /// This cancels worker, scheduler, and activity worker loops started by
+    /// [`Runtime::start`].
     pub async fn shutdown(mut self) -> Result {
         self.shutdown_token.cancel();
 
@@ -79,6 +142,10 @@ where
     S: Clone + Send + Sync + 'static,
 {
     /// Creates a runtime from a workflow.
+    ///
+    /// By default this starts with no registered activities. Register activity
+    /// handlers via [`Runtime::activity`] before calling [`Runtime::run`] or
+    /// [`Runtime::start`].
     pub fn new(workflow: Job<I, S>) -> Self {
         let activity_worker = ActivityWorker::new(workflow.queue().pool.clone());
         Self {
@@ -93,12 +160,19 @@ where
     }
 
     /// Registers an activity handler for this runtime.
+    ///
+    /// Activity names must be unique per runtime. Register the same activity
+    /// type only once.
     pub fn activity<A: Activity>(mut self, activity: A) -> Self {
         self.activity_worker = self.activity_worker.activity(activity);
         self
     }
 
     /// Runs this runtime to completion.
+    ///
+    /// This starts worker, scheduler, and activity worker loops in the current
+    /// task and returns when one of them exits with an error or when all loops
+    /// stop.
     pub async fn run(&self) -> Result {
         let shutdown_token = CancellationToken::new();
 
@@ -136,7 +210,9 @@ where
         Ok(())
     }
 
-    /// Starts this runtime and returns a handle.
+    /// Starts this runtime in background tasks and returns a handle.
+    ///
+    /// Use [`RuntimeHandle::shutdown`] for graceful stop.
     pub fn start(&self) -> RuntimeHandle {
         let shutdown_token = CancellationToken::new();
 

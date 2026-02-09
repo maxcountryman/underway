@@ -24,6 +24,70 @@
 //! - **Scalable and Flexible**: Easily scales from a single worker to many,
 //!   enabling seamless background job processing with minimal setup.
 //!
+//! ## Workflow Activities
+//!
+//! In addition to plain step chaining, workflows can invoke durable activities
+//! through [`job::Context::call`](crate::job::Context::call) and
+//! [`job::Context::emit`](crate::job::Context::emit).
+//!
+//! - `call` is request/response and may suspend a step until the activity
+//!   completes.
+//! - `emit` is fire-and-forget and records intent durably.
+//!
+//! Activity handlers are registered on [`Runtime`] and run alongside workers
+//! and schedulers.
+//!
+//! ```rust,no_run
+//! use serde::{Deserialize, Serialize};
+//! use sqlx::PgPool;
+//! use underway::{Activity, ActivityError, Job, Runtime, To};
+//!
+//! #[derive(Deserialize, Serialize)]
+//! struct Input {
+//!     user_id: i64,
+//! }
+//!
+//! struct ResolveEmail;
+//!
+//! impl Activity for ResolveEmail {
+//!     const NAME: &'static str = "resolve-email";
+//!
+//!     type Input = i64;
+//!     type Output = String;
+//!
+//!     async fn execute(&self, user_id: Self::Input) -> underway::activity::Result<Self::Output> {
+//!         if user_id <= 0 {
+//!             return Err(ActivityError::fatal(
+//!                 "invalid_user",
+//!                 "user_id must be positive",
+//!             ));
+//!         }
+//!
+//!         Ok(format!("{user_id}@example.com"))
+//!     }
+//! }
+//!
+//! # use tokio::runtime::Runtime as TokioRuntime;
+//! # fn main() {
+//! # let rt = TokioRuntime::new().unwrap();
+//! # rt.block_on(async {
+//! # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+//! let workflow = Job::builder()
+//!     .step(|cx, Input { user_id }| async move {
+//!         let _email: String = cx.call("resolve", ResolveEmail::NAME, &user_id).await?;
+//!         To::done()
+//!     })
+//!     .name("resolve-email")
+//!     .pool(pool)
+//!     .build()
+//!     .await?;
+//!
+//! Runtime::new(workflow).activity(ResolveEmail).run().await?;
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! # });
+//! # }
+//! ```
+//!
 //! # Examples
 //!
 //! Underway is suitable for many different use cases, ranging from simple
