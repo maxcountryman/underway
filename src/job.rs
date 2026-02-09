@@ -713,6 +713,7 @@ pub struct Context<S> {
     pub queue_name: String,
 
     activity_call_buffer: Arc<Mutex<ActivityCallBuffer>>,
+    call_sequence_state: Arc<Mutex<CallSequenceState>>,
 }
 
 #[derive(Clone, sqlx::FromRow)]
@@ -736,6 +737,11 @@ struct ActivityCallCommand {
 struct ActivityCallBuffer {
     records: HashMap<String, ActivityCallRecord>,
     commands: Vec<ActivityCallCommand>,
+}
+
+#[derive(Default)]
+struct CallSequenceState {
+    unresolved_call_key: Option<String>,
 }
 
 impl ActivityCallBuffer {
@@ -870,9 +876,13 @@ impl<S> Context<S> {
                 }
             }
 
-            "pending" | "in_progress" => Err(TaskError::Suspended(format!(
-                "Waiting on activity call `{activity}` with key `{key}`"
-            ))),
+            "pending" | "in_progress" => {
+                self.register_call_sequence_wait(&key)?;
+
+                Err(TaskError::Suspended(format!(
+                    "Waiting on activity call `{activity}` with key `{key}`"
+                )))
+            }
 
             state => Err(TaskError::Fatal(format!(
                 "Unexpected activity call state `{state}` for activity `{activity}` with key \
@@ -893,6 +903,26 @@ impl<S> Context<S> {
             .map_err(|_| TaskError::Fatal("Activity call buffer lock was poisoned.".to_string()))?;
 
         activity_call_buffer.register_call(key, activity, input)
+    }
+
+    fn register_call_sequence_wait(&self, key: &str) -> TaskResult<()> {
+        let mut call_sequence_state = self.call_sequence_state.lock().map_err(|_| {
+            TaskError::Fatal("Call sequence state lock was poisoned.".to_string())
+        })?;
+
+        if let Some(existing) = &call_sequence_state.unresolved_call_key {
+            if existing != key {
+                return Err(TaskError::Fatal(
+                    "Multiple unresolved `call` operations in a single step execution are not \
+                     supported. Await each call result before issuing another call."
+                        .to_string(),
+                ));
+            }
+        } else {
+            call_sequence_state.unresolved_call_key = Some(key.to_string());
+        }
+
+        Ok(())
     }
 }
 
@@ -2075,6 +2105,7 @@ where
             self.fetch_activity_calls(&mut tx, job_id, step_index)
                 .await?,
         )));
+        let call_sequence_state = Arc::new(Mutex::new(CallSequenceState::default()));
 
         let cx = Context {
             state: self.state.clone(),
@@ -2083,6 +2114,7 @@ where
             step_count: self.steps.len(),
             queue_name: self.queue.name.clone(),
             activity_call_buffer: Arc::clone(&activity_call_buffer),
+            call_sequence_state,
         };
 
         // Execute the step and handle any errors.
@@ -3764,6 +3796,76 @@ mod tests {
         .await?;
 
         assert_eq!(activity_call_count, 1);
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn concurrent_calls_are_rejected(pool: PgPool) -> sqlx::Result<(), Error> {
+        #[derive(Serialize, Deserialize)]
+        struct Input {
+            message: String,
+        }
+
+        let job = Job::builder()
+            .step(|cx, Input { message }| async move {
+                let call_one = cx.call::<String, _>("call-1", "echo", &message);
+                let call_two = cx.call::<String, _>("call-2", "echo", &message);
+
+                let (result_one, result_two) = tokio::join!(call_one, call_two);
+
+                if let Err(err) = result_one {
+                    if matches!(err, TaskError::Fatal(_)) {
+                        return Err(err);
+                    }
+                }
+
+                result_two?;
+
+                To::done()
+            })
+            .name("concurrent_calls_are_rejected")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let enqueued = job
+            .enqueue(&Input {
+                message: "hello".to_string(),
+            })
+            .await?;
+
+        job.worker().process_next_task().await?;
+
+        let task_state = sqlx::query_scalar!(
+            r#"
+            select state as "state: TaskState"
+            from underway.task
+            where task_queue_name = $1
+              and (input->>'job_id')::uuid = $2
+            "#,
+            job.queue.name,
+            *enqueued.id,
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(task_state, TaskState::Failed);
+
+        let activity_call_count = sqlx::query_scalar!(
+            r#"
+            select count(*)::int as "count!"
+            from underway.activity_call
+            where task_queue_name = $1
+              and job_id = $2
+            "#,
+            job.queue.name,
+            *enqueued.id,
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(activity_call_count, 0);
 
         Ok(())
     }
