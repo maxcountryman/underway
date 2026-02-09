@@ -20,7 +20,7 @@
 //! Jobs are formed from at least one step function.
 //!
 //! ```rust
-//! use underway::{Job, To};
+//! use underway::{Activity, Job, To};
 //!
 //! let job_builder = Job::<(), ()>::builder().step(|_cx, _| async move { To::done() });
 //! ```
@@ -52,7 +52,7 @@
 //!
 //! ```rust
 //! use serde::{Deserialize, Serialize};
-//! use underway::{Job, To};
+//! use underway::{Activity, Job, To};
 //!
 //! // Our very own input type.
 //! #[derive(Serialize, Deserialize)]
@@ -115,7 +115,7 @@
 //!
 //! ```rust,compile_fail
 //! use serde::{Deserialize, Serialize};
-//! use underway::{Job, To};
+//! use underway::{Activity, Job, To};
 //!
 //! #[derive(Serialize, Deserialize)]
 //! struct Step1 {
@@ -151,7 +151,7 @@
 //! ```rust
 //! use jiff::ToSpan;
 //! use serde::{Deserialize, Serialize};
-//! use underway::{Job, To};
+//! use underway::{Activity, Job, To};
 //!
 //! #[derive(Serialize, Deserialize)]
 //! struct Step1 {
@@ -266,7 +266,7 @@
 //!
 //! ```rust
 //! use serde::{Deserialize, Serialize};
-//! use underway::{Job, To};
+//! use underway::{Activity, Job, To};
 //!
 //! #[derive(Serialize, Deserialize)]
 //! struct Step1 {
@@ -278,13 +278,41 @@
 //!     profile_id: i64,
 //! }
 //!
+//! struct CreateProfile;
+//!
+//! impl Activity for CreateProfile {
+//!     const NAME: &'static str = "create-profile";
+//!
+//!     type Input = i64;
+//!     type Output = i64;
+//!
+//!     async fn execute(&self, user_id: Self::Input) -> underway::activity::Result<Self::Output> {
+//!         Ok(user_id)
+//!     }
+//! }
+//!
+//! struct WriteAuditLog;
+//!
+//! impl Activity for WriteAuditLog {
+//!     const NAME: &'static str = "write-audit-log";
+//!
+//!     type Input = i64;
+//!     type Output = ();
+//!
+//!     async fn execute(&self, _user_id: Self::Input) -> underway::activity::Result<Self::Output> {
+//!         Ok(())
+//!     }
+//! }
+//!
 //! let job_builder = Job::<_, ()>::builder()
+//!     .activity(CreateProfile)
+//!     .activity(WriteAuditLog)
 //!     .step(|cx, Step1 { user_id }| async move {
 //!         // Fire-and-forget effect intent.
-//!         cx.emit("audit", "write-audit-log", &user_id).await?;
+//!         cx.emit::<WriteAuditLog, _>("audit", &user_id).await?;
 //!
 //!         // Suspends/resumes durably until completion.
-//!         let profile_id: i64 = cx.call("profile", "create-profile", &user_id).await?;
+//!         let profile_id: i64 = cx.call::<CreateProfile, _>("profile", &user_id).await?;
 //!         To::next(Step2 { profile_id })
 //!     })
 //!     .step(|_cx, Step2 { profile_id: _ }| async move { To::done() });
@@ -679,7 +707,8 @@ use ulid::Ulid;
 use uuid::Uuid;
 
 use crate::{
-    activity::{self, CallState},
+    activity::{self, registration::Contains, CallState},
+    activity_worker::ActivityWorker,
     queue::{Error as QueueError, InProgressTask, Queue},
     runtime::Runtime,
     scheduler::{Error as SchedulerError, Scheduler, ZonedSchedule},
@@ -721,12 +750,16 @@ pub enum Error {
     /// Error returned from database operations.
     #[error(transparent)]
     Database(#[from] sqlx::Error),
+
+    /// Errors produced while running the activity side-effect worker.
+    #[error("{0}")]
+    Runtime(String),
 }
 
-type JobQueue<T, S> = Queue<Job<T, S>>;
+type JobQueue<T, S, A> = Queue<Job<T, S, A>>;
 
 /// Context passed in to each step.
-pub struct Context<S> {
+pub struct Context<S, Set = activity::registration::Nil> {
     /// Shared step state.
     ///
     /// This value is set via [`state`](Builder::state).
@@ -756,6 +789,7 @@ pub struct Context<S> {
 
     activity_call_buffer: Arc<Mutex<ActivityCallBuffer>>,
     call_sequence_state: Arc<Mutex<CallSequenceState>>,
+    _activity_set: PhantomData<fn() -> Set>,
 }
 
 #[derive(Clone, sqlx::FromRow)]
@@ -846,7 +880,7 @@ impl ActivityCallBuffer {
     }
 }
 
-impl<S> Context<S> {
+impl<S, Set> Context<S, Set> {
     /// Emits a durable fire-and-forget activity call.
     ///
     /// The call is persisted as part of the current step transaction boundary.
@@ -854,20 +888,15 @@ impl<S> Context<S> {
     /// intent is not recorded.
     ///
     /// `key` should be deterministic for this step execution.
-    pub async fn emit<T>(
-        &self,
-        key: impl Into<String>,
-        activity: impl Into<String>,
-        input: &T,
-    ) -> TaskResult<()>
+    pub async fn emit<A, Idx>(&self, key: impl Into<String>, input: &A::Input) -> TaskResult<()>
     where
-        T: Serialize + ?Sized,
+        A: activity::Activity,
+        Set: Contains<A, Idx>,
     {
         let key = key.into();
-        let activity = activity.into();
         let input = serde_json::to_value(input).map_err(|err| TaskError::Fatal(err.to_string()))?;
 
-        self.register_activity_call(&key, &activity, &input)?;
+        self.register_activity_call(&key, A::NAME, &input)?;
 
         Ok(())
     }
@@ -884,27 +913,26 @@ impl<S> Context<S> {
     ///
     /// For v1 semantics, calls are sequential: only one unresolved call is
     /// permitted at a time in a single step execution.
-    pub async fn call<O, T>(
+    pub async fn call<A, Idx>(
         &self,
         key: impl Into<String>,
-        activity: impl Into<String>,
-        input: &T,
-    ) -> TaskResult<O>
+        input: &A::Input,
+    ) -> TaskResult<A::Output>
     where
-        O: DeserializeOwned,
-        T: Serialize + ?Sized,
+        A: activity::Activity,
+        Set: Contains<A, Idx>,
     {
         let key = key.into();
-        let activity = activity.into();
         let input = serde_json::to_value(input).map_err(|err| TaskError::Fatal(err.to_string()))?;
 
-        let record = self.register_activity_call(&key, &activity, &input)?;
+        let record = self.register_activity_call(&key, A::NAME, &input)?;
 
         match record.state {
             CallState::Succeeded => {
                 let output = record.output.ok_or_else(|| {
                     TaskError::Fatal(format!(
-                        "Missing output for activity call `{activity}` with key `{key}`."
+                        "Missing output for activity call `{activity}` with key `{key}`.",
+                        activity = A::NAME
                     ))
                 })?;
 
@@ -920,7 +948,8 @@ impl<S> Context<S> {
                             "activity_call_failed",
                             format!(
                                 "Activity call `{activity}` with key `{key}` failed without an \
-                                 error envelope."
+                                 error envelope.",
+                                activity = A::NAME
                             ),
                         )
                     });
@@ -936,7 +965,8 @@ impl<S> Context<S> {
                 self.register_call_sequence_wait(&key)?;
 
                 Err(TaskError::Suspended(format!(
-                    "Waiting on activity call `{activity}` with key `{key}`"
+                    "Waiting on activity call `{activity}` with key `{key}",
+                    activity = A::NAME
                 )))
             }
         }
@@ -978,8 +1008,8 @@ impl<S> Context<S> {
     }
 }
 
-struct StepConfig<S> {
-    executor: Box<dyn StepExecutor<S>>,
+struct StepConfig<S, A> {
+    executor: Box<dyn StepExecutor<S, A>>,
     task_config: StepTaskConfig,
 }
 
@@ -1023,15 +1053,14 @@ mod sealed {
 
 /// Container for the runtime of the job instance.
 ///
-/// Provides a method to gracefully stop the worker and scheduler.
+/// Provides a method to gracefully stop the worker, scheduler, and activity worker.
 pub struct JobHandle {
     workers: JoinSet<StdResult<Result<()>, JoinError>>,
     shutdown_token: CancellationToken,
 }
 
 impl JobHandle {
-    /// Signals the worker and scheduler to shutdown and waits for them to
-    /// finish.
+    /// Signals runtime workers to shutdown and waits for them to finish.
     ///
     /// # Example
     ///
@@ -1056,7 +1085,7 @@ impl JobHandle {
     ///
     /// let job_handle = job.start();
     ///
-    /// // Gracefully stop worker and scheduler.
+    /// // Gracefully stop runtime workers.
     /// job_handle.shutdown().await?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
@@ -1216,18 +1245,20 @@ impl<T: Task> EnqueuedJob<T> {
 
 /// Sequential set of functions, where the output of the last is the input to
 /// the next.
-pub struct Job<I, S>
+pub struct Job<I, S, A = activity::registration::Nil>
 where
     I: Sync + Send + 'static,
     S: Clone + Sync + Send + 'static,
+    A: 'static,
 {
-    queue: Arc<JobQueue<I, S>>,
-    steps: Arc<Vec<StepConfig<S>>>,
+    queue: Arc<JobQueue<I, S, A>>,
+    steps: Arc<Vec<StepConfig<S, A>>>,
     state: S,
-    _marker: PhantomData<I>,
+    activity_registry: crate::activity_worker::ActivityRegistry,
+    _marker: PhantomData<fn() -> (I, A)>,
 }
 
-impl<I, S> Job<I, S>
+impl<I, S> Job<I, S, activity::registration::Nil>
 where
     I: Serialize + Sync + Send + 'static,
     S: Clone + Send + Sync + 'static,
@@ -1260,10 +1291,17 @@ where
     /// # });
     /// # }
     /// ```
-    pub fn builder() -> Builder<I, I, S, Initial> {
-        Builder::new()
+    pub fn builder() -> Builder<I, I, S, Initial, activity::registration::Nil> {
+        Builder::<I, I, S, Initial, activity::registration::Nil>::new()
     }
+}
 
+impl<I, S, A> Job<I, S, A>
+where
+    I: Serialize + Sync + Send + 'static,
+    S: Clone + Send + Sync + 'static,
+    A: 'static,
+{
     /// Enqueue the job using a connection from the queue's pool.
     ///
     /// # Errors
@@ -1810,6 +1848,10 @@ where
         Arc::clone(&self.queue)
     }
 
+    pub(crate) fn activity_registry(&self) -> crate::activity_worker::ActivityRegistry {
+        self.activity_registry.clone()
+    }
+
     /// Creates a [`Runtime`] for this job.
     ///
     /// # Example
@@ -1838,7 +1880,7 @@ where
     /// # });
     /// # }
     /// ```
-    pub fn runtime(&self) -> Runtime<I, S> {
+    pub fn runtime(&self) -> Runtime<I, S, A> {
         Runtime::new(self.clone())
     }
 
@@ -1906,13 +1948,13 @@ where
         Scheduler::new(self.queue(), self.clone())
     }
 
-    /// Runs both a worker and scheduler for the job.
+    /// Runs a worker, scheduler, and activity worker for the job.
     ///
     /// # Errors
     ///
     /// This has the same error conditions as [`Worker::run`] and
-    /// [`Scheduler::run`]. It will also return an error if either of the
-    /// spawned worker or scheduler cannot be joined.
+    /// [`Scheduler::run`]. It will also return an error if any spawned runtime
+    /// worker cannot be joined.
     ///
     /// # Example
     ///
@@ -1943,10 +1985,18 @@ where
     pub async fn run(&self) -> Result {
         let worker = self.worker();
         let scheduler = self.scheduler();
+        let activity_worker =
+            ActivityWorker::with_registry(self.queue.pool.clone(), self.activity_registry());
 
         let mut workers = JoinSet::new();
         workers.spawn(async move { worker.run().await.map_err(Error::from) });
         workers.spawn(async move { scheduler.run().await.map_err(Error::from) });
+        workers.spawn(async move {
+            activity_worker
+                .run()
+                .await
+                .map_err(|err| Error::Runtime(err.to_string()))
+        });
 
         while let Some(ret) = workers.join_next().await {
             match ret {
@@ -1959,16 +2009,15 @@ where
         Ok(())
     }
 
-    /// Starts both a worker and scheduler for the job and returns a handle.
+    /// Starts runtime workers for the job and returns a handle.
     ///
-    /// The returned handle may be used to gracefully shutdown the worker and
-    /// scheduler.
+    /// The returned handle may be used to gracefully shutdown runtime workers.
     ///
     /// # Errors
     ///
     /// This has the same error conditions as [`Worker::run`] and
-    /// [`Scheduler::run`]. It will also return an error if either of the
-    /// spawned worker or scheduler cannot be joined.
+    /// [`Scheduler::run`]. It will also return an error if any spawned runtime
+    /// worker cannot be joined.
     ///
     /// # Example
     ///
@@ -2004,15 +2053,25 @@ where
         worker.set_shutdown_token(shutdown_token.clone());
         let mut scheduler = self.scheduler();
         scheduler.set_shutdown_token(shutdown_token.clone());
+        let mut activity_worker =
+            ActivityWorker::with_registry(self.queue.pool.clone(), self.activity_registry());
+        activity_worker.set_shutdown_token(shutdown_token.clone());
 
         // Spawn the tasks using `tokio::spawn` to decouple them from polling the
         // `Future`.
         let worker_handle = tokio::spawn(async move { worker.run().await.map_err(Error::from) });
         let scheduler_handle =
             tokio::spawn(async move { scheduler.run().await.map_err(Error::from) });
+        let activity_worker_handle = tokio::spawn(async move {
+            activity_worker
+                .run()
+                .await
+                .map_err(|err| Error::Runtime(err.to_string()))
+        });
 
         workers.spawn(worker_handle);
         workers.spawn(scheduler_handle);
+        workers.spawn(activity_worker_handle);
 
         JobHandle {
             workers,
@@ -2032,10 +2091,11 @@ where
     }
 }
 
-impl<I, S> Job<I, S>
+impl<I, S, A> Job<I, S, A>
 where
     I: Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
+    A: 'static,
 {
     fn step_task_config(&self, step_index: usize) -> StepTaskConfig {
         self.steps
@@ -2120,10 +2180,11 @@ where
     }
 }
 
-impl<I, S> Task for Job<I, S>
+impl<I, S, A> Task for Job<I, S, A>
 where
     I: Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
+    A: 'static,
 {
     type Input = JobState;
     type Output = ();
@@ -2167,6 +2228,7 @@ where
             queue_name: self.queue.name.clone(),
             activity_call_buffer: Arc::clone(&activity_call_buffer),
             call_sequence_state,
+            _activity_set: PhantomData,
         };
 
         // Execute the step and handle any errors.
@@ -2269,16 +2331,18 @@ where
     }
 }
 
-impl<I, S> Clone for Job<I, S>
+impl<I, S, A> Clone for Job<I, S, A>
 where
     I: Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
+    A: 'static,
 {
     fn clone(&self) -> Self {
         Self {
             queue: self.queue.clone(),
             state: self.state.clone(),
             steps: self.steps.clone(),
+            activity_registry: self.activity_registry.clone(),
             _marker: PhantomData,
         }
     }
@@ -2327,20 +2391,22 @@ impl To<()> {
 }
 
 // A concrete implementation of a step using a closure.
-struct StepFn<I, O, S, F>
+type StepFnMarker<I, O, S, A> = fn() -> (I, O, S, A);
+
+struct StepFn<I, O, S, A, F>
 where
-    F: Fn(Context<S>, I) -> Pin<Box<dyn Future<Output = TaskResult<To<O>>> + Send>>
+    F: Fn(Context<S, A>, I) -> Pin<Box<dyn Future<Output = TaskResult<To<O>>> + Send>>
         + Send
         + Sync
         + 'static,
 {
     func: Arc<F>,
-    _marker: PhantomData<(I, O, S)>,
+    _marker: PhantomData<StepFnMarker<I, O, S, A>>,
 }
 
-impl<I, O, S, F> StepFn<I, O, S, F>
+impl<I, O, S, A, F> StepFn<I, O, S, A, F>
 where
-    F: Fn(Context<S>, I) -> Pin<Box<dyn Future<Output = TaskResult<To<O>>> + Send>>
+    F: Fn(Context<S, A>, I) -> Pin<Box<dyn Future<Output = TaskResult<To<O>>> + Send>>
         + Send
         + Sync
         + 'static,
@@ -2357,28 +2423,28 @@ type StepResult = TaskResult<Option<(serde_json::Value, Span)>>;
 
 // A trait object wrapper for steps to allow heterogeneous step types in a
 // vector.
-trait StepExecutor<S>: Send + Sync {
+trait StepExecutor<S, A>: Send + Sync {
     // Execute the step with the given input serialized as JSON.
     fn execute_step(
         &self,
-        cx: Context<S>,
+        cx: Context<S, A>,
         input: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = StepResult> + Send>>;
 }
 
-impl<I, O, S, F> StepExecutor<S> for StepFn<I, O, S, F>
+impl<I, O, S, A, F> StepExecutor<S, A> for StepFn<I, O, S, A, F>
 where
     I: DeserializeOwned + Serialize + Send + Sync + 'static,
     O: Serialize + Send + Sync + 'static,
     S: Send + Sync + 'static,
-    F: Fn(Context<S>, I) -> Pin<Box<dyn Future<Output = TaskResult<To<O>>> + Send>>
+    F: Fn(Context<S, A>, I) -> Pin<Box<dyn Future<Output = TaskResult<To<O>>> + Send>>
         + Send
         + Sync
         + 'static,
 {
     fn execute_step(
         &self,
-        cx: Context<S>,
+        cx: Context<S, A>,
         input: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = StepResult> + Send>> {
         let deserialized_input: I = match serde_json::from_value(input) {
@@ -2430,13 +2496,14 @@ mod builder_states {
         pub _marker: PhantomData<Current>,
     }
 
-    pub struct QueueSet<I, S>
+    pub struct QueueSet<I, S, A>
     where
         I: Send + Sync + 'static,
         S: Clone + Send + Sync + 'static,
+        A: 'static,
     {
         pub state: S,
-        pub queue: JobQueue<I, S>,
+        pub queue: JobQueue<I, S, A>,
     }
 
     pub struct QueueNameSet<S> {
@@ -2451,20 +2518,44 @@ mod builder_states {
     }
 }
 
+type BuilderMarker<I, O, S, A> = fn() -> (I, O, S, A);
+
 /// Builder for constructing a `Job` with a sequence of steps.
-pub struct Builder<I, O, S, B> {
+pub struct Builder<I, O, S, B, A = activity::registration::Nil>
+where
+    A: 'static,
+{
     builder_state: B,
-    steps: Vec<StepConfig<S>>,
-    _marker: PhantomData<(I, O, S)>,
+    steps: Vec<StepConfig<S, A>>,
+    activity_registry: crate::activity_worker::ActivityRegistry,
+    _marker: PhantomData<BuilderMarker<I, O, S, A>>,
 }
 
-impl<I, S> Default for Builder<I, I, S, Initial> {
+impl<I, S> Default for Builder<I, I, S, Initial, activity::registration::Nil> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<I, S> Builder<I, I, S, Initial> {
+impl<I, S, ASet> Builder<I, I, S, Initial, ASet> {
+    /// Registers an activity handler for subsequent steps.
+    pub fn activity<A>(
+        mut self,
+        activity: A,
+    ) -> Builder<I, I, S, Initial, activity::registration::Cons<A, ASet>>
+    where
+        A: activity::Activity,
+    {
+        self.activity_registry.register(activity);
+
+        Builder {
+            builder_state: Initial,
+            steps: Vec::new(),
+            activity_registry: self.activity_registry,
+            _marker: PhantomData,
+        }
+    }
+
     /// Create a new builder.
     ///
     /// # Example
@@ -2475,10 +2566,11 @@ impl<I, S> Builder<I, I, S, Initial> {
     /// // Instantiate a new builder from the `Job` method.
     /// let job_builder = Job::<(), ()>::builder();
     /// ```
-    pub fn new() -> Builder<I, I, S, Initial> {
-        Builder::<I, I, S, _> {
+    pub fn new() -> Builder<I, I, S, Initial, activity::registration::Nil> {
+        Builder::<I, I, S, _, activity::registration::Nil> {
             builder_state: Initial,
             steps: Vec::new(),
+            activity_registry: crate::activity_worker::ActivityRegistry::default(),
             _marker: PhantomData,
         }
     }
@@ -2509,10 +2601,11 @@ impl<I, S> Builder<I, I, S, Initial> {
     ///     data: "foo".to_string(),
     /// });
     /// ```
-    pub fn state(self, state: S) -> Builder<I, I, S, StateSet<S>> {
+    pub fn state(self, state: S) -> Builder<I, I, S, StateSet<S>, ASet> {
         Builder {
             builder_state: StateSet { state },
             steps: self.steps,
+            activity_registry: self.activity_registry,
             _marker: PhantomData,
         }
     }
@@ -2536,12 +2629,12 @@ impl<I, S> Builder<I, I, S, Initial> {
     /// // Set a step.
     /// let job_builder = Job::<(), ()>::builder().step(|_cx, _| async move { To::done() });
     /// ```
-    pub fn step<F, O, Fut>(mut self, func: F) -> Builder<I, O, S, StepSet<O, ()>>
+    pub fn step<F, O, Fut>(mut self, func: F) -> Builder<I, O, S, StepSet<O, ()>, ASet>
     where
         I: DeserializeOwned + Serialize + Send + Sync + 'static,
         O: Serialize + Send + Sync + 'static,
         S: Send + Sync + 'static,
-        F: Fn(Context<S>, I) -> Fut + Send + Sync + 'static,
+        F: Fn(Context<S, ASet>, I) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = TaskResult<To<O>>> + Send + 'static,
     {
         let step_fn = StepFn::new(move |cx, input| Box::pin(func(cx, input)));
@@ -2556,13 +2649,34 @@ impl<I, S> Builder<I, I, S, Initial> {
                 _marker: PhantomData,
             },
             steps: self.steps,
+            activity_registry: self.activity_registry,
             _marker: PhantomData,
         }
     }
 }
 
 // After state set, before first step set.
-impl<I, S> Builder<I, I, S, StateSet<S>> {
+impl<I, S, ASet> Builder<I, I, S, StateSet<S>, ASet> {
+    /// Registers an activity handler for subsequent steps.
+    pub fn activity<A>(
+        mut self,
+        activity: A,
+    ) -> Builder<I, I, S, StateSet<S>, activity::registration::Cons<A, ASet>>
+    where
+        A: activity::Activity,
+    {
+        self.activity_registry.register(activity);
+
+        Builder {
+            builder_state: StateSet {
+                state: self.builder_state.state,
+            },
+            steps: Vec::new(),
+            activity_registry: self.activity_registry,
+            _marker: PhantomData,
+        }
+    }
+
     /// Add a step to the job.
     ///
     /// A step function should take the job context as its first argument
@@ -2594,12 +2708,12 @@ impl<I, S> Builder<I, I, S, StateSet<S>> {
     ///         To::done()
     ///     });
     /// ```
-    pub fn step<F, O, Fut>(mut self, func: F) -> Builder<I, O, S, StepSet<O, S>>
+    pub fn step<F, O, Fut>(mut self, func: F) -> Builder<I, O, S, StepSet<O, S>, ASet>
     where
         I: DeserializeOwned + Serialize + Send + Sync + 'static,
         O: Serialize + Send + Sync + 'static,
         S: Send + Sync + 'static,
-        F: Fn(Context<S>, I) -> Fut + Send + Sync + 'static,
+        F: Fn(Context<S, ASet>, I) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = TaskResult<To<O>>> + Send + 'static,
     {
         let step_fn = StepFn::new(move |cx, input| Box::pin(func(cx, input)));
@@ -2614,13 +2728,14 @@ impl<I, S> Builder<I, I, S, StateSet<S>> {
                 _marker: PhantomData,
             },
             steps: self.steps,
+            activity_registry: self.activity_registry,
             _marker: PhantomData,
         }
     }
 }
 
 // After first step set.
-impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
+impl<I, Current, S, ASet> Builder<I, Current, S, StepSet<Current, S>, ASet> {
     /// Add a subsequent step to the job.
     ///
     /// This method ensures that the input type of the new step matches the
@@ -2642,12 +2757,12 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
     ///     .step(|_cx, _| async move { To::next(Step2 { n: 42 }) })
     ///     .step(|_cx, Step2 { n }| async move { To::done() });
     /// ```
-    pub fn step<F, New, Fut>(mut self, func: F) -> Builder<I, New, S, StepSet<New, S>>
+    pub fn step<F, New, Fut>(mut self, func: F) -> Builder<I, New, S, StepSet<New, S>, ASet>
     where
         Current: DeserializeOwned + Serialize + Send + Sync + 'static,
         New: Serialize + Send + Sync + 'static,
         S: Send + Sync + 'static,
-        F: Fn(Context<S>, Current) -> Fut + Send + Sync + 'static,
+        F: Fn(Context<S, ASet>, Current) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = TaskResult<To<New>>> + Send + 'static,
     {
         let step_fn = StepFn::new(move |cx, input| Box::pin(func(cx, input)));
@@ -2662,6 +2777,7 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
                 _marker: PhantomData,
             },
             steps: self.steps,
+            activity_registry: self.activity_registry,
             _marker: PhantomData,
         }
     }
@@ -2686,7 +2802,7 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
     pub fn retry_policy(
         mut self,
         retry_policy: RetryPolicy,
-    ) -> Builder<I, Current, S, StepSet<Current, S>> {
+    ) -> Builder<I, Current, S, StepSet<Current, S>, ASet> {
         let step_config = self.steps.last_mut().expect("Steps should not be empty");
         step_config.task_config.retry_policy = retry_policy;
 
@@ -2696,6 +2812,7 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
                 _marker: PhantomData,
             },
             steps: self.steps,
+            activity_registry: self.activity_registry,
             _marker: PhantomData,
         }
     }
@@ -2712,7 +2829,7 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
     ///     .step(|_cx, _| async move { To::done() })
     ///     .timeout(1.minute());
     /// ```
-    pub fn timeout(mut self, timeout: Span) -> Builder<I, Current, S, StepSet<Current, S>> {
+    pub fn timeout(mut self, timeout: Span) -> Builder<I, Current, S, StepSet<Current, S>, ASet> {
         let step_config = self.steps.last_mut().expect("Steps should not be empty");
         step_config.task_config.timeout = timeout;
 
@@ -2722,6 +2839,7 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
                 _marker: PhantomData,
             },
             steps: self.steps,
+            activity_registry: self.activity_registry,
             _marker: PhantomData,
         }
     }
@@ -2738,7 +2856,7 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
     ///     .step(|_cx, _| async move { To::done() })
     ///     .ttl(7.days());
     /// ```
-    pub fn ttl(mut self, ttl: Span) -> Builder<I, Current, S, StepSet<Current, S>> {
+    pub fn ttl(mut self, ttl: Span) -> Builder<I, Current, S, StepSet<Current, S>, ASet> {
         let step_config = self.steps.last_mut().expect("Steps should not be empty");
         step_config.task_config.ttl = ttl;
 
@@ -2748,6 +2866,7 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
                 _marker: PhantomData,
             },
             steps: self.steps,
+            activity_registry: self.activity_registry,
             _marker: PhantomData,
         }
     }
@@ -2766,7 +2885,7 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
     ///     .step(|_cx, _| async move { To::done() })
     ///     .delay(30.seconds());
     /// ```
-    pub fn delay(mut self, delay: Span) -> Builder<I, Current, S, StepSet<Current, S>> {
+    pub fn delay(mut self, delay: Span) -> Builder<I, Current, S, StepSet<Current, S>, ASet> {
         let step_config = self.steps.last_mut().expect("Steps should not be empty");
         step_config.task_config.delay = delay;
 
@@ -2776,6 +2895,7 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
                 _marker: PhantomData,
             },
             steps: self.steps,
+            activity_registry: self.activity_registry,
             _marker: PhantomData,
         }
     }
@@ -2792,7 +2912,10 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
     ///     .step(|_cx, _| async move { To::done() })
     ///     .heartbeat(5.seconds());
     /// ```
-    pub fn heartbeat(mut self, heartbeat: Span) -> Builder<I, Current, S, StepSet<Current, S>> {
+    pub fn heartbeat(
+        mut self,
+        heartbeat: Span,
+    ) -> Builder<I, Current, S, StepSet<Current, S>, ASet> {
         let step_config = self.steps.last_mut().expect("Steps should not be empty");
         step_config.task_config.heartbeat = heartbeat;
 
@@ -2802,6 +2925,7 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
                 _marker: PhantomData,
             },
             steps: self.steps,
+            activity_registry: self.activity_registry,
             _marker: PhantomData,
         }
     }
@@ -2820,7 +2944,7 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
     pub fn concurrency_key(
         mut self,
         concurrency_key: impl Into<String>,
-    ) -> Builder<I, Current, S, StepSet<Current, S>> {
+    ) -> Builder<I, Current, S, StepSet<Current, S>, ASet> {
         let step_config = self.steps.last_mut().expect("Steps should not be empty");
         step_config.task_config.concurrency_key = Some(concurrency_key.into());
 
@@ -2830,6 +2954,7 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
                 _marker: PhantomData,
             },
             steps: self.steps,
+            activity_registry: self.activity_registry,
             _marker: PhantomData,
         }
     }
@@ -2845,7 +2970,7 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
     ///     .step(|_cx, _| async move { To::done() })
     ///     .priority(10);
     /// ```
-    pub fn priority(mut self, priority: i32) -> Builder<I, Current, S, StepSet<Current, S>> {
+    pub fn priority(mut self, priority: i32) -> Builder<I, Current, S, StepSet<Current, S>, ASet> {
         let step_config = self.steps.last_mut().expect("Steps should not be empty");
         step_config.task_config.priority = priority;
 
@@ -2855,13 +2980,14 @@ impl<I, Current, S> Builder<I, Current, S, StepSet<Current, S>> {
                 _marker: PhantomData,
             },
             steps: self.steps,
+            activity_registry: self.activity_registry,
             _marker: PhantomData,
         }
     }
 }
 
 // Encapsulate queue creation.
-impl<I, S> Builder<I, (), S, StepSet<(), S>>
+impl<I, S, ASet> Builder<I, (), S, StepSet<(), S>, ASet>
 where
     I: Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
@@ -2886,19 +3012,20 @@ where
     ///     .step(|_cx, _| async move { To::done() })
     ///     .name("example");
     /// ```
-    pub fn name(self, name: impl Into<String>) -> Builder<I, (), S, QueueNameSet<S>> {
+    pub fn name(self, name: impl Into<String>) -> Builder<I, (), S, QueueNameSet<S>, ASet> {
         Builder {
             builder_state: QueueNameSet {
                 state: self.builder_state.state,
                 queue_name: name.into(),
             },
             steps: self.steps,
+            activity_registry: self.activity_registry,
             _marker: PhantomData,
         }
     }
 }
 
-impl<I, S> Builder<I, (), S, QueueNameSet<S>>
+impl<I, S, ASet> Builder<I, (), S, QueueNameSet<S>, ASet>
 where
     I: Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
@@ -2931,7 +3058,7 @@ where
     /// # });
     /// # }
     /// ```
-    pub fn pool(self, pool: PgPool) -> Builder<I, (), S, PoolSet<S>> {
+    pub fn pool(self, pool: PgPool) -> Builder<I, (), S, PoolSet<S>, ASet> {
         let QueueNameSet { queue_name, state } = self.builder_state;
         Builder {
             builder_state: PoolSet {
@@ -2940,12 +3067,13 @@ where
                 pool,
             },
             steps: self.steps,
+            activity_registry: self.activity_registry,
             _marker: PhantomData,
         }
     }
 }
 
-impl<I, S> Builder<I, (), S, PoolSet<S>>
+impl<I, S, ASet> Builder<I, (), S, PoolSet<S>, ASet>
 where
     I: Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
@@ -2977,7 +3105,7 @@ where
     /// # });
     /// # }
     /// ```
-    pub async fn build(self) -> Result<Job<I, S>> {
+    pub async fn build(self) -> Result<Job<I, S, ASet>> {
         let PoolSet {
             state,
             queue_name,
@@ -2988,13 +3116,14 @@ where
             queue: Arc::new(queue),
             steps: Arc::new(self.steps),
             state,
+            activity_registry: self.activity_registry,
             _marker: PhantomData,
         })
     }
 }
 
 // Directly provide queue.
-impl<I, S> Builder<I, (), S, StepSet<(), S>>
+impl<I, S, ASet> Builder<I, (), S, StepSet<(), S>, ASet>
 where
     I: Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
@@ -3029,19 +3158,23 @@ where
     /// # });
     /// # }
     /// ```
-    pub fn queue(self, queue: JobQueue<I, S>) -> Builder<I, (), S, QueueSet<I, S>> {
+    pub fn queue(
+        self,
+        queue: JobQueue<I, S, ASet>,
+    ) -> Builder<I, (), S, QueueSet<I, S, ASet>, ASet> {
         Builder {
             builder_state: QueueSet {
                 state: self.builder_state.state,
                 queue,
             },
             steps: self.steps,
+            activity_registry: self.activity_registry,
             _marker: PhantomData,
         }
     }
 }
 
-impl<I, S> Builder<I, (), S, QueueSet<I, S>>
+impl<I, S, ASet> Builder<I, (), S, QueueSet<I, S, ASet>, ASet>
 where
     I: Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
@@ -3073,12 +3206,13 @@ where
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
     /// # }
-    pub fn build(self) -> Job<I, S> {
+    pub fn build(self) -> Job<I, S, ASet> {
         let QueueSet { state, queue } = self.builder_state;
         Job {
             queue: Arc::new(queue),
             steps: Arc::new(self.steps),
             state,
+            activity_registry: self.activity_registry,
             _marker: PhantomData,
         }
     }
@@ -3093,7 +3227,44 @@ mod tests {
     use sqlx::{postgres::types::PgInterval, PgPool};
 
     use super::*;
-    use crate::{queue::graceful_shutdown, worker::pg_interval_to_span};
+    use crate::{
+        activity::{Activity, Error as ActivityError, Result as ActivityResult},
+        queue::graceful_shutdown,
+        worker::pg_interval_to_span,
+    };
+
+    struct EchoActivity;
+
+    impl Activity for EchoActivity {
+        const NAME: &'static str = "echo";
+
+        type Input = String;
+        type Output = String;
+
+        async fn execute(&self, input: Self::Input) -> ActivityResult<Self::Output> {
+            Ok(format!("echo:{input}"))
+        }
+    }
+
+    struct EmailActivity;
+
+    impl Activity for EmailActivity {
+        const NAME: &'static str = "email";
+
+        type Input = String;
+        type Output = ();
+
+        async fn execute(&self, input: Self::Input) -> ActivityResult<Self::Output> {
+            if input.is_empty() {
+                return Err(ActivityError::fatal(
+                    "empty_message",
+                    "email message is empty",
+                ));
+            }
+
+            Ok(())
+        }
+    }
 
     #[sqlx::test]
     async fn one_step(pool: PgPool) -> sqlx::Result<(), Error> {
@@ -3712,8 +3883,9 @@ mod tests {
         }
 
         let job = Job::builder()
+            .activity(EchoActivity)
             .step(|cx, Input { message }| async move {
-                let _: String = cx.call("echo-main", "echo", &message).await?;
+                let _: String = cx.call::<EchoActivity, _>("echo-main", &message).await?;
                 To::done()
             })
             .name("call_suspends_and_persists_activity_intent")
@@ -3774,8 +3946,9 @@ mod tests {
         }
 
         let job = Job::builder()
+            .activity(EmailActivity)
             .step(|cx, Input { message }| async move {
-                cx.emit("notify", "email", &message).await?;
+                cx.emit::<EmailActivity, _>("notify", &message).await?;
                 Err(TaskError::Retryable("retry me".to_string()))
             })
             .name("emit_not_persisted_on_retryable_failure")
@@ -3817,8 +3990,9 @@ mod tests {
         }
 
         let job = Job::builder()
+            .activity(EmailActivity)
             .step(|cx, Input { message }| async move {
-                cx.emit("notify", "email", &message).await?;
+                cx.emit::<EmailActivity, _>("notify", &message).await?;
                 To::done()
             })
             .name("emit_persisted_on_success")
@@ -3860,9 +4034,10 @@ mod tests {
         }
 
         let job = Job::builder()
+            .activity(EchoActivity)
             .step(|cx, Input { message }| async move {
-                let call_one = cx.call::<String, _>("call-1", "echo", &message);
-                let call_two = cx.call::<String, _>("call-2", "echo", &message);
+                let call_one = cx.call::<EchoActivity, _>("call-1", &message);
+                let call_two = cx.call::<EchoActivity, _>("call-2", &message);
 
                 let (result_one, result_two) = tokio::join!(call_one, call_two);
 

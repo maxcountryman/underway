@@ -1,9 +1,11 @@
 # Unreleased
 
 - Breaking: Remove `job::Context::tx`; step contexts no longer expose a worker transaction directly
-- Add: `Runtime` high-level orchestration API with activity registration
+- Breaking: Workflow activities are now registered on `Job::builder()` before steps
+- Add: `Runtime` high-level orchestration API sourced from builder-registered activities
 - Add: `Activity` trait and standard activity error envelope
-- Add: Durable `Context::call` and `Context::emit` primitives backed by `underway.activity_call`
+- Add: Durable typed `Context::call::<A, _>` and `Context::emit::<A, _>` primitives with compile-time registration checks
+- Fix: `Job::run` and `Job::start` now run the activity worker alongside worker and scheduler
 - Add: `waiting` task state to support workflow suspension while activity calls complete
 - Breaking: Rename `enqueue_multi` to `enqueue_many` and return task IDs for batch enqueue
 - Perf: Optimize `enqueue_many` for uniform-config batches

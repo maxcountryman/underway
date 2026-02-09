@@ -87,10 +87,28 @@ impl<A: Activity> ActivityHandler for RegisteredActivity<A> {
     }
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct ActivityRegistry {
+    handlers: HashMap<String, Arc<dyn ActivityHandler>>,
+}
+
+impl ActivityRegistry {
+    pub(crate) fn register<A: Activity>(&mut self, activity: A) {
+        self.handlers.insert(
+            A::NAME.to_string(),
+            Arc::new(RegisteredActivity { inner: activity }),
+        );
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.handlers.is_empty()
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ActivityWorker {
     pool: PgPool,
-    handlers: HashMap<String, Arc<dyn ActivityHandler>>,
+    registry: ActivityRegistry,
     shutdown_token: CancellationToken,
 }
 
@@ -108,20 +126,12 @@ struct ClaimedCall {
 }
 
 impl ActivityWorker {
-    pub(crate) fn new(pool: PgPool) -> Self {
+    pub(crate) fn with_registry(pool: PgPool, registry: ActivityRegistry) -> Self {
         Self {
             pool,
-            handlers: HashMap::new(),
+            registry,
             shutdown_token: CancellationToken::new(),
         }
-    }
-
-    pub(crate) fn activity<A: Activity>(mut self, activity: A) -> Self {
-        self.handlers.insert(
-            A::NAME.to_string(),
-            Arc::new(RegisteredActivity { inner: activity }),
-        );
-        self
     }
 
     pub(crate) fn set_shutdown_token(&mut self, shutdown_token: CancellationToken) {
@@ -129,7 +139,7 @@ impl ActivityWorker {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.handlers.is_empty()
+        self.registry.is_empty()
     }
 
     pub(crate) async fn run(&self) -> Result {
@@ -206,7 +216,7 @@ impl ActivityWorker {
             "Processing activity call"
         );
 
-        let Some(handler) = self.handlers.get(&call.activity).cloned() else {
+        let Some(handler) = self.registry.handlers.get(&call.activity).cloned() else {
             let err = activity::Error::fatal(
                 "activity_not_registered",
                 format!("No activity handler registered for `{}`", call.activity),

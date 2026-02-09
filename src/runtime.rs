@@ -48,8 +48,9 @@
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
 //!     let workflow = Job::builder()
+//!         .activity(LookupEmail)
 //!         .step(|cx, FetchUser { user_id }| async move {
-//!             let email: String = cx.call("lookup", LookupEmail::NAME, &user_id).await?;
+//!             let email: String = cx.call::<LookupEmail, _>("lookup", &user_id).await?;
 //!             println!("Got email {email}");
 //!             To::done()
 //!         })
@@ -58,7 +59,7 @@
 //!         .build()
 //!         .await?;
 //!
-//!     let runtime = Runtime::new(workflow).activity(LookupEmail);
+//!     let runtime = Runtime::new(workflow);
 //!     runtime.run().await?;
 //!     Ok(())
 //! }
@@ -69,7 +70,6 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    activity::Activity,
     activity_worker::{ActivityWorker, Error as ActivityWorkerError},
     job::Job,
     scheduler::Error as SchedulerError,
@@ -127,27 +127,30 @@ impl RuntimeHandle {
 
 /// High-level workflow runtime.
 #[derive(Clone)]
-pub struct Runtime<I, S>
+pub struct Runtime<I, S, A = crate::activity::registration::Nil>
 where
     I: Serialize + Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
+    A: 'static,
 {
-    workflow: Job<I, S>,
+    workflow: Job<I, S, A>,
     activity_worker: ActivityWorker,
 }
 
-impl<I, S> Runtime<I, S>
+impl<I, S, A> Runtime<I, S, A>
 where
     I: Serialize + Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
+    A: 'static,
 {
     /// Creates a runtime from a workflow.
     ///
-    /// By default this starts with no registered activities. Register activity
-    /// handlers via [`Runtime::activity`] before calling [`Runtime::run`] or
-    /// [`Runtime::start`].
-    pub fn new(workflow: Job<I, S>) -> Self {
-        let activity_worker = ActivityWorker::new(workflow.queue().pool.clone());
+    /// Registered activity handlers are sourced from the workflow's builder.
+    pub fn new(workflow: Job<I, S, A>) -> Self {
+        let activity_worker = ActivityWorker::with_registry(
+            workflow.queue().pool.clone(),
+            workflow.activity_registry(),
+        );
         Self {
             workflow,
             activity_worker,
@@ -155,17 +158,8 @@ where
     }
 
     /// Returns a reference to the workflow managed by this runtime.
-    pub fn workflow(&self) -> &Job<I, S> {
+    pub fn workflow(&self) -> &Job<I, S, A> {
         &self.workflow
-    }
-
-    /// Registers an activity handler for this runtime.
-    ///
-    /// Activity names must be unique per runtime. Register the same activity
-    /// type only once.
-    pub fn activity<A: Activity>(mut self, activity: A) -> Self {
-        self.activity_worker = self.activity_worker.activity(activity);
-        self
     }
 
     /// Runs this runtime to completion.
@@ -240,12 +234,13 @@ where
     }
 }
 
-impl<I, S> From<Job<I, S>> for Runtime<I, S>
+impl<I, S, A> From<Job<I, S, A>> for Runtime<I, S, A>
 where
     I: Serialize + Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
+    A: 'static,
 {
-    fn from(workflow: Job<I, S>) -> Self {
+    fn from(workflow: Job<I, S, A>) -> Self {
         Self::new(workflow)
     }
 }
@@ -298,8 +293,9 @@ mod tests {
         let outputs_step = outputs.clone();
 
         let workflow = Job::builder()
+            .activity(EchoActivity)
             .step(|cx, Step1 { message }| async move {
-                let echoed: String = cx.call("echo-main", EchoActivity::NAME, &message).await?;
+                let echoed: String = cx.call::<EchoActivity, _>("echo-main", &message).await?;
                 To::next(Step2 { echoed })
             })
             .step(move |_cx, Step2 { echoed }| {
@@ -314,7 +310,7 @@ mod tests {
             .build()
             .await?;
 
-        let runtime = Runtime::new(workflow).activity(EchoActivity);
+        let runtime = Runtime::new(workflow);
 
         runtime
             .workflow()

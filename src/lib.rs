@@ -73,8 +73,9 @@
 //! # rt.block_on(async {
 //! # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
 //! let workflow = Job::builder()
+//!     .activity(ResolveEmail)
 //!     .step(|cx, Input { user_id }| async move {
-//!         let _email: String = cx.call("resolve", ResolveEmail::NAME, &user_id).await?;
+//!         let _email: String = cx.call::<ResolveEmail, _>("resolve", &user_id).await?;
 //!         To::done()
 //!     })
 //!     .name("resolve-email")
@@ -82,7 +83,7 @@
 //!     .build()
 //!     .await?;
 //!
-//! Runtime::new(workflow).activity(ResolveEmail).run().await?;
+//! Runtime::new(workflow).run().await?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! # });
 //! # }
