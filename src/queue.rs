@@ -62,14 +62,14 @@
 //! # Processing tasks
 //!
 //! Note that while queues provide methods for enqueuing and dequeuing tasks,
-//! you will generaly not use these methods directly and instead use jobs and
-//! their workers, respectively.
+//! you will generaly not use these methods directly and instead use workflows
+//! and their workers, respectively.
 //!
-//! For example, `Job` provides an [`enqueue`](crate::Job::enqueue) method,
-//! which wraps its queue's enqueue method. Likewise, when a job spins up a
-//! worker via its [`run`](crate::Job::run) method, that worker uses its queue's
-//! dequeue method and in both cases there's no need to use the queue methods
-//! directly.
+//! For example, `Workflow` provides an [`enqueue`](crate::Workflow::enqueue)
+//! method, which wraps its queue's enqueue method. Likewise, when a workflow
+//! runtime starts workers via [`Runtime::run`](crate::Runtime::run), those
+//! workers use the queue's dequeue method and in both cases there's no need to
+//! use the queue methods directly.
 //!
 //! With that said, a queue may be interfaced with directly and operated
 //! manually if desired:
@@ -135,9 +135,9 @@
 //! It's important to note that a schedule **must** be set on the queue before
 //! the scheduler can be run.
 //!
-//! As with task processing, jobs provide an interface for scheduling. For
-//! example, the [`schedule`](crate::Job::schedule) method schedules the job.
-//! Once scheduled, a scheduler must be run to ensure exeuction.
+//! As with task processing, workflows provide an interface for scheduling. For
+//! example, the [`schedule`](crate::Workflow::schedule) method schedules the
+//! workflow. Once scheduled, a scheduler must be run to ensure exeuction.
 //!
 //! Of course it's also possible to interface directly with the queue to achieve
 //! the same if desired. Schedules can be set with the
@@ -1410,6 +1410,67 @@ impl InProgressTask {
             TaskState::Succeeded as TaskState,
             self.queue_name,
             self.attempt_number
+        )
+        .execute(&mut *conn)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(Error::TaskNotFound(self.id));
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn mark_waiting(&self, conn: &mut PgConnection) -> Result {
+        // Update the task attempt row.
+        let result = sqlx::query!(
+            r#"
+            update underway.task_attempt
+            set state = $3,
+                updated_at = now()
+            where task_id = $1
+              and task_queue_name = $2
+              and attempt_number = $4
+              and attempt_number = (
+                  select attempt_number
+                  from underway.task_attempt
+                  where task_id = $1
+                    and task_queue_name = $2
+                  order by attempt_number desc
+                  limit 1
+              )
+            "#,
+            self.id as TaskId,
+            self.queue_name,
+            TaskState::Waiting as TaskState,
+            self.attempt_number,
+        )
+        .execute(&mut *conn)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(Error::TaskNotFound(self.id));
+        }
+
+        // Update the task row.
+        let result = sqlx::query!(
+            r#"
+            update underway.task
+            set state = $2,
+                updated_at = now()
+            where id = $1
+              and task_queue_name = $3
+              and $4 = (
+                  select max(attempt_number)
+                  from underway.task_attempt
+                  where task_id = $1
+                    and task_queue_name = $3
+              )
+            "#,
+            self.id as TaskId,
+            TaskState::Waiting as TaskState,
+            self.queue_name,
+            self.attempt_number,
         )
         .execute(&mut *conn)
         .await?;

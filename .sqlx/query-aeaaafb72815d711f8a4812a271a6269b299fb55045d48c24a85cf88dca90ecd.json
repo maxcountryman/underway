@@ -57,6 +57,7 @@
               "Enum": [
                 "pending",
                 "in_progress",
+                "waiting",
                 "succeeded",
                 "cancelled",
                 "failed"

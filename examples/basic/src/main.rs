@@ -1,56 +1,78 @@
-use std::env;
+use std::{sync::Arc, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use underway::{Job, To};
+use tokio::{
+    sync::Mutex,
+    time::{sleep, timeout},
+};
+use underway::{To, Workflow};
 
-const QUEUE_NAME: &str = "example-basic";
+#[derive(Debug, Deserialize, Serialize)]
+struct ResizeImage {
+    asset_id: i64,
+}
 
-#[derive(Clone, Deserialize, Serialize)]
-struct WelcomeEmail {
-    user_id: i32,
-    email: String,
-    name: String,
+#[derive(Debug, Deserialize, Serialize)]
+struct PublishImage {
+    object_key: String,
+}
+
+#[derive(Clone, Default)]
+struct State {
+    completions: Arc<Mutex<Vec<String>>>,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Set up the database connection pool.
-    let database_url = &env::var("DATABASE_URL").expect("DATABASE_URL should be set");
-    let pool = PgPool::connect(database_url).await?;
+    let database_url = std::env::var("DATABASE_URL")?;
+    let pool = PgPool::connect(&database_url).await?;
 
-    // Run migrations.
     underway::run_migrations(&pool).await?;
 
-    // Build the job.
-    let job = Job::builder()
-        .step(
-            |_ctx,
-             WelcomeEmail {
-                 user_id,
-                 email,
-                 name,
-             }| async move {
-                // Simulate sending an email.
-                println!("Sending welcome email to {name} <{email}> (user_id: {user_id})");
+    let state = State::default();
+
+    let workflow = Workflow::builder()
+        .state(state.clone())
+        .step(|_cx, ResizeImage { asset_id }| async move {
+            let object_key = format!("images/{asset_id}.webp");
+            println!("Resized image {asset_id} -> {object_key}");
+
+            To::next(PublishImage { object_key })
+        })
+        .step(|cx, PublishImage { object_key }| {
+            let completions = cx.state.completions.clone();
+
+            async move {
+                println!("Publishing {object_key}");
+                completions.lock().await.push(object_key);
                 To::done()
-            },
-        )
-        .name(QUEUE_NAME)
+            }
+        })
+        .name("example-basic-workflow")
         .pool(pool)
         .build()
         .await?;
 
-    // Enqueue a job task.
-    job.enqueue(&WelcomeEmail {
-        user_id: 42,
-        email: "ferris@example.com".to_string(),
-        name: "Ferris".to_string(),
+    workflow.enqueue(&ResizeImage { asset_id: 42 }).await?;
+
+    let runtime_handle = workflow.runtime().start();
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if !state.completions.lock().await.is_empty() {
+                break;
+            }
+
+            sleep(Duration::from_millis(50)).await;
+        }
     })
     .await?;
 
-    // Start the worker to process tasks.
-    job.run().await?;
+    runtime_handle.shutdown().await?;
+
+    let completions = state.completions.lock().await.clone();
+    println!("Completed workflow outputs: {completions:?}");
 
     Ok(())
 }

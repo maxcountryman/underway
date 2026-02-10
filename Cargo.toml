@@ -1,10 +1,10 @@
 [package]
 name = "underway"
-description = "⏳ Durable step functions via Postgres"
+description = "⏳ Durable background workflows on Postgres"
 version = "0.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-keywords = ["background-jobs", "job-queue", "work-queue", "sqlx", "web"]
+keywords = ["background-workflows", "workflow-queue", "work-queue", "sqlx", "web"]
 categories = ["asynchronous", "database", "web-programming"]
 repository = "https://github.com/maxcountryman/underway"
 documentation = "https://docs.rs/underway"

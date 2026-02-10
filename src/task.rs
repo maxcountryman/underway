@@ -14,13 +14,13 @@
 //!
 //! # Implementing `Task`
 //!
-//! Generally you'll want to use the higher-level [`Job`](crate::Job)
+//! Generally you'll want to use the higher-level [`Workflow`](crate::Workflow)
 //! abstraction instead of implementing `Task` yourself. Its workflow is more
 //! ergonomic and therefore preferred for virtually all cases.
 //!
 //! However, it's possible to implement the trait directly. This may be useful
 //! for building more sophisticated behavior on top of the task concept that
-//! isn't already provided by `Job`.
+//! isn't already provided by `Workflow`.
 //!
 //! ```
 //! use serde::{Deserialize, Serialize};
@@ -138,6 +138,13 @@ pub enum Error {
     #[error("Task timed out after {0} during execution")]
     TimedOut(SignedDuration),
 
+    /// Indicates execution has suspended while waiting for external work.
+    ///
+    /// This is used by workflow-style tasks that need to pause until a durable
+    /// side effect completes.
+    #[error("{0}")]
+    Suspended(String),
+
     /// Error indicating that the task has encountered an unrecoverable error
     /// state.
     ///
@@ -164,9 +171,9 @@ pub enum Error {
 ///
 ///```rust
 /// use tokio::net;
-/// use underway::{Job, To, ToTaskResult};
+/// use underway::{To, ToTaskResult, Workflow};
 ///
-/// Job::<(), ()>::builder().step(|_, _| async {
+/// Workflow::<(), ()>::builder().step(|_, _| async {
 ///     // If we can't resolve DNS the issue may be transient and recoverable.
 ///     net::lookup_host("example.com:80").await.retryable()?;
 ///
@@ -179,9 +186,9 @@ pub enum Error {
 /// ```rust
 /// use std::env;
 ///
-/// use underway::{Job, To, ToTaskResult};
+/// use underway::{To, ToTaskResult, Workflow};
 ///
-/// Job::<(), ()>::builder().step(|_, _| async {
+/// Workflow::<(), ()>::builder().step(|_, _| async {
 ///     // If the API_KEY environment variable isn't set we can't recover.
 ///     let api_key = env::var("API_KEY").fatal()?;
 ///
@@ -524,7 +531,7 @@ pub trait Task: Send + 'static {
     /// Specifies the priority of the task.
     ///
     /// Higher-priority tasks will be processed before lower-priority ones. This
-    /// can be useful in systems where certain jobs are time-sensitive and
+    /// can be useful in systems where certain workflows are time-sensitive and
     /// need to be handled before others.
     ///
     /// The default priority is `0`, and higher numbers represent higher
@@ -619,6 +626,9 @@ pub enum State {
 
     /// Currently being processed.
     InProgress,
+
+    /// Execution suspended while waiting for external activity completion.
+    Waiting,
 
     /// Execute completed successfully.
     Succeeded,

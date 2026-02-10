@@ -19,9 +19,9 @@
 //!
 //! # Running workers
 //!
-//! Oftentimes you'll define [a job](crate::job) and use its methods to run a
-//! worker. However, workers can be manually constructed and only require a
-//! queue and task:
+//! Oftentimes you'll define [a workflow](crate::workflow) and use its methods
+//! to run a worker. However, workers can be manually constructed and only
+//! require a queue and task:
 //!
 //! ```rust,no_run
 //! # use tokio::runtime::Runtime;
@@ -900,6 +900,12 @@ impl<T: Task + Sync> Worker<T> {
         error: &TaskError,
     ) -> Result {
         tracing::error!(err = %error, "Task execution encountered an error");
+
+        if let TaskError::Suspended(reason) = error {
+            tracing::info!(%reason, "Task execution suspended");
+            in_progress_task.mark_waiting(conn).await?;
+            return Ok(());
+        }
 
         // Short-circuit on fatal errors.
         if matches!(error, TaskError::Fatal(_)) {
