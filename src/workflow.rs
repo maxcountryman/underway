@@ -11,16 +11,16 @@
 //! ╰───────────────╯   ╰───────────────╯   ╰───────────────╯
 //! ```
 //!
-//! Because each step is treated as its own task, steps are executed and then
-//! persisted, before the next task is enqueued. This means that when a step,
-//! the workflow will be resumed from where it was.
+//! Each step executes as its own task and is durably persisted before the next
+//! step is enqueued. If execution is interrupted, the workflow resumes from the
+//! last persisted step.
 //!
 //! # Defining workflows
 //!
 //! Workflows are formed from at least one step function.
 //!
 //! ```rust
-//! use underway::{Activity, To, Workflow};
+//! use underway::{To, Workflow};
 //!
 //! let workflow_builder = Workflow::<(), ()>::builder().step(|_cx, _| async move { To::done() });
 //! ```
@@ -43,6 +43,8 @@
 //! [`workflow_id`](crate::workflow::Context::workflow_id), as well as workflow
 //! helpers like [`call`](crate::workflow::Context::call) and
 //! [`emit`](crate::workflow::Context::emit).
+//! Activity calls are type-checked against handlers registered on
+//! [`workflow::Builder::activity`](crate::workflow::Builder::activity).
 //!
 //! The second argument is a type we provide as input to the step. In our
 //! example it's the unit type. But if we were to specify another type it would
@@ -53,7 +55,7 @@
 //!
 //! ```rust
 //! use serde::{Deserialize, Serialize};
-//! use underway::{Activity, To, Workflow};
+//! use underway::{To, Workflow};
 //!
 //! // Our very own input type.
 //! #[derive(Serialize, Deserialize)]
@@ -116,7 +118,7 @@
 //!
 //! ```rust,compile_fail
 //! use serde::{Deserialize, Serialize};
-//! use underway::{Activity, Workflow, To};
+//! use underway::{Workflow, To};
 //!
 //! #[derive(Serialize, Deserialize)]
 //! struct Step1 {
@@ -133,7 +135,7 @@
 //!     .step(|_cx, Step1 { n }| async move {
 //!         println!("Got {n}");
 //!
-//!         // This is does not compile!
+//!         // This does not compile!
 //!         To::next(Step1 { n })
 //!     })
 //!     .step(|_cx, Step2 { original, new }| async move {
@@ -143,7 +145,7 @@
 //! ```
 //!
 //! Often we want to immediately transition to the next step. However, there may
-//! be cases were we want to wait some time beforehand. We can return
+//! be cases where we want to wait some time beforehand. We can return
 //! [`To::delay_for`] to express this.
 //!
 //! Like transitioning to the next step, we give the input still but also supply
@@ -152,7 +154,7 @@
 //! ```rust
 //! use jiff::ToSpan;
 //! use serde::{Deserialize, Serialize};
-//! use underway::{Activity, To, Workflow};
+//! use underway::{To, Workflow};
 //!
 //! #[derive(Serialize, Deserialize)]
 //! struct Step1 {
@@ -201,7 +203,7 @@
 //! # assert!(until_tomorrow_morning.is_positive());
 //! ```
 //!
-//! Then this span may be used as our delay given to `To::delay`.
+//! Then this span may be used as our delay given to `To::delay_for`.
 //!
 //! # Stateful workflows
 //!
@@ -259,6 +261,9 @@
 //! Instead, durable side effects are modeled with workflow helpers:
 //! - [`Context::emit`] for fire-and-forget intents, and
 //! - [`Context::call`] for request/response effects.
+//!
+//! Activities must be registered on the workflow builder before any step that
+//! calls or emits them. Missing registrations fail at compile time.
 //!
 //! A `call` does **not** require user polling loops. When a call has not
 //! completed yet, it suspends the current step. The worker marks the task as
@@ -1086,7 +1091,7 @@ impl<T: Task> EnqueuedWorkflow<T> {
     /// # Errors
     ///
     /// This will return an error if the database operation fails and if the
-    /// task ID cannot be found.
+    /// workflow ID cannot be found.
     ///
     /// # Example
     ///
@@ -1296,8 +1301,8 @@ where
     /// application may already be using in a given context.
     ///
     /// **Note:** If you pass a transactional executor and the transaction is
-    /// rolled back, the returned task ID will not correspond to any persisted
-    /// task.
+    /// rolled back, the returned workflow ID will not correspond to any
+    /// persisted task.
     ///
     /// # Errors
     ///
@@ -1479,8 +1484,8 @@ where
     /// application may already be using in a given context.
     ///
     /// **Note:** If you pass a transactional executor and the transaction is
-    /// rolled back, the returned task ID will not correspond to any persisted
-    /// task.
+    /// rolled back, the returned workflow ID will not correspond to any
+    /// persisted task.
     ///
     /// # Errors
     ///
@@ -1611,7 +1616,7 @@ where
     /// #
     ///
     /// // Our own transaction.
-    /// let mut tx = pool.acquire().await?;
+    /// let mut tx = pool.begin().await?;
     ///
     /// # let workflow = Workflow::builder()
     /// #     .step(|_cx, _| async move { To::done() })
@@ -1710,7 +1715,7 @@ where
     /// # */
     /// #
     ///
-    /// let mut tx = pool.acquire().await?;
+    /// let mut tx = pool.begin().await?;
     ///
     /// # let workflow = Workflow::<(), _>::builder()
     /// #     .step(|_cx, _| async move { To::done() })

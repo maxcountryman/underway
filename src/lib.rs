@@ -13,10 +13,14 @@
 //!
 //! - **PostgreSQL-Backed** Leverages PostgreSQL with `FOR UPDATE SKIP LOCKED`
 //!   for reliable task storage and coordination.
-//! - **Atomic Task Management**: Enqueue tasks within your transactions and use
-//!   the `Task` API transaction for atomic database queries.
+//! - **Runtime-First Execution**: Run workflows through [`Runtime`] via
+//!   `workflow.runtime().run()` or `workflow.runtime().start()`.
 //! - **Durable Workflow Effects**: Use workflow context call/emit primitives
 //!   with registered activities for durable side-effect execution.
+//! - **Compile-Time Safe Activities**: Register activity handlers on
+//!   [`Workflow::builder`] and call them from steps with typed APIs.
+//! - **Transactional Enqueue and Schedule**: Use `*_using` APIs to enqueue or
+//!   schedule workflows inside your own transactions.
 //! - **Automatic Retries**: Configurable retry strategies ensure tasks are
 //!   reliably completed, even after transient failures.
 //! - **Cron-Like Scheduling**: Schedule recurring tasks with cron-like
@@ -34,13 +38,14 @@
 //!   completes.
 //! - `emit` is fire-and-forget and records intent durably.
 //!
-//! Activity handlers are registered on [`Runtime`] and run alongside workers
-//! and schedulers.
+//! Activity handlers are registered on [`Workflow::builder`] via
+//! [`workflow::Builder::activity`](crate::workflow::Builder::activity), and
+//! then run by the workflow's runtime.
 //!
 //! ```rust,no_run
 //! use serde::{Deserialize, Serialize};
 //! use sqlx::PgPool;
-//! use underway::{Activity, ActivityError, Runtime, To, Workflow};
+//! use underway::{Activity, ActivityError, To, Workflow};
 //!
 //! #[derive(Deserialize, Serialize)]
 //! struct Input {
@@ -83,7 +88,7 @@
 //!     .build()
 //!     .await?;
 //!
-//! Runtime::new(workflow).run().await?;
+//! workflow.runtime().run().await?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! # });
 //! # }
@@ -297,6 +302,9 @@
 //! - [Tasks](#tasks) represent a well-structured unit of work.
 //! - [Workflows](#workflows) are a series of sequential steps, where each step
 //!   is a [`Task`].
+//! - [Runtime](#runtime) orchestrates workflow workers, schedulers, and
+//!   activities.
+//! - [Activities](#activities) model durable side effects for workflow steps.
 //! - [Queues](#queues) provide an interface for managing task lifecycle.
 //! - [Workers](#workers) interface with queues to execute tasks.
 //!
@@ -320,6 +328,22 @@
 //!
 //! See [`workflow`] for more details about workflows.
 //!
+//! ## Runtime
+//!
+//! Runtime is the high-level execution entrypoint for workflows. It starts and
+//! coordinates worker, scheduler, and activity-worker loops so suspended
+//! workflow calls can resume automatically.
+//!
+//! See [`runtime`] for more details about runtime orchestration.
+//!
+//! ## Activities
+//!
+//! Activities are durable side-effect handlers invoked from workflow steps
+//! through [`workflow::Context::call`](crate::workflow::Context::call) and
+//! [`workflow::Context::emit`](crate::workflow::Context::emit).
+//!
+//! See [`activity`] for more details about activity handlers and errors.
+//!
 //! ## Queues
 //!
 //! Queues manage task lifecycle, including enqueuing and dequeuing them from
@@ -337,42 +361,49 @@
 //! ## Strata
 //!
 //! The Underway system is split into a **lower-level** and a **higher-level**
-//! system, where the latter is the **workflow** abstraction and the former is
-//! everything else. More specifically the lower-level components are the
-//! **queue**, **worker**, **scheduler**, and **task**. The locus of the
-//! composite system is the task, with all components being built with or around
-//! it.
+//! system. The higher-level layer is **workflow + runtime + activities**; the
+//! lower-level layer is **queue + worker + scheduler + task**.
 //!
 //! ```text
-//!                        ╭───────────────╮
-//!                        │      Workflow      │
-//!                        │  (impl Task)  │
-//!                        ╰───────────────╯
-//!                                │
-//!                                ▼
-//!                        ╭───────────────╮
-//!                     ┏━━│     Queue     │◀━┓
-//!                     ┃  ╰───────────────╯  ┃
-//!  ╭───────────────╮  ┃          ◊          ┃  ╭───────────────╮
-//!  │    Worker     │◀━┩          │          ┡━━│   Scheduler   │
-//!  ╰───────────────╯  │  ╭───────────────╮  │  ╰───────────────╯
-//!                     └─▶│     Task      │◀─┘
-//!                        ╰───────────────╯
+//!                   ╭────────────────────────╮
+//!                   │        Runtime         │
+//!                   │   run/start/shutdown   │
+//!                   ╰───────────┬────────────╯
+//!                               │
+//!           ╭───────────────────┼───────────────────╮
+//!           ▼                   ▼                   ▼
+//!     ╭──────────╮        ╭──────────╮        ╭──────────────╮
+//!     │  Worker  │        │Scheduler │        │ActivityWorker│
+//!     ╰────┬─────╯        ╰────┬─────╯        ╰──────┬───────╯
+//!          ╰───────────────────┴──────────────────────╯
+//!                              ▼
+//!                         ╭──────────╮
+//!                         │  Queue   │
+//!                         ╰────┬─────╯
+//!                              ▼
+//!                         ╭──────────╮
+//!                         │   Task   │
+//!                         ╰────┬─────╯
+//!                              ▲
+//!                         ╭──────────╮
+//!                         │ Workflow │
+//!                         │impl Task │
+//!                         ╰──────────╯
 //! ```
 //!
 //! These components are designed to promote clear [separation of
 //! concerns][SoC], with each having a well-defined purpose and clear boundary
-//! in relationship to the other components.
+//! in relation to the other components.
 //!
-//! For example, queues manage task life cycle, encapsulating state transitions
-//! and persisiting the task's canonical state in the database. Whereas workers
+//! For example, queues manage task lifecycle, encapsulating state transitions
+//! and persisting a task's canonical state in the database. Workers
 //! and schedulers interface with the queue to process tasks or enqueue tasks
 //! for execution, respectively.
 //!
 //! At the uppermost layer, workflows are built on top of this subsystem, and
 //! are an implementation of the `Task` trait. Put another way, the lower-level
-//! system is unawre of the concept of a "workflow" and treats it like any other
-//! task.
+//! system is unaware of the concept of a "workflow" and treats it like any
+//! other task.
 //!
 //! [SoC]: https://en.wikipedia.org/wiki/Separation_of_concerns
 #![warn(clippy::all, nonstandard_style, future_incompatible, missing_docs)]
