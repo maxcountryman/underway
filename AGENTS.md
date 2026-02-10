@@ -25,7 +25,7 @@
 - `cargo +nightly fmt --all -- --check` checks formatting.
 - `RUSTDOCFLAGS="-D rustdoc::broken-intra-doc-links" cargo doc --all-features --no-deps`.
 - `cargo run --manifest-path examples/basic/Cargo.toml` runs a sample crate.
-- `cargo run --manifest-path examples/scheduled/Cargo.toml` runs another example.
+- `cargo run --manifest-path examples/activities/Cargo.toml` runs the activity example.
 
 ### CI parity checks
 - CI installs the nightly toolchain for rustfmt/clippy.
@@ -43,12 +43,7 @@ cargo test --doc Workflow
 
 ### Example crates
 - `examples/basic` basic workflow usage.
-- `examples/scheduled` scheduled workflows.
-- `examples/step` step-by-step usage.
-- `examples/multitask` multi-task workflows.
-- `examples/graceful_shutdown` shutdown flow.
-- `examples/tracing` tracing instrumentation.
-- `examples/rag` sample integration (see its README).
+- `examples/activities` durable `call`/`emit` workflow activities usage.
 
 ### Database + SQLX setup
 - `docker-compose up -d postgres` starts local Postgres.

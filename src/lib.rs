@@ -1,38 +1,80 @@
 //! # Underway
 //!
-//! ⏳ Durable step functions via Postgres.
+//! ⏳ Durable background workflows on Postgres.
 //!
 //! # Overview
 //!
-//! **Underway** provides durable background workflows over Postgres. Workflows
-//! are composed of a sequence of one or more steps. Each step takes the output
-//! of the previous step as its input. These simple workflows provide a powerful
-//! interface to common deferred work use cases.
+//! **Underway** runs durable background workflows on the Postgres you already
+//! operate. Model business flows as typed Rust steps, execute durable side
+//! effects through activities, and recover cleanly across retries, restarts,
+//! and deploys.
 //!
 //! Key Features:
 //!
-//! - **PostgreSQL-Backed** Leverages PostgreSQL with `FOR UPDATE SKIP LOCKED`
-//!   for reliable task storage and coordination.
-//! - **Runtime-First Execution**: Run workflows through [`Runtime`] via
-//!   `workflow.runtime().run()` or `workflow.runtime().start()`.
-//! - **Durable Workflow Effects**: Use workflow context call/emit primitives
-//!   with registered activities for durable side-effect execution.
-//! - **Compile-Time Safe Activities**: Register activity handlers on
-//!   [`Workflow::builder`] and call them from steps with typed APIs.
-//! - **Transactional Enqueue and Schedule**: Use `*_using` APIs to enqueue or
-//!   schedule workflows inside your own transactions.
-//! - **Automatic Retries**: Configurable retry strategies ensure tasks are
-//!   reliably completed, even after transient failures.
-//! - **Cron-Like Scheduling**: Schedule recurring tasks with cron-like
-//!   expressions for automated, time-based workflow execution.
-//! - **Scalable and Flexible**: Easily scales from a single worker to many,
-//!   enabling seamless background workflow processing with minimal setup.
+//! - **Recover from Failures Automatically** Workflow progress and activity
+//!   intent are persisted, so work resumes after restarts, crashes, and
+//!   deploys.
+//! - **Use the Postgres You Already Run** No extra broker or orchestration
+//!   layer; queue coordination and task claiming happen in PostgreSQL.
+//! - **Model Business Flows in Typed Rust** Build multi-step workflows with
+//!   compile-time checked step inputs, outputs, and transitions.
+//! - **Make Side Effects Durable and Replay-Safe** `Context::call` and
+//!   `Context::emit` persist side-effect intent, and registered activities are
+//!   compile-time checked.
+//! - **Operate with Production Controls** Transactional `*_using` APIs,
+//!   retries, cron scheduling, heartbeats, and fencing support reliable
+//!   high-concurrency execution.
+//!
+//! ## Quick Start
+//!
+//! The example below shows the smallest runtime-first flow: run migrations,
+//! build a workflow, enqueue input, and start the runtime.
+//!
+//! ```rust,no_run
+//! use serde::{Deserialize, Serialize};
+//! use sqlx::PgPool;
+//! use underway::{To, Workflow};
+//!
+//! #[derive(Deserialize, Serialize)]
+//! struct SendWelcomeEmail {
+//!     user_id: i64,
+//! }
+//!
+//! # use tokio::runtime::Runtime as TokioRuntime;
+//! # fn main() {
+//! # let rt = TokioRuntime::new().unwrap();
+//! # rt.block_on(async {
+//! # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+//! underway::run_migrations(&pool).await?;
+//!
+//! let workflow = Workflow::builder()
+//!     .step(|_cx, SendWelcomeEmail { user_id }| async move {
+//!         println!("sending welcome email to user {user_id}");
+//!         To::done()
+//!     })
+//!     .name("send-welcome-email")
+//!     .pool(pool)
+//!     .build()
+//!     .await?;
+//!
+//! workflow.enqueue(&SendWelcomeEmail { user_id: 42 }).await?;
+//!
+//! let runtime_handle = workflow.runtime().start();
+//! runtime_handle.shutdown().await?;
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! # });
+//! # }
+//! ```
+//!
+//! This same pattern scales to multi-step workflows by returning `To::next`.
+//! For durable side effects, see the Workflow Activities section below.
 //!
 //! ## Workflow Activities
 //!
-//! In addition to plain step chaining, workflows can invoke durable activities
-//! through [`workflow::Context::call`](crate::workflow::Context::call) and
-//! [`workflow::Context::emit`](crate::workflow::Context::emit).
+//! For durable side effects beyond plain step chaining, workflows can invoke
+//! activities through
+//! [`workflow::Context::call`](crate::workflow::Context::call)
+//! and [`workflow::Context::emit`](crate::workflow::Context::emit).
 //!
 //! - `call` is request/response and may suspend a step until the activity
 //!   completes.
@@ -96,202 +138,178 @@
 //!
 //! # Examples
 //!
-//! Underway is suitable for many different use cases, ranging from simple
-//! single-step workflows to more sophisticated multi-step workflows, where
-//! dependencies are built up between steps.
+//! The following examples mirror common production patterns.
 //!
-//! ## Welcome emails
-//!
-//! A common use case is deferring work that can be processed later. For
-//! instance, during user registration, we might want to send a welcome email to
-//! new users. Rather than handling this within the registration process (e.g.,
-//! form validation, database insertion), we can offload it to run "out-of-band"
-//! using Underway. By defining a workflow for sending the welcome email,
-//! Underway ensures it gets processed in the background, without slowing down
-//! the user registration flow.
+//! ## Build and run a workflow
 //!
 //! ```rust,no_run
-//! use std::env;
-//!
 //! use serde::{Deserialize, Serialize};
 //! use sqlx::PgPool;
 //! use underway::{To, Workflow};
 //!
-//! // This is the input we'll provide to the workflow when we enqueue it.
 //! #[derive(Deserialize, Serialize)]
-//! struct WelcomeEmail {
-//!     user_id: i32,
-//!     email: String,
-//!     name: String,
+//! struct ResizeImage {
+//!     asset_id: i64,
 //! }
 //!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     // Set up the database connection pool.
-//!     let database_url = &env::var("DATABASE_URL").expect("DATABASE_URL should be set");
-//!     let pool = PgPool::connect(database_url).await?;
-//!
-//!     // Run migrations.
-//!     underway::run_migrations(&pool).await?;
-//!
-//!     // Build the workflow.
-//!     let workflow = Workflow::builder()
-//!         .step(
-//!             |_cx,
-//!              WelcomeEmail {
-//!                  user_id,
-//!                  email,
-//!                  name,
-//!              }| async move {
-//!                 // Simulate sending an email.
-//!                 println!("Sending welcome email to {name} <{email}> (user_id: {user_id})");
-//!                 // Returning this indicates this is the final step.
-//!                 To::done()
-//!             },
-//!         )
-//!         .name("welcome-email")
-//!         .pool(pool)
-//!         .build()
-//!         .await?;
-//!
-//!     // Here we enqueue a new workflow to be processed later.
-//!     workflow
-//!         .enqueue(&WelcomeEmail {
-//!             user_id: 42,
-//!             email: "ferris@example.com".to_string(),
-//!             name: "Ferris".to_string(),
-//!         })
-//!         .await?;
-//!
-//!     // Start processing enqueued workflows.
-//!     let runtime_handle = workflow.runtime().start();
-//!     runtime_handle.shutdown().await?;
-//!
-//!     Ok(())
+//! #[derive(Deserialize, Serialize)]
+//! struct PublishImage {
+//!     object_key: String,
 //! }
+//!
+//! # use tokio::runtime::Runtime as TokioRuntime;
+//! # fn main() {
+//! # let rt = TokioRuntime::new().unwrap();
+//! # rt.block_on(async {
+//! let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+//! underway::run_migrations(&pool).await?;
+//!
+//! let workflow = Workflow::builder()
+//!     .step(|_cx, ResizeImage { asset_id }| async move {
+//!         let object_key = format!("images/{asset_id}.webp");
+//!         To::next(PublishImage { object_key })
+//!     })
+//!     .step(|_cx, PublishImage { object_key }| async move {
+//!         println!("Publishing {object_key}");
+//!         To::done()
+//!     })
+//!     .name("image-pipeline")
+//!     .pool(pool)
+//!     .build()
+//!     .await?;
+//!
+//! workflow.enqueue(&ResizeImage { asset_id: 42 }).await?;
+//!
+//! let runtime_handle = workflow.runtime().start();
+//! runtime_handle.shutdown().await?;
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! # });
+//! # }
 //! ```
 //!
-//! ## Order receipts
-//!
-//! Another common use case is defining dependencies between discrete steps of a
-//! workflow. For instance, we might generate PDF receipts for orders and then
-//! email these to customers. With Underway, each step is handled separately,
-//! making it easy to create a workflow that first generates the PDF and, once
-//! completed, proceeds to send the email.
-//!
-//! This separation provides significant value: if the email sending service
-//! is temporarily unavailable, we can retry the email step without having to
-//! regenerate the PDF, avoiding unnecessary repeated work.
+//! ## Durable side effects with activities
 //!
 //! ```rust,no_run
-//! use std::env;
-//!
 //! use serde::{Deserialize, Serialize};
 //! use sqlx::PgPool;
-//! use underway::{To, Workflow};
+//! use underway::{Activity, ActivityError, To, Workflow};
 //!
-//! #[derive(Deserialize, Serialize)]
-//! struct GenerateReceipt {
-//!     // An order we want to generate a receipt for.
-//!     order_id: i32,
+//! #[derive(Clone)]
+//! struct LookupEmail {
+//!     pool: PgPool,
+//! }
+//!
+//! impl Activity for LookupEmail {
+//!     const NAME: &'static str = "lookup-email";
+//!
+//!     type Input = i64;
+//!     type Output = String;
+//!
+//!     async fn execute(&self, user_id: Self::Input) -> underway::activity::Result<Self::Output> {
+//!         let email =
+//!             sqlx::query_scalar::<_, String>("select concat('user-', $1::text, '@example.com')")
+//!                 .bind(user_id)
+//!                 .fetch_one(&self.pool)
+//!                 .await
+//!                 .map_err(|err| ActivityError::retryable("db_error", err.to_string()))?;
+//!
+//!         Ok(email)
+//!     }
+//! }
+//!
+//! struct TrackSignupMetric;
+//!
+//! impl Activity for TrackSignupMetric {
+//!     const NAME: &'static str = "track-signup-metric";
+//!
+//!     type Input = String;
+//!     type Output = ();
+//!
+//!     async fn execute(&self, email: Self::Input) -> underway::activity::Result<Self::Output> {
+//!         println!("tracking signup metric for {email}");
+//!         Ok(())
+//!     }
 //! }
 //!
 //! #[derive(Deserialize, Serialize)]
-//! struct EmailReceipt {
-//!     // An object store key to our receipt PDF.
-//!     receipt_key: String,
+//! struct Signup {
+//!     user_id: i64,
 //! }
 //!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     // Set up the database connection pool.
-//!     let database_url = &env::var("DATABASE_URL").expect("DATABASE_URL should be set");
-//!     let pool = PgPool::connect(database_url).await?;
+//! # use tokio::runtime::Runtime as TokioRuntime;
+//! # fn main() {
+//! # let rt = TokioRuntime::new().unwrap();
+//! # rt.block_on(async {
+//! let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+//! underway::run_migrations(&pool).await?;
 //!
-//!     // Run migrations.
-//!     underway::run_migrations(&pool).await?;
+//! let workflow = Workflow::builder()
+//!     .activity(LookupEmail { pool: pool.clone() })
+//!     .activity(TrackSignupMetric)
+//!     .step(|mut cx, Signup { user_id }| async move {
+//!         let email: String = cx.call::<LookupEmail, _>("lookup", &user_id).await?;
+//!         cx.emit::<TrackSignupMetric, _>("track", &email).await?;
+//!         To::done()
+//!     })
+//!     .name("signup-side-effects")
+//!     .pool(pool)
+//!     .build()
+//!     .await?;
 //!
-//!     // Build the workflow.
-//!     let workflow = Workflow::builder()
-//!         .step(|_cx, GenerateReceipt { order_id }| async move {
-//!             // Use the order ID to build a receipt PDF...
-//!             let receipt_key = format!("receipts_bucket/{order_id}-receipt.pdf");
-//!             // ...store the PDF in an object store.
-//!
-//!             // We proceed to the next step with the receipt_key as its input.
-//!             To::next(EmailReceipt { receipt_key })
-//!         })
-//!         .step(|_cx, EmailReceipt { receipt_key }| async move {
-//!             // Retrieve the PDF from the object store, and send the email.
-//!             println!("Emailing receipt for {receipt_key}");
-//!             To::done()
-//!         })
-//!         .name("order-receipt")
-//!         .pool(pool)
-//!         .build()
-//!         .await?;
-//!
-//!     // Enqueue the workflow for the given order.
-//!     workflow.enqueue(&GenerateReceipt { order_id: 42 }).await?;
-//!
-//!     // Start processing enqueued workflows.
-//!     let runtime_handle = workflow.runtime().start();
-//!     runtime_handle.shutdown().await?;
-//!
-//!     Ok(())
-//! }
+//! workflow.enqueue(&Signup { user_id: 42 }).await?;
+//! workflow.runtime().run().await?;
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! # });
+//! # }
 //! ```
 //!
-//! With this setup, if the email service is down, the `EmailReceipt` step can
-//! be retried without redoing the PDF generation, saving time and resources by
-//! not repeating the expensive step of generating the PDF.
-//!
-//! ## Daily reports
-//!
-//! Workflows may also be run on a schedule. This makes them useful for
-//! situations where we want to do things on a regular cadence, such as creating
-//! a daily business report.
+//! ## Enqueue and schedule in your transaction
 //!
 //! ```rust,no_run
-//! use std::env;
-//!
 //! use serde::{Deserialize, Serialize};
 //! use sqlx::PgPool;
 //! use underway::{To, Workflow};
 //!
 //! #[derive(Deserialize, Serialize)]
-//! struct DailyReport;
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     // Set up the database connection pool.
-//!     let database_url = &env::var("DATABASE_URL").expect("DATABASE_URL should be set");
-//!     let pool = PgPool::connect(database_url).await?;
-//!
-//!     // Run migrations.
-//!     underway::run_migrations(&pool).await?;
-//!
-//!     // Build the workflow.
-//!     let workflow = Workflow::builder()
-//!         .step(|_cx, _| async move {
-//!             // Here we would generate and store the report.
-//!             To::done()
-//!         })
-//!         .name("daily-report")
-//!         .pool(pool)
-//!         .build()
-//!         .await?;
-//!
-//!     // Set a daily schedule with the given input.
-//!     let daily = "@daily[America/Los_Angeles]".parse()?;
-//!     workflow.schedule(&daily, &DailyReport).await?;
-//!
-//!     // Start processing enqueued workflows.
-//!     let runtime_handle = workflow.runtime().start();
-//!     runtime_handle.shutdown().await?;
-//!
-//!     Ok(())
+//! struct TenantCleanup {
+//!     tenant_id: i64,
 //! }
+//!
+//! # use tokio::runtime::Runtime as TokioRuntime;
+//! # fn main() {
+//! # let rt = TokioRuntime::new().unwrap();
+//! # rt.block_on(async {
+//! let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+//! underway::run_migrations(&pool).await?;
+//!
+//! let workflow = Workflow::builder()
+//!     .step(|_cx, TenantCleanup { tenant_id }| async move {
+//!         println!("Running cleanup for tenant {tenant_id}");
+//!         To::done()
+//!     })
+//!     .name("tenant-cleanup")
+//!     .pool(pool.clone())
+//!     .build()
+//!     .await?;
+//!
+//! let nightly = "0 2 * * *[UTC]".parse()?;
+//! let tenant_id = 7;
+//! let input = TenantCleanup { tenant_id };
+//!
+//! let mut tx = pool.begin().await?;
+//!
+//! sqlx::query("update app_tenant set cleanup_enabled = true where id = $1")
+//!     .bind(tenant_id)
+//!     .execute(&mut *tx)
+//!     .await?;
+//!
+//! workflow.enqueue_using(&mut *tx, &input).await?;
+//! workflow.schedule_using(&mut *tx, &nightly, &input).await?;
+//!
+//! tx.commit().await?;
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! # });
+//! # }
 //! ```
 //!
 //! # Concepts
@@ -358,54 +376,6 @@
 //!
 //! See [`worker`] for more details about workers.
 //!
-//! ## Strata
-//!
-//! The Underway system is split into a **lower-level** and a **higher-level**
-//! system. The higher-level layer is **workflow + runtime + activities**; the
-//! lower-level layer is **queue + worker + scheduler + task**.
-//!
-//! ```text
-//!                   ╭────────────────────────╮
-//!                   │        Runtime         │
-//!                   │   run/start/shutdown   │
-//!                   ╰───────────┬────────────╯
-//!                               │
-//!           ╭───────────────────┼───────────────────╮
-//!           ▼                   ▼                   ▼
-//!     ╭──────────╮        ╭──────────╮        ╭──────────────╮
-//!     │  Worker  │        │Scheduler │        │ActivityWorker│
-//!     ╰────┬─────╯        ╰────┬─────╯        ╰──────┬───────╯
-//!          ╰───────────────────┴──────────────────────╯
-//!                              ▼
-//!                         ╭──────────╮
-//!                         │  Queue   │
-//!                         ╰────┬─────╯
-//!                              ▼
-//!                         ╭──────────╮
-//!                         │   Task   │
-//!                         ╰────┬─────╯
-//!                              ▲
-//!                         ╭──────────╮
-//!                         │ Workflow │
-//!                         │impl Task │
-//!                         ╰──────────╯
-//! ```
-//!
-//! These components are designed to promote clear [separation of
-//! concerns][SoC], with each having a well-defined purpose and clear boundary
-//! in relation to the other components.
-//!
-//! For example, queues manage task lifecycle, encapsulating state transitions
-//! and persisting a task's canonical state in the database. Workers
-//! and schedulers interface with the queue to process tasks or enqueue tasks
-//! for execution, respectively.
-//!
-//! At the uppermost layer, workflows are built on top of this subsystem, and
-//! are an implementation of the `Task` trait. Put another way, the lower-level
-//! system is unaware of the concept of a "workflow" and treats it like any
-//! other task.
-//!
-//! [SoC]: https://en.wikipedia.org/wiki/Separation_of_concerns
 #![warn(clippy::all, nonstandard_style, future_incompatible, missing_docs)]
 #![forbid(unsafe_code)]
 

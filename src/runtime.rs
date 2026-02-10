@@ -17,7 +17,7 @@
 //! ```rust,no_run
 //! use serde::{Deserialize, Serialize};
 //! use sqlx::PgPool;
-//! use underway::{Activity, ActivityError, Runtime, To, Workflow};
+//! use underway::{Activity, ActivityError, To, Workflow};
 //!
 //! #[derive(Deserialize, Serialize)]
 //! struct FetchUser {
@@ -59,8 +59,7 @@
 //!         .build()
 //!         .await?;
 //!
-//!     let runtime = Runtime::new(workflow);
-//!     runtime.run().await?;
+//!     workflow.runtime().run().await?;
 //!     Ok(())
 //! }
 //! ```

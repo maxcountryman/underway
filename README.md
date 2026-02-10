@@ -3,7 +3,7 @@
 </h1>
 
 <p align="center">
-    ⏳ Durable step functions via Postgres.
+    ⏳ Durable background workflows on Postgres.
 </p>
 
 <div align="center">
@@ -20,25 +20,24 @@
 
 ## 🎨 Overview
 
-**Underway** provides durable background workflows over Postgres. Workflows are composed of a sequence of one or more steps. Each step takes the output of the previous step as its input. These simple workflows provide a powerful interface to common deferred work use cases.
+**Underway** runs durable background workflows on the Postgres you already operate.
+Model business flows as typed Rust steps, execute durable side effects through
+activities, and recover cleanly across retries, restarts, and deploys.
 
 Key Features:
 
-- **Runtime-First Execution** Run workflows via `workflow.runtime().run()` or
-  `workflow.runtime().start()`.
-- **PostgreSQL-Backed Coordination** Uses PostgreSQL with `FOR UPDATE SKIP
-  LOCKED` for reliable queue coordination.
-- **Transactional Enqueue and Schedule** Use `*_using` APIs to enqueue or
-  schedule workflows inside your own transactions.
-- **Durable Activity Effects** Use `Context::call` and `Context::emit` for
-  persisted side effects with suspend/resume behavior.
-- **Compile-Time Safe Activities** Register handlers on
-  `Workflow::builder().activity(...)`; calls are typed and unregistered
-  activities fail at compile time.
-- **Leased Execution and Fencing** Heartbeats act as task leases; stale
-  heartbeats trigger new attempts and fence out old workers.
-- **Automatic Retries and Scheduling** Configure retries per task/workflow and
-  run recurring workflows with cron-like schedules.
+- **Recover from Failures Automatically** Workflow progress and activity intent
+  are persisted, so work resumes after restarts, crashes, and deploys.
+- **Use the Postgres You Already Run** No extra broker or orchestration layer;
+  queue coordination and task claiming happen in PostgreSQL.
+- **Model Business Flows in Typed Rust** Build multi-step workflows with
+  compile-time checked step inputs, outputs, and transitions.
+- **Make Side Effects Durable and Replay-Safe** `Context::call` and
+  `Context::emit` persist side-effect intent, and registered activities are
+  compile-time checked.
+- **Operate with Production Controls** Transactional `*_using` APIs, retries,
+  cron scheduling, heartbeats, and fencing support reliable high-concurrency
+  execution.
 
 ## 🤸 Usage
 
