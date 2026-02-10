@@ -1,175 +1,20 @@
-use std::{future::Future, marker::PhantomData, pin::Pin, sync::Arc};
+use std::{future::Future, marker::PhantomData, sync::Arc};
 
-use jiff::{Span, ToSpan};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use jiff::Span;
+use serde::{de::DeserializeOwned, Serialize};
 use sqlx::PgPool;
 
-use super::{Context, Result, Workflow, WorkflowQueue};
-use crate::{
-    activity,
-    queue::Queue,
-    task::{Error as TaskError, Result as TaskResult, RetryPolicy},
+use super::{
+    registration::{ActivitySet, NoActivities, Registered},
+    step::{StepConfig, To},
+    Context, Result, Workflow, WorkflowQueue,
 };
-
-pub(super) struct StepConfig<S, A> {
-    pub(super) executor: Box<dyn StepExecutor<S, A>>,
-    pub(super) task_config: StepTaskConfig,
-}
-
-#[derive(Clone)]
-pub(super) struct StepTaskConfig {
-    pub(super) retry_policy: RetryPolicy,
-    pub(super) timeout: Span,
-    pub(super) ttl: Span,
-    pub(super) delay: Span,
-    pub(super) heartbeat: Span,
-    pub(super) concurrency_key: Option<String>,
-    pub(super) priority: i32,
-}
-
-impl Default for StepTaskConfig {
-    fn default() -> Self {
-        Self {
-            retry_policy: RetryPolicy::default(),
-            timeout: 15.minutes(),
-            ttl: 14.days(),
-            delay: Span::new(),
-            heartbeat: 30.seconds(),
-            concurrency_key: None,
-            priority: 0,
-        }
-    }
-}
-
-/// Represents the state after executing a step.
-#[derive(Deserialize, Serialize)]
-pub enum To<N> {
-    /// The next step to transition to.
-    Next(N),
-
-    /// The next step to transition to after the delay.
-    Delay {
-        /// The step itself.
-        next: N,
-
-        /// The delay before which the step will not be run.
-        delay: Span,
-    },
-
-    /// The terminal state.
-    Done,
-}
-
-impl<S> To<S> {
-    /// Transitions from the current step to the next step.
-    pub fn next(step: S) -> TaskResult<Self> {
-        Ok(Self::Next(step))
-    }
-
-    /// Transitions from the current step to the next step, but after the given
-    /// delay.
-    ///
-    /// The next step will be enqueued immediately, but won't be dequeued until
-    /// the span has elapsed.
-    pub fn delay_for(step: S, delay: Span) -> TaskResult<Self> {
-        Ok(Self::Delay { next: step, delay })
-    }
-}
-
-impl To<()> {
-    /// Signals that this is the final step and no more steps will follow.
-    pub fn done() -> TaskResult<To<()>> {
-        Ok(To::Done)
-    }
-}
-
-// A concrete implementation of a step using a closure.
-type StepFnMarker<I, O, S, A> = fn() -> (I, O, S, A);
-
-struct StepFn<I, O, S, A, F>
-where
-    F: Fn(Context<S, A>, I) -> Pin<Box<dyn Future<Output = TaskResult<To<O>>> + Send>>
-        + Send
-        + Sync
-        + 'static,
-{
-    func: Arc<F>,
-    _marker: PhantomData<StepFnMarker<I, O, S, A>>,
-}
-
-impl<I, O, S, A, F> StepFn<I, O, S, A, F>
-where
-    F: Fn(Context<S, A>, I) -> Pin<Box<dyn Future<Output = TaskResult<To<O>>> + Send>>
-        + Send
-        + Sync
-        + 'static,
-{
-    fn new(func: F) -> Self {
-        Self {
-            func: Arc::new(func),
-            _marker: PhantomData,
-        }
-    }
-}
-
-type StepResult = TaskResult<Option<(serde_json::Value, Span)>>;
-
-// A trait object wrapper for steps to allow heterogeneous step types in a
-// vector.
-pub(super) trait StepExecutor<S, A>: Send + Sync {
-    // Execute the step with the given input serialized as JSON.
-    fn execute_step(
-        &self,
-        cx: Context<S, A>,
-        input: serde_json::Value,
-    ) -> Pin<Box<dyn Future<Output = StepResult> + Send>>;
-}
-
-impl<I, O, S, A, F> StepExecutor<S, A> for StepFn<I, O, S, A, F>
-where
-    I: DeserializeOwned + Serialize + Send + Sync + 'static,
-    O: Serialize + Send + Sync + 'static,
-    S: Send + Sync + 'static,
-    F: Fn(Context<S, A>, I) -> Pin<Box<dyn Future<Output = TaskResult<To<O>>> + Send>>
-        + Send
-        + Sync
-        + 'static,
-{
-    fn execute_step(
-        &self,
-        cx: Context<S, A>,
-        input: serde_json::Value,
-    ) -> Pin<Box<dyn Future<Output = StepResult> + Send>> {
-        let deserialized_input: I = match serde_json::from_value(input) {
-            Ok(val) => val,
-            Err(e) => return Box::pin(async move { Err(TaskError::Fatal(e.to_string())) }),
-        };
-        let fut = (self.func)(cx, deserialized_input);
-
-        Box::pin(async move {
-            match fut.await {
-                Ok(To::Next(output)) => {
-                    let serialized_output = serde_json::to_value(output)
-                        .map_err(|e| TaskError::Fatal(e.to_string()))?;
-                    Ok(Some((serialized_output, Span::new())))
-                }
-
-                Ok(To::Delay {
-                    next: output,
-                    delay,
-                }) => {
-                    let serialized_output = serde_json::to_value(output)
-                        .map_err(|e| TaskError::Fatal(e.to_string()))?;
-                    Ok(Some((serialized_output, delay)))
-                }
-
-                Ok(To::Done) => Ok(None),
-
-                Err(e) => Err(e),
-            }
-        })
-    }
-}
+use crate::{
+    activity::Activity,
+    activity_worker::ActivityRegistry,
+    queue::Queue,
+    task::{Result as TaskResult, RetryPolicy},
+};
 
 pub(super) mod builder_states {
     use std::marker::PhantomData;
@@ -189,14 +34,13 @@ pub(super) mod builder_states {
         pub _marker: PhantomData<Current>,
     }
 
-    pub struct QueueSet<I, S, A>
+    pub struct QueueSet<I, S>
     where
         I: Send + Sync + 'static,
         S: Clone + Send + Sync + 'static,
-        A: 'static,
     {
         pub state: S,
-        pub queue: WorkflowQueue<I, S, A>,
+        pub queue: WorkflowQueue<I, S>,
     }
 
     pub struct QueueNameSet<S> {
@@ -216,34 +60,32 @@ pub(super) use builder_states::{Initial, PoolSet, QueueNameSet, QueueSet, StateS
 type BuilderMarker<I, O, S, A> = fn() -> (I, O, S, A);
 
 /// Builder for constructing a `Workflow` with a sequence of steps.
-pub struct Builder<I, O, S, B, A = activity::registration::Nil>
-where
-    A: 'static,
-{
+pub struct Builder<I, O, S, B, A = NoActivities> {
     builder_state: B,
-    steps: Vec<StepConfig<S, A>>,
-    activity_registry: crate::activity_worker::ActivityRegistry,
+    steps: Vec<StepConfig<S>>,
+    activity_registry: ActivityRegistry,
     _marker: PhantomData<BuilderMarker<I, O, S, A>>,
 }
 
-impl<I, S> Default for Builder<I, I, S, Initial, activity::registration::Nil> {
+impl<I, S> Default for Builder<I, I, S, Initial, NoActivities> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<I, S, ASet> Builder<I, I, S, Initial, ASet> {
+impl<I, S, ASet> Builder<I, I, S, Initial, ASet>
+where
+    ASet: 'static,
+{
     /// Registers an activity handler for subsequent steps.
-    pub fn activity<A>(
-        mut self,
-        activity: A,
-    ) -> Builder<I, I, S, Initial, activity::registration::Cons<A, ASet>>
+    pub fn activity<A>(mut self, activity: A) -> Builder<I, I, S, Initial, Registered<A, ASet>>
     where
-        A: activity::Activity,
+        ASet: ActivitySet,
+        A: Activity,
     {
         self.activity_registry.register(activity);
 
-        Builder {
+        Builder::<I, I, S, Initial, Registered<A, ASet>> {
             builder_state: Initial,
             steps: Vec::new(),
             activity_registry: self.activity_registry,
@@ -261,11 +103,11 @@ impl<I, S, ASet> Builder<I, I, S, Initial, ASet> {
     /// // Instantiate a new builder from the `Workflow` method.
     /// let workflow_builder = Workflow::<(), ()>::builder();
     /// ```
-    pub fn new() -> Builder<I, I, S, Initial, activity::registration::Nil> {
-        Builder::<I, I, S, _, activity::registration::Nil> {
+    pub fn new() -> Builder<I, I, S, Initial, NoActivities> {
+        Builder::<I, I, S, _, NoActivities> {
             builder_state: Initial,
             steps: Vec::new(),
-            activity_registry: crate::activity_worker::ActivityRegistry::default(),
+            activity_registry: ActivityRegistry::default(),
             _marker: PhantomData,
         }
     }
@@ -332,11 +174,7 @@ impl<I, S, ASet> Builder<I, I, S, Initial, ASet> {
         F: Fn(Context<S, ASet>, I) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = TaskResult<To<O>>> + Send + 'static,
     {
-        let step_fn = StepFn::new(move |cx, input| Box::pin(func(cx, input)));
-        self.steps.push(StepConfig {
-            executor: Box::new(step_fn),
-            task_config: StepTaskConfig::default(),
-        });
+        self.steps.push(StepConfig::new(func));
 
         Builder {
             builder_state: StepSet {
@@ -351,18 +189,19 @@ impl<I, S, ASet> Builder<I, I, S, Initial, ASet> {
 }
 
 // After state set, before first step set.
-impl<I, S, ASet> Builder<I, I, S, StateSet<S>, ASet> {
+impl<I, S, ASet> Builder<I, I, S, StateSet<S>, ASet>
+where
+    ASet: 'static,
+{
     /// Registers an activity handler for subsequent steps.
-    pub fn activity<A>(
-        mut self,
-        activity: A,
-    ) -> Builder<I, I, S, StateSet<S>, activity::registration::Cons<A, ASet>>
+    pub fn activity<A>(mut self, activity: A) -> Builder<I, I, S, StateSet<S>, Registered<A, ASet>>
     where
-        A: activity::Activity,
+        ASet: ActivitySet,
+        A: Activity,
     {
         self.activity_registry.register(activity);
 
-        Builder {
+        Builder::<I, I, S, StateSet<S>, Registered<A, ASet>> {
             builder_state: StateSet {
                 state: self.builder_state.state,
             },
@@ -411,11 +250,7 @@ impl<I, S, ASet> Builder<I, I, S, StateSet<S>, ASet> {
         F: Fn(Context<S, ASet>, I) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = TaskResult<To<O>>> + Send + 'static,
     {
-        let step_fn = StepFn::new(move |cx, input| Box::pin(func(cx, input)));
-        self.steps.push(StepConfig {
-            executor: Box::new(step_fn),
-            task_config: StepTaskConfig::default(),
-        });
+        self.steps.push(StepConfig::new(func));
 
         Builder {
             builder_state: StepSet {
@@ -430,7 +265,10 @@ impl<I, S, ASet> Builder<I, I, S, StateSet<S>, ASet> {
 }
 
 // After first step set.
-impl<I, Current, S, ASet> Builder<I, Current, S, StepSet<Current, S>, ASet> {
+impl<I, Current, S, ASet> Builder<I, Current, S, StepSet<Current, S>, ASet>
+where
+    ASet: 'static,
+{
     /// Add a subsequent step to the workflow.
     ///
     /// This method ensures that the input type of the new step matches the
@@ -460,11 +298,7 @@ impl<I, Current, S, ASet> Builder<I, Current, S, StepSet<Current, S>, ASet> {
         F: Fn(Context<S, ASet>, Current) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = TaskResult<To<New>>> + Send + 'static,
     {
-        let step_fn = StepFn::new(move |cx, input| Box::pin(func(cx, input)));
-        self.steps.push(StepConfig {
-            executor: Box::new(step_fn),
-            task_config: StepTaskConfig::default(),
-        });
+        self.steps.push(StepConfig::new(func));
 
         Builder {
             builder_state: StepSet {
@@ -800,7 +634,7 @@ where
     /// # });
     /// # }
     /// ```
-    pub async fn build(self) -> Result<Workflow<I, S, ASet>> {
+    pub async fn build(self) -> Result<Workflow<I, S>> {
         let PoolSet {
             state,
             queue_name,
@@ -853,10 +687,7 @@ where
     /// # });
     /// # }
     /// ```
-    pub fn queue(
-        self,
-        queue: WorkflowQueue<I, S, ASet>,
-    ) -> Builder<I, (), S, QueueSet<I, S, ASet>, ASet> {
+    pub fn queue(self, queue: WorkflowQueue<I, S>) -> Builder<I, (), S, QueueSet<I, S>, ASet> {
         Builder {
             builder_state: QueueSet {
                 state: self.builder_state.state,
@@ -869,7 +700,7 @@ where
     }
 }
 
-impl<I, S, ASet> Builder<I, (), S, QueueSet<I, S, ASet>, ASet>
+impl<I, S, ASet> Builder<I, (), S, QueueSet<I, S>, ASet>
 where
     I: Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
@@ -901,7 +732,7 @@ where
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
     /// # }
-    pub fn build(self) -> Workflow<I, S, ASet> {
+    pub fn build(self) -> Workflow<I, S> {
         let QueueSet { state, queue } = self.builder_state;
         Workflow {
             queue: Arc::new(queue),

@@ -694,6 +694,9 @@
 
 mod builder;
 mod context;
+#[doc(hidden)]
+pub mod registration;
+mod step;
 
 use std::{
     marker::PhantomData,
@@ -701,20 +704,23 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-pub use builder::{Builder, To};
-use builder::{Initial, StepConfig, StepTaskConfig};
+pub use builder::Builder;
+use builder::Initial;
 pub use context::Context;
-use context::{ActivityCallBuffer, ActivityCallRecord, CallSequenceState};
+use context::{ActivityCallBuffer, ActivityCallRecord, CallSequenceState, ContextParts};
 use jiff::Span;
 use sealed::WorkflowState;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgConnection, PgExecutor, Postgres, Transaction};
+pub use step::To;
+use step::{StepConfig, StepTaskConfig};
 use tracing::instrument;
 use ulid::Ulid;
 use uuid::Uuid;
 
 use crate::{
-    activity::{self, CallState},
+    activity::CallState,
+    activity_worker::ActivityRegistry,
     queue::{Error as QueueError, InProgressTask, Queue},
     runtime::Runtime,
     scheduler::{Error as SchedulerError, ZonedSchedule},
@@ -722,6 +728,7 @@ use crate::{
         Error as TaskError, Result as TaskResult, RetryPolicy, State as TaskState, Task, TaskId,
     },
     worker::Error as WorkerError,
+    workflow::registration::NoActivities,
 };
 
 type Result<T = ()> = std::result::Result<T, Error>;
@@ -754,7 +761,7 @@ pub enum Error {
     Database(#[from] sqlx::Error),
 }
 
-type WorkflowQueue<T, S, A> = Queue<Workflow<T, S, A>>;
+type WorkflowQueue<T, S> = Queue<Workflow<T, S>>;
 
 mod sealed {
     use serde::{Deserialize, Serialize};
@@ -884,20 +891,19 @@ impl<T: Task> EnqueuedWorkflow<T> {
 
 /// Sequential set of functions, where the output of the last is the input to
 /// the next.
-pub struct Workflow<I, S, A = activity::registration::Nil>
+pub struct Workflow<I, S>
 where
     I: Sync + Send + 'static,
     S: Clone + Sync + Send + 'static,
-    A: 'static,
 {
-    queue: Arc<WorkflowQueue<I, S, A>>,
-    steps: Arc<Vec<StepConfig<S, A>>>,
+    queue: Arc<WorkflowQueue<I, S>>,
+    steps: Arc<Vec<StepConfig<S>>>,
     state: S,
-    activity_registry: crate::activity_worker::ActivityRegistry,
-    _marker: PhantomData<fn() -> (I, A)>,
+    activity_registry: ActivityRegistry,
+    _marker: PhantomData<fn() -> I>,
 }
 
-impl<I, S> Workflow<I, S, activity::registration::Nil>
+impl<I, S> Workflow<I, S>
 where
     I: Serialize + Sync + Send + 'static,
     S: Clone + Send + Sync + 'static,
@@ -930,16 +936,15 @@ where
     /// # });
     /// # }
     /// ```
-    pub fn builder() -> Builder<I, I, S, Initial, activity::registration::Nil> {
-        Builder::<I, I, S, Initial, activity::registration::Nil>::new()
+    pub fn builder() -> Builder<I, I, S, Initial, NoActivities> {
+        Builder::<I, I, S, Initial, NoActivities>::new()
     }
 }
 
-impl<I, S, A> Workflow<I, S, A>
+impl<I, S> Workflow<I, S>
 where
     I: Serialize + Sync + Send + 'static,
     S: Clone + Send + Sync + 'static,
-    A: 'static,
 {
     /// Enqueue the workflow using a connection from the queue's pool.
     ///
@@ -1497,7 +1502,7 @@ where
         Arc::clone(&self.queue)
     }
 
-    pub(crate) fn activity_registry(&self) -> crate::activity_worker::ActivityRegistry {
+    pub(crate) fn activity_registry(&self) -> ActivityRegistry {
         self.activity_registry.clone()
     }
 
@@ -1529,7 +1534,7 @@ where
     /// # });
     /// # }
     /// ```
-    pub fn runtime(&self) -> Runtime<I, S, A> {
+    pub fn runtime(&self) -> Runtime<I, S> {
         Runtime::new(self.clone())
     }
 
@@ -1545,11 +1550,10 @@ where
     }
 }
 
-impl<I, S, A> Workflow<I, S, A>
+impl<I, S> Workflow<I, S>
 where
     I: Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
-    A: 'static,
 {
     fn step_task_config(&self, step_index: usize) -> StepTaskConfig {
         self.steps
@@ -1634,11 +1638,10 @@ where
     }
 }
 
-impl<I, S, A> Task for Workflow<I, S, A>
+impl<I, S> Task for Workflow<I, S>
 where
     I: Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
-    A: 'static,
 {
     type Input = WorkflowState;
     type Output = ();
@@ -1674,7 +1677,7 @@ where
         )));
         let call_sequence_state = Arc::new(Mutex::new(CallSequenceState::default()));
 
-        let cx = Context {
+        let cx = ContextParts {
             state: self.state.clone(),
             step_index,
             workflow_id,
@@ -1682,7 +1685,6 @@ where
             queue_name: self.queue.name.clone(),
             activity_call_buffer: Arc::clone(&activity_call_buffer),
             call_sequence_state,
-            _activity_set: PhantomData,
         };
 
         // Execute the step and handle any errors.
@@ -1790,11 +1792,10 @@ where
     }
 }
 
-impl<I, S, A> Clone for Workflow<I, S, A>
+impl<I, S> Clone for Workflow<I, S>
 where
     I: Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
-    A: 'static,
 {
     fn clone(&self) -> Self {
         Self {

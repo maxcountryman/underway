@@ -125,21 +125,19 @@ impl RuntimeHandle {
 }
 
 /// High-level workflow runtime.
-pub struct Runtime<I, S, A = crate::activity::registration::Nil>
+pub struct Runtime<I, S>
 where
     I: Serialize + Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
-    A: 'static,
 {
-    workflow: Workflow<I, S, A>,
+    workflow: Workflow<I, S>,
     activity_worker: ActivityWorker,
 }
 
-impl<I, S, A> Clone for Runtime<I, S, A>
+impl<I, S> Clone for Runtime<I, S>
 where
     I: Serialize + Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
-    A: 'static,
 {
     fn clone(&self) -> Self {
         Self {
@@ -149,16 +147,15 @@ where
     }
 }
 
-impl<I, S, A> Runtime<I, S, A>
+impl<I, S> Runtime<I, S>
 where
     I: Serialize + Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
-    A: 'static,
 {
     /// Creates a runtime from a workflow.
     ///
     /// Registered activity handlers are sourced from the workflow's builder.
-    pub fn new(workflow: Workflow<I, S, A>) -> Self {
+    pub fn new(workflow: Workflow<I, S>) -> Self {
         let activity_worker = ActivityWorker::with_registry(
             workflow.queue().pool.clone(),
             workflow.queue().name.clone(),
@@ -171,7 +168,7 @@ where
     }
 
     /// Returns a reference to the workflow managed by this runtime.
-    pub fn workflow(&self) -> &Workflow<I, S, A> {
+    pub fn workflow(&self) -> &Workflow<I, S> {
         &self.workflow
     }
 
@@ -179,7 +176,7 @@ where
     ///
     /// This is useful when running worker loops manually instead of calling
     /// [`Runtime::run`] or [`Runtime::start`].
-    pub fn worker(&self) -> Worker<Workflow<I, S, A>> {
+    pub fn worker(&self) -> Worker<Workflow<I, S>> {
         Worker::new(self.workflow.queue(), self.workflow.clone())
     }
 
@@ -187,7 +184,7 @@ where
     ///
     /// This is useful when running scheduler loops manually instead of calling
     /// [`Runtime::run`] or [`Runtime::start`].
-    pub fn scheduler(&self) -> Scheduler<Workflow<I, S, A>> {
+    pub fn scheduler(&self) -> Scheduler<Workflow<I, S>> {
         Scheduler::new(self.workflow.queue(), self.workflow.clone())
     }
 
@@ -263,13 +260,12 @@ where
     }
 }
 
-impl<I, S, A> From<Workflow<I, S, A>> for Runtime<I, S, A>
+impl<I, S> From<Workflow<I, S>> for Runtime<I, S>
 where
     I: Serialize + Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
-    A: 'static,
 {
-    fn from(workflow: Workflow<I, S, A>) -> Self {
+    fn from(workflow: Workflow<I, S>) -> Self {
         Self::new(workflow)
     }
 }

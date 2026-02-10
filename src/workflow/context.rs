@@ -4,14 +4,17 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use super::WorkflowId;
+use super::{
+    registration::{Contains, NoActivities},
+    WorkflowId,
+};
 use crate::{
-    activity::{self, registration::Contains, CallState},
+    activity::{self, Activity, CallState},
     task::{Error as TaskError, Result as TaskResult},
 };
 
 /// Context passed in to each step.
-pub struct Context<S, Set = activity::registration::Nil> {
+pub struct Context<S, Set = NoActivities> {
     /// Shared step state.
     ///
     /// This value is set via
@@ -43,6 +46,16 @@ pub struct Context<S, Set = activity::registration::Nil> {
     pub(super) activity_call_buffer: Arc<Mutex<ActivityCallBuffer>>,
     pub(super) call_sequence_state: Arc<Mutex<CallSequenceState>>,
     pub(super) _activity_set: PhantomData<fn() -> Set>,
+}
+
+pub(super) struct ContextParts<S> {
+    pub(super) state: S,
+    pub(super) step_index: usize,
+    pub(super) step_count: usize,
+    pub(super) workflow_id: WorkflowId,
+    pub(super) queue_name: String,
+    pub(super) activity_call_buffer: Arc<Mutex<ActivityCallBuffer>>,
+    pub(super) call_sequence_state: Arc<Mutex<CallSequenceState>>,
 }
 
 #[derive(Clone, sqlx::FromRow)]
@@ -134,6 +147,29 @@ impl ActivityCallBuffer {
 }
 
 impl<S, Set> Context<S, Set> {
+    pub(super) fn from_parts(parts: ContextParts<S>) -> Self {
+        let ContextParts {
+            state,
+            step_index,
+            step_count,
+            workflow_id,
+            queue_name,
+            activity_call_buffer,
+            call_sequence_state,
+        } = parts;
+
+        Self {
+            state,
+            step_index,
+            step_count,
+            workflow_id,
+            queue_name,
+            activity_call_buffer,
+            call_sequence_state,
+            _activity_set: PhantomData,
+        }
+    }
+
     /// Emits a durable fire-and-forget activity call.
     ///
     /// The call is persisted as part of the current step transaction boundary.
@@ -143,7 +179,7 @@ impl<S, Set> Context<S, Set> {
     /// `key` should be deterministic for this step execution.
     pub async fn emit<A, Idx>(&self, key: impl Into<String>, input: &A::Input) -> TaskResult<()>
     where
-        A: activity::Activity,
+        A: Activity,
         Set: Contains<A, Idx>,
     {
         let key = key.into();
@@ -166,16 +202,13 @@ impl<S, Set> Context<S, Set> {
     ///
     /// This method takes `&mut self`, which enforces sequential call issuance
     /// within a step at compile time.
-    ///
-    /// For v1 semantics, calls are sequential: only one unresolved call is
-    /// permitted at a time in a single step execution.
     pub async fn call<A, Idx>(
         &mut self,
         key: impl Into<String>,
         input: &A::Input,
     ) -> TaskResult<A::Output>
     where
-        A: activity::Activity,
+        A: Activity,
         Set: Contains<A, Idx>,
     {
         let key = key.into();

@@ -61,39 +61,6 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::task::RetryPolicy;
 
-/// Type-level activity registration set utilities.
-#[doc(hidden)]
-pub mod registration {
-    use std::marker::PhantomData;
-
-    use super::Activity;
-
-    /// Empty set of registered activities.
-    pub struct Nil;
-
-    /// Type-level set node.
-    pub struct Cons<Head, Tail>(pub(crate) PhantomData<(Head, Tail)>);
-
-    /// Type-level index for the head of a set.
-    pub struct Here;
-
-    /// Type-level index for an element in the tail of a set.
-    pub struct There<T>(pub(crate) PhantomData<T>);
-
-    /// Marker trait indicating `A` is present in an activity set.
-    pub trait Contains<A: Activity, Idx> {}
-
-    impl<A, Tail> Contains<A, Here> for Cons<A, Tail> where A: Activity {}
-
-    impl<A, Head, Tail, Idx> Contains<A, There<Idx>> for Cons<Head, Tail>
-    where
-        A: Activity,
-        Head: Activity,
-        Tail: Contains<A, Idx>,
-    {
-    }
-}
-
 /// A type alias for activity execution results.
 pub type Result<T> = StdResult<T, Error>;
 
