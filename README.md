@@ -26,15 +26,15 @@ Key Features:
 
 - **Runtime-First Execution** Run workflows via `workflow.runtime().run()` or
   `workflow.runtime().start()`.
+- **PostgreSQL-Backed Coordination** Uses PostgreSQL with `FOR UPDATE SKIP
+  LOCKED` for reliable queue coordination.
+- **Transactional Enqueue and Schedule** Use `*_using` APIs to enqueue or
+  schedule workflows inside your own transactions.
 - **Durable Activity Effects** Use `Context::call` and `Context::emit` for
   persisted side effects with suspend/resume behavior.
 - **Compile-Time Safe Activities** Register handlers on
   `Workflow::builder().activity(...)`; calls are typed and unregistered
   activities fail at compile time.
-- **Transactional Enqueue and Schedule** Use `*_using` APIs to enqueue or
-  schedule workflows inside your own transactions.
-- **PostgreSQL-Backed Coordination** Uses PostgreSQL with `FOR UPDATE SKIP
-  LOCKED` for reliable queue coordination.
 - **Leased Execution and Fencing** Heartbeats act as task leases; stale
   heartbeats trigger new attempts and fence out old workers.
 - **Automatic Retries and Scheduling** Configure retries per task/workflow and
@@ -111,15 +111,13 @@ impl Activity for LookupEmail {
     type Output = String;
 
     async fn execute(&self, user_id: Self::Input) -> underway::activity::Result<Self::Output> {
-        let email = sqlx::query_scalar::<_, String>("select email from app_user where id = $1")
+        let email = sqlx::query_scalar::<_, String>("select concat('user-', $1::text, '@example.com')")
             .bind(user_id)
-            .fetch_optional(&self.pool)
+            .fetch_one(&self.pool)
             .await
             .map_err(|err| ActivityError::retryable("db_error", err.to_string()))?;
 
-        email.ok_or_else(|| {
-            ActivityError::fatal("missing_user", format!("No user found for id {user_id}"))
-        })
+        Ok(email)
     }
 }
 
@@ -216,6 +214,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## 🛟 Getting Help
 
 The [API docs][docs] include module-level walkthroughs and runnable snippets.
+Runnable examples are available in `examples/basic` and `examples/activities`.
 You're also welcome to [open a discussion](https://github.com/maxcountryman/underway/discussions/new?category=q-a) and ask additional questions you might have.
 
 ## 👯 Contributing
