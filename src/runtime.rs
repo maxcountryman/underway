@@ -161,6 +161,7 @@ where
     pub fn new(workflow: Workflow<I, S, A>) -> Self {
         let activity_worker = ActivityWorker::with_registry(
             workflow.queue().pool.clone(),
+            workflow.queue().name.clone(),
             workflow.activity_registry(),
         );
         Self {
@@ -303,6 +304,19 @@ mod tests {
         }
     }
 
+    struct ReverseActivity;
+
+    impl Activity for ReverseActivity {
+        const NAME: &'static str = "reverse";
+
+        type Input = String;
+        type Output = String;
+
+        async fn execute(&self, input: Self::Input) -> ActivityResult<Self::Output> {
+            Ok(input.chars().rev().collect())
+        }
+    }
+
     #[derive(Debug, Deserialize, Serialize)]
     struct Step1 {
         message: String,
@@ -311,6 +325,11 @@ mod tests {
     #[derive(Debug, Deserialize, Serialize)]
     struct Step2 {
         echoed: String,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    struct MessageInput {
+        message: String,
     }
 
     #[sqlx::test]
@@ -379,6 +398,205 @@ mod tests {
         .fetch_one(&pool)
         .await?;
 
+        assert_eq!(attempt_state, CallState::Succeeded);
+
+        handle.shutdown().await?;
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn runtime_does_not_claim_unregistered_activity_calls_on_shared_queue(
+        pool: PgPool,
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let queue_name = "runtime_shared_queue_activity_scope";
+
+        let workflow = Workflow::builder()
+            .activity(EchoActivity)
+            .step(|mut cx, MessageInput { message }| async move {
+                let _: String = cx.call::<EchoActivity, _>("shared-call", &message).await?;
+                To::done()
+            })
+            .name(queue_name)
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        workflow
+            .enqueue(&MessageInput {
+                message: "hello".to_string(),
+            })
+            .await?;
+
+        let workflow_worker = workflow.runtime().worker();
+        let _ = workflow_worker.process_next_task().await?;
+
+        let call_state = sqlx::query_scalar!(
+            r#"
+            select state as "state: CallState"
+            from underway.activity_call
+            where task_queue_name = $1
+              and call_key = $2
+            "#,
+            queue_name,
+            "shared-call",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(call_state, CallState::Pending);
+
+        let unrelated_workflow = Workflow::builder()
+            .activity(ReverseActivity)
+            .step(|_cx, _: MessageInput| async move { To::done() })
+            .name(queue_name)
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let handle = unrelated_workflow.runtime().start();
+        sleep(Duration::from_millis(300)).await;
+        handle.shutdown().await?;
+
+        let call_state_after = sqlx::query_scalar!(
+            r#"
+            select state as "state: CallState"
+            from underway.activity_call
+            where task_queue_name = $1
+              and call_key = $2
+            "#,
+            queue_name,
+            "shared-call",
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(call_state_after, CallState::Pending);
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn runtime_reclaims_stale_in_progress_activity_calls(
+        pool: PgPool,
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let outputs = Arc::new(Mutex::new(Vec::new()));
+        let outputs_step = outputs.clone();
+
+        let workflow = Workflow::builder()
+            .activity(EchoActivity)
+            .step(|mut cx, Step1 { message }| async move {
+                let echoed: String = cx.call::<EchoActivity, _>("echo-main", &message).await?;
+                To::next(Step2 { echoed })
+            })
+            .step(move |_cx, Step2 { echoed }| {
+                let outputs_step = outputs_step.clone();
+                async move {
+                    outputs_step.lock().await.push(echoed);
+                    To::done()
+                }
+            })
+            .name("runtime_reclaims_stale_in_progress_activity_calls")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        workflow
+            .enqueue(&Step1 {
+                message: "hello".to_string(),
+            })
+            .await?;
+
+        let workflow_worker = workflow.runtime().worker();
+        let _ = workflow_worker.process_next_task().await?;
+
+        let call_id = sqlx::query_scalar!(
+            r#"
+            select id
+            from underway.activity_call
+            where task_queue_name = $1
+              and call_key = $2
+            limit 1
+            "#,
+            workflow.queue().name,
+            "echo-main",
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        sqlx::query!(
+            r#"
+            update underway.activity_call
+            set state = 'in_progress'::underway.activity_call_state,
+                started_at = now() - interval '2 hours',
+                updated_at = now() - interval '2 hours'
+            where id = $1
+            "#,
+            call_id,
+        )
+        .execute(&pool)
+        .await?;
+
+        sqlx::query!(
+            r#"
+            insert into underway.activity_call_attempt (
+                activity_call_id,
+                attempt_number,
+                state,
+                started_at,
+                updated_at
+            ) values (
+                $1,
+                1,
+                'in_progress'::underway.activity_call_state,
+                now() - interval '2 hours',
+                now() - interval '2 hours'
+            )
+            "#,
+            call_id,
+        )
+        .execute(&pool)
+        .await?;
+
+        let runtime = workflow.runtime();
+        let handle = runtime.start();
+
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if outputs.lock().await.len() == 1 {
+                    break;
+                }
+
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await?;
+
+        assert_eq!(outputs.lock().await.as_slice(), ["echo:hello"]);
+
+        let call_state = sqlx::query_scalar!(
+            r#"
+            select state as "state: CallState"
+            from underway.activity_call
+            where id = $1
+            "#,
+            call_id,
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(call_state, CallState::Succeeded);
+
+        let attempt_state = sqlx::query_scalar!(
+            r#"
+            select state as "state: CallState"
+            from underway.activity_call_attempt
+            where activity_call_id = $1
+            order by attempt_number desc
+            limit 1
+            "#,
+            call_id,
+        )
+        .fetch_one(&pool)
+        .await?;
         assert_eq!(attempt_state, CallState::Succeeded);
 
         handle.shutdown().await?;

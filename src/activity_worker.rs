@@ -15,6 +15,8 @@ use crate::{
 
 pub(crate) type Result<T = ()> = std::result::Result<T, Error>;
 
+const IN_PROGRESS_RECLAIM_GRACE_MS: i64 = 30_000;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
@@ -108,6 +110,7 @@ impl ActivityRegistry {
 #[derive(Clone)]
 pub(crate) struct ActivityWorker {
     pool: PgPool,
+    queue_name: String,
     registry: ActivityRegistry,
     shutdown_token: CancellationToken,
 }
@@ -126,9 +129,14 @@ struct ClaimedCall {
 }
 
 impl ActivityWorker {
-    pub(crate) fn with_registry(pool: PgPool, registry: ActivityRegistry) -> Self {
+    pub(crate) fn with_registry(
+        pool: PgPool,
+        queue_name: String,
+        registry: ActivityRegistry,
+    ) -> Self {
         Self {
             pool,
+            queue_name,
             registry,
             shutdown_token: CancellationToken::new(),
         }
@@ -201,8 +209,12 @@ impl ActivityWorker {
     }
 
     async fn process_next_call(&self) -> Result<Option<Uuid>> {
+        let (activities, timeout_millis) = self.activity_claim_specs()?;
+
         let mut tx = self.pool.begin().await?;
-        let call = self.claim_next_call(&mut tx).await?;
+        let call = self
+            .claim_next_call(&mut tx, &activities, &timeout_millis)
+            .await?;
         tx.commit().await?;
 
         let Some(call) = call else {
@@ -254,16 +266,35 @@ impl ActivityWorker {
     async fn claim_next_call(
         &self,
         tx: &mut Transaction<'_, Postgres>,
+        activities: &[String],
+        timeout_millis: &[i64],
     ) -> Result<Option<ClaimedCall>> {
         let call = sqlx::query_as!(
             ClaimedCall,
             r#"
-            with next_call as (
-                select id
-                from underway.activity_call
-                where state = 'pending'::underway.activity_call_state
-                  and available_at <= now()
-                order by created_at, id
+            with handler as (
+                select *
+                from unnest($1::text[], $2::bigint[]) as h(activity, timeout_ms)
+            ),
+            next_call as (
+                select c.id
+                from underway.activity_call c
+                inner join handler h
+                  on h.activity = c.activity
+                where c.task_queue_name = $3
+                  and (
+                    (
+                        c.state = 'pending'::underway.activity_call_state
+                        and c.available_at <= now()
+                    )
+                    or (
+                        c.state = 'in_progress'::underway.activity_call_state
+                        and coalesce(c.started_at, c.updated_at, c.created_at)
+                              + ((h.timeout_ms + $4) * interval '1 millisecond')
+                            <= now()
+                    )
+                  )
+                order by c.created_at, c.id
                 limit 1
                 for update skip locked
             ),
@@ -271,7 +302,7 @@ impl ActivityWorker {
                 update underway.activity_call c
                 set state = 'in_progress'::underway.activity_call_state,
                     updated_at = now(),
-                    started_at = coalesce(c.started_at, now())
+                    started_at = now()
                 from next_call
                 where c.id = next_call.id
                 returning
@@ -295,6 +326,13 @@ impl ActivityWorker {
                     claimed.attempt_count + 1,
                     'in_progress'::underway.activity_call_state
                 from claimed
+                on conflict (activity_call_id, attempt_number)
+                do update
+                  set state = 'in_progress'::underway.activity_call_state,
+                      error = null,
+                      started_at = now(),
+                      updated_at = now(),
+                      completed_at = null
                 returning
                     activity_call_id,
                     attempt_number
@@ -313,11 +351,39 @@ impl ActivityWorker {
             inner join attempt
               on attempt.activity_call_id = claimed.id
             "#,
+            activities as _,
+            timeout_millis as _,
+            self.queue_name,
+            IN_PROGRESS_RECLAIM_GRACE_MS,
         )
         .fetch_optional(&mut **tx)
         .await?;
 
         Ok(call)
+    }
+
+    fn activity_claim_specs(&self) -> Result<(Vec<String>, Vec<i64>)> {
+        let mut handlers = self
+            .registry
+            .handlers
+            .iter()
+            .map(|(activity, handler)| {
+                let timeout: Duration = handler.timeout().try_into()?;
+                let timeout_millis = timeout.as_millis().min(i64::MAX as u128) as i64;
+                Ok((activity.clone(), timeout_millis))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        handlers.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let mut activities = Vec::with_capacity(handlers.len());
+        let mut timeout_millis = Vec::with_capacity(handlers.len());
+        for (activity, timeout_ms) in handlers {
+            activities.push(activity);
+            timeout_millis.push(timeout_ms);
+        }
+
+        Ok((activities, timeout_millis))
     }
 
     async fn mark_succeeded(&self, call: &ClaimedCall, output: Value) -> Result {
