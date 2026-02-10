@@ -24,213 +24,190 @@
 
 Key Features:
 
-- **PostgreSQL-Backed** Leverages PostgreSQL with `FOR UPDATE SKIP LOCKED`
-  for reliable task storage and coordination.
-- **Atomic Task Management** Enqueue tasks within your transactions and use
-  the worker's transaction within your tasks for atomic queries.
-- **Leased Execution** Heartbeats act as task leases; stale heartbeats trigger
-  new attempts and fence out older workers from updating task state.
-- **Automatic Retries** Configurable retry strategies ensure tasks are
-  reliably completed, even after transient failures.
-- **Cron-Like Scheduling** Schedule recurring tasks with cron-like
-  expressions for automated, time-based workflow execution.
-- **Scalable and Flexible** Easily scales from a single worker to many,
-  enabling seamless background workflow processing with minimal setup.
+- **Runtime-First Execution** Run workflows via `workflow.runtime().run()` or
+  `workflow.runtime().start()`.
+- **Durable Activity Effects** Use `Context::call` and `Context::emit` for
+  persisted side effects with suspend/resume behavior.
+- **Compile-Time Safe Activities** Register handlers on
+  `Workflow::builder().activity(...)`; calls are typed and unregistered
+  activities fail at compile time.
+- **Transactional Enqueue and Schedule** Use `*_using` APIs to enqueue or
+  schedule workflows inside your own transactions.
+- **PostgreSQL-Backed Coordination** Uses PostgreSQL with `FOR UPDATE SKIP
+  LOCKED` for reliable queue coordination.
+- **Leased Execution and Fencing** Heartbeats act as task leases; stale
+  heartbeats trigger new attempts and fence out old workers.
+- **Automatic Retries and Scheduling** Configure retries per task/workflow and
+  run recurring workflows with cron-like schedules.
 
 ## 🤸 Usage
 
-Underway is suitable for many different use cases, ranging from simple
-single-step workflows to more sophisticated multi-step workflows, where dependencies
-are built up between steps.
+Underway supports a few common patterns out of the box:
 
-## Welcome emails
+1. Build a typed workflow and run it with `runtime()`.
+2. Use durable activity calls for side effects.
+3. Enqueue and schedule atomically inside your own transaction.
 
-A common use case is deferring work that can be processed later. For
-instance, during user registration, we might want to send a welcome email to
-new users. Rather than handling this within the registration process (e.g.,
-form validation, database insertion), we can offload it to run "out-of-band"
-using Underway. By defining a workflow for sending the welcome email, Underway
-ensures it gets processed in the background, without slowing down the user
-registration flow.
+### 1) Build and run a workflow
 
 ```rust
-use std::env;
-
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use underway::{Workflow, To};
+use underway::{To, Workflow};
 
-// This is the input we'll provide to the workflow when we enqueue it.
 #[derive(Deserialize, Serialize)]
-struct WelcomeEmail {
-    user_id: i32,
-    email: String,
-    name: String,
+struct ResizeImage {
+    asset_id: i64,
+}
+
+#[derive(Deserialize, Serialize)]
+struct PublishImage {
+    object_key: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Set up the database connection pool.
-    let database_url = &env::var("DATABASE_URL").expect("DATABASE_URL should be set");
-    let pool = PgPool::connect(database_url).await?;
-
-    // Run migrations.
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
     underway::run_migrations(&pool).await?;
 
-    // Build the workflow.
     let workflow = Workflow::builder()
-        .step(
-            |_cx,
-             WelcomeEmail {
-                 user_id,
-                 email,
-                 name,
-             }| async move {
-                // Simulate sending an email.
-                println!("Sending welcome email to {name} <{email}> (user_id: {user_id})");
-                // Returning this indicates this is the final step.
-                To::done()
-            },
-        )
-        .name("welcome-email")
+        .step(|_cx, ResizeImage { asset_id }| async move {
+            let object_key = format!("images/{asset_id}.webp");
+            To::next(PublishImage { object_key })
+        })
+        .step(|_cx, PublishImage { object_key }| async move {
+            println!("Publishing {object_key}");
+            To::done()
+        })
+        .name("image-pipeline")
         .pool(pool)
         .build()
         .await?;
 
-    // Here we enqueue a new workflow to be processed later.
-    workflow.enqueue(&WelcomeEmail {
-        user_id: 42,
-        email: "ferris@example.com".to_string(),
-        name: "Ferris".to_string(),
-    })
-    .await?;
+    workflow.enqueue(&ResizeImage { asset_id: 42 }).await?;
 
-    // Start processing enqueued workflows.
     let runtime_handle = workflow.runtime().start();
     runtime_handle.shutdown().await?;
-
     Ok(())
 }
 ```
 
-## Order receipts
-
-Another common use case is defining dependencies between discrete steps of a
-workflow. For instance, we might generate PDF receipts for orders and then email
-these to customers. With Underway, each step is handled separately, making
-it easy to create a workflow that first generates the PDF and, once
-completed, proceeds to send the email.
-
-This separation provides significant value: if the email sending service
-is temporarily unavailable, we can retry the email step without having to
-regenerate the PDF, avoiding unnecessary repeated work.
+### 2) Durable side effects with activities
 
 ```rust
-use std::env;
-
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use underway::{Workflow, To};
+use underway::{Activity, ActivityError, To, Workflow};
 
-#[derive(Deserialize, Serialize)]
-struct GenerateReceipt {
-    // An order we want to generate a receipt for.
-    order_id: i32,
+#[derive(Clone)]
+struct LookupEmail {
+    pool: PgPool,
+}
+
+impl Activity for LookupEmail {
+    const NAME: &'static str = "lookup-email";
+
+    type Input = i64;
+    type Output = String;
+
+    async fn execute(&self, user_id: Self::Input) -> underway::activity::Result<Self::Output> {
+        let email = sqlx::query_scalar::<_, String>("select email from app_user where id = $1")
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|err| ActivityError::retryable("db_error", err.to_string()))?;
+
+        email.ok_or_else(|| {
+            ActivityError::fatal("missing_user", format!("No user found for id {user_id}"))
+        })
+    }
+}
+
+struct TrackSignupMetric;
+
+impl Activity for TrackSignupMetric {
+    const NAME: &'static str = "track-signup-metric";
+
+    type Input = String;
+    type Output = ();
+
+    async fn execute(&self, email: Self::Input) -> underway::activity::Result<Self::Output> {
+        println!("tracking signup metric for {email}");
+        Ok(())
+    }
 }
 
 #[derive(Deserialize, Serialize)]
-struct EmailReceipt {
-    // An object store key to our receipt PDF.
-    receipt_key: String,
+struct Signup {
+    user_id: i64,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Set up the database connection pool.
-    let database_url = &env::var("DATABASE_URL").expect("DATABASE_URL should be set");
-    let pool = PgPool::connect(database_url).await?;
-
-    // Run migrations.
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
     underway::run_migrations(&pool).await?;
 
-    // Build the workflow.
     let workflow = Workflow::builder()
-        .step(|_cx, GenerateReceipt { order_id }| async move {
-            // Use the order ID to build a receipt PDF...
-            let receipt_key = format!("receipts_bucket/{order_id}-receipt.pdf");
-            // ...store the PDF in an object store.
-
-            // We proceed to the next step with the receipt_key as its input.
-            To::next(EmailReceipt { receipt_key })
-        })
-        .step(|_cx, EmailReceipt { receipt_key }| async move {
-            // Retrieve the PDF from the object store, and send the email.
-            println!("Emailing receipt for {receipt_key}");
+        .activity(LookupEmail { pool: pool.clone() })
+        .activity(TrackSignupMetric)
+        .step(|mut cx, Signup { user_id }| async move {
+            let email: String = cx.call::<LookupEmail, _>("lookup", &user_id).await?;
+            cx.emit::<TrackSignupMetric, _>("track", &email).await?;
             To::done()
         })
-        .name("order-receipt")
+        .name("signup-side-effects")
         .pool(pool)
         .build()
         .await?;
 
-    // Enqueue the workflow for the given order.
-    workflow.enqueue(&GenerateReceipt { order_id: 42 }).await?;
-
-    // Start processing enqueued workflows.
-    let runtime_handle = workflow.runtime().start();
-    runtime_handle.shutdown().await?;
-
+    workflow.enqueue(&Signup { user_id: 42 }).await?;
+    workflow.runtime().run().await?;
     Ok(())
 }
 ```
 
-With this setup, if the email service is down, the `EmailReceipt` step can
-be retried without redoing the PDF generation, saving time and resources by
-not repeating the expensive step of generating the PDF.
-
-## Daily reports
-
-Workflows may also be run on a schedule. This makes them useful for situations
-where we want to do things on a regular cadence, such as creating a daily
-business report.
+### 3) Enqueue and schedule in your transaction
 
 ```rust
-use std::env;
-
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use underway::{Workflow, To};
+use underway::{To, Workflow};
 
 #[derive(Deserialize, Serialize)]
-struct DailyReport;
+struct TenantCleanup {
+    tenant_id: i64,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Set up the database connection pool.
-    let database_url = &env::var("DATABASE_URL").expect("DATABASE_URL should be set");
-    let pool = PgPool::connect(database_url).await?;
-
-    // Run migrations.
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
     underway::run_migrations(&pool).await?;
 
-    // Build the workflow.
     let workflow = Workflow::builder()
-        .step(|_cx, _| async move {
-            // Here we would generate and store the report.
+        .step(|_cx, TenantCleanup { tenant_id }| async move {
+            println!("Running cleanup for tenant {tenant_id}");
             To::done()
         })
-        .name("daily-report")
-        .pool(pool)
+        .name("tenant-cleanup")
+        .pool(pool.clone())
         .build()
         .await?;
 
-    // Set a daily schedule with the given input.
-    let daily = "@daily[America/Los_Angeles]".parse()?;
-    workflow.schedule(&daily, &DailyReport).await?;
+    let nightly = "0 2 * * *[UTC]".parse()?;
+    let tenant_id = 7;
 
-    // Start processing enqueued workflows.
-    let runtime_handle = workflow.runtime().start();
-    runtime_handle.shutdown().await?;
+    let mut tx = pool.begin().await?;
+
+    sqlx::query("update app_tenant set cleanup_enabled = true where id = $1")
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+
+    let input = TenantCleanup { tenant_id };
+    workflow.enqueue_using(&mut *tx, &input).await?;
+    workflow.schedule_using(&mut *tx, &nightly, &input).await?;
+
+    tx.commit().await?;
 
     Ok(())
 }
@@ -238,11 +215,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## 🛟 Getting Help
 
-We've put together a number of [examples][examples] to help get you started. You're also welcome to [open a discussion](https://github.com/maxcountryman/underway/discussions/new?category=q-a) and ask additional questions you might have.
+The [API docs][docs] include module-level walkthroughs and runnable snippets.
+You're also welcome to [open a discussion](https://github.com/maxcountryman/underway/discussions/new?category=q-a) and ask additional questions you might have.
 
 ## 👯 Contributing
 
 We appreciate all kinds of contributions, thank you!
 
-[examples]: https://github.com/maxcountryman/underway/tree/main/examples
 [docs]: https://docs.rs/underway
