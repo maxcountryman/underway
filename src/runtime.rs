@@ -49,7 +49,7 @@
 //!     let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
 //!     let workflow = Workflow::builder()
 //!         .activity(LookupEmail)
-//!         .step(|cx, FetchUser { user_id }| async move {
+//!         .step(|mut cx, FetchUser { user_id }| async move {
 //!             let email: String = cx.call::<LookupEmail, _>("lookup", &user_id).await?;
 //!             println!("Got email {email}");
 //!             To::done()
@@ -323,7 +323,7 @@ mod tests {
 
         let workflow = Workflow::builder()
             .activity(EchoActivity)
-            .step(|cx, Step1 { message }| async move {
+            .step(|mut cx, Step1 { message }| async move {
                 let echoed: String = cx.call::<EchoActivity, _>("echo-main", &message).await?;
                 To::next(Step2 { echoed })
             })

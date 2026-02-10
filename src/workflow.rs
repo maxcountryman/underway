@@ -254,9 +254,8 @@
 //!
 //! # Durable side effects
 //!
-//! Step context intentionally avoids exposing a database transaction directly.
-//! This keeps step execution sound while preserving closure ergonomics for
-//! `step`.
+//! Workflow steps do not expose a raw database transaction directly.
+//! Use durable activity helpers for side effects instead.
 //!
 //! Instead, durable side effects are modeled with workflow helpers:
 //! - [`Context::emit`] for fire-and-forget intents, and
@@ -313,7 +312,7 @@
 //! let workflow_builder = Workflow::<_, ()>::builder()
 //!     .activity(CreateProfile)
 //!     .activity(WriteAuditLog)
-//!     .step(|cx, Step1 { user_id }| async move {
+//!     .step(|mut cx, Step1 { user_id }| async move {
 //!         // Fire-and-forget effect intent.
 //!         cx.emit::<WriteAuditLog, _>("audit", &user_id).await?;
 //!
@@ -328,8 +327,9 @@
 //! Reusing a key with a different activity name or input is treated as
 //! non-deterministic and fails execution.
 //!
-//! For v1 semantics, only one unresolved `call` is allowed at a time in a
-//! step execution; issue calls sequentially as `call(...).await?`.
+//! Because [`Context::call`] requires mutable context, issuing multiple
+//! unresolved calls in parallel fails to compile. Issue calls sequentially as
+//! `call(...).await?`.
 //!
 //! If a workflow needs direct transaction-level database semantics, implement
 //! [`Task`] directly and use its `execute` method, which receives
@@ -906,10 +906,13 @@ impl<S, Set> Context<S, Set> {
     /// step after the activity completes, at which point this call returns the
     /// durable result for the same call key.
     ///
+    /// This method takes `&mut self`, which enforces sequential call issuance
+    /// within a step at compile time.
+    ///
     /// For v1 semantics, calls are sequential: only one unresolved call is
     /// permitted at a time in a single step execution.
     pub async fn call<A, Idx>(
-        &self,
+        &mut self,
         key: impl Into<String>,
         input: &A::Input,
     ) -> TaskResult<A::Output>
@@ -3626,7 +3629,7 @@ mod tests {
 
         let workflow = Workflow::builder()
             .activity(EchoActivity)
-            .step(|cx, Input { message }| async move {
+            .step(|mut cx, Input { message }| async move {
                 let _: String = cx.call::<EchoActivity, _>("echo-main", &message).await?;
                 To::done()
             })
@@ -3769,7 +3772,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn concurrent_calls_are_rejected(pool: PgPool) -> sqlx::Result<(), Error> {
+    async fn second_call_after_suspension_is_rejected(pool: PgPool) -> sqlx::Result<(), Error> {
         #[derive(Serialize, Deserialize)]
         struct Input {
             message: String,
@@ -3777,23 +3780,15 @@ mod tests {
 
         let workflow = Workflow::builder()
             .activity(EchoActivity)
-            .step(|cx, Input { message }| async move {
-                let call_one = cx.call::<EchoActivity, _>("call-1", &message);
-                let call_two = cx.call::<EchoActivity, _>("call-2", &message);
+            .step(|mut cx, Input { message }| async move {
+                let first = cx.call::<EchoActivity, _>("call-1", &message).await;
+                assert!(matches!(first, Err(TaskError::Suspended(_))));
 
-                let (result_one, result_two) = tokio::join!(call_one, call_two);
-
-                if let Err(err) = result_one {
-                    if matches!(err, TaskError::Fatal(_)) {
-                        return Err(err);
-                    }
-                }
-
-                result_two?;
+                let _ = cx.call::<EchoActivity, _>("call-2", &message).await?;
 
                 To::done()
             })
-            .name("concurrent_calls_are_rejected")
+            .name("second_call_after_suspension_is_rejected")
             .pool(pool.clone())
             .build()
             .await?;

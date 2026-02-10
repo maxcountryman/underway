@@ -79,7 +79,7 @@
 //! # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
 //! let workflow = Workflow::builder()
 //!     .activity(ResolveEmail)
-//!     .step(|cx, Input { user_id }| async move {
+//!     .step(|mut cx, Input { user_id }| async move {
 //!         let _email: String = cx.call::<ResolveEmail, _>("resolve", &user_id).await?;
 //!         To::done()
 //!     })
