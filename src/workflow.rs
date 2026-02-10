@@ -692,26 +692,35 @@
 //! Also note that workflows with schedules may still be enqueued manually when
 //! desired.
 
+mod builder;
+mod context;
+#[doc(hidden)]
+pub mod registration;
+mod step;
+
 use std::{
-    collections::HashMap,
-    future::Future,
     marker::PhantomData,
     ops::Deref,
-    pin::Pin,
     sync::{Arc, Mutex},
 };
 
-use builder_states::{Initial, PoolSet, QueueNameSet, QueueSet, StateSet, StepSet};
-use jiff::{Span, ToSpan};
+pub use builder::Builder;
+use builder::Initial;
+pub use context::Context;
+use context::{ActivityCallBuffer, ActivityCallRecord, CallSequenceState, ContextParts};
+use jiff::Span;
 use sealed::WorkflowState;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use sqlx::{PgConnection, PgExecutor, PgPool, Postgres, Transaction};
+use serde::{Deserialize, Serialize};
+use sqlx::{PgConnection, PgExecutor, Postgres, Transaction};
+pub use step::To;
+use step::{StepConfig, StepTaskConfig};
 use tracing::instrument;
 use ulid::Ulid;
 use uuid::Uuid;
 
 use crate::{
-    activity::{self, registration::Contains, CallState},
+    activity::CallState,
+    activity_worker::ActivityRegistry,
     queue::{Error as QueueError, InProgressTask, Queue},
     runtime::Runtime,
     scheduler::{Error as SchedulerError, ZonedSchedule},
@@ -719,6 +728,7 @@ use crate::{
         Error as TaskError, Result as TaskResult, RetryPolicy, State as TaskState, Task, TaskId,
     },
     worker::Error as WorkerError,
+    workflow::registration::NoActivities,
 };
 
 type Result<T = ()> = std::result::Result<T, Error>;
@@ -751,290 +761,7 @@ pub enum Error {
     Database(#[from] sqlx::Error),
 }
 
-type WorkflowQueue<T, S, A> = Queue<Workflow<T, S, A>>;
-
-/// Context passed in to each step.
-pub struct Context<S, Set = activity::registration::Nil> {
-    /// Shared step state.
-    ///
-    /// This value is set via [`state`](Builder::state).
-    ///
-    /// **Note:** State is not persisted and therefore should not be
-    /// relied on when durability is needed.
-    pub state: S,
-
-    /// Current index of the step being executed zero-based.
-    ///
-    /// In multi-step workflow definitions, this points to the current step the
-    /// workflow is processing currently.
-    pub step_index: usize,
-
-    /// Total steps count.
-    ///
-    /// The number of steps in this workflow definition.
-    pub step_count: usize,
-
-    /// This `WorkflowId`.
-    pub workflow_id: WorkflowId,
-
-    /// Queue name.
-    ///
-    /// Name of the queue the current step is currently running on.
-    pub queue_name: String,
-
-    activity_call_buffer: Arc<Mutex<ActivityCallBuffer>>,
-    call_sequence_state: Arc<Mutex<CallSequenceState>>,
-    _activity_set: PhantomData<fn() -> Set>,
-}
-
-#[derive(Clone, sqlx::FromRow)]
-struct ActivityCallRecord {
-    call_key: String,
-    activity: String,
-    input: serde_json::Value,
-    output: Option<serde_json::Value>,
-    error: Option<serde_json::Value>,
-    state: CallState,
-}
-
-#[derive(Clone)]
-struct ActivityCallCommand {
-    call_key: String,
-    activity: String,
-    input: serde_json::Value,
-}
-
-#[derive(Default)]
-struct ActivityCallBuffer {
-    records: HashMap<String, ActivityCallRecord>,
-    commands: Vec<ActivityCallCommand>,
-}
-
-#[derive(Default)]
-struct CallSequenceState {
-    unresolved_call_key: Option<String>,
-}
-
-impl ActivityCallBuffer {
-    fn new(records: Vec<ActivityCallRecord>) -> Self {
-        Self {
-            records: records
-                .into_iter()
-                .map(|record| (record.call_key.clone(), record))
-                .collect(),
-            commands: Vec::new(),
-        }
-    }
-
-    fn register_call(
-        &mut self,
-        key: &str,
-        activity: &str,
-        input: &serde_json::Value,
-    ) -> TaskResult<ActivityCallRecord> {
-        if let Some(record) = self.records.get(key) {
-            if record.activity != activity {
-                return Err(TaskError::Fatal(format!(
-                    "Non-deterministic activity call detected: key `{key}` was previously bound \
-                     to `{previous}` but now `{current}`.",
-                    previous = record.activity,
-                    current = activity,
-                )));
-            }
-
-            if record.input != *input {
-                return Err(TaskError::Fatal(format!(
-                    "Non-deterministic activity call input detected for key `{key}`."
-                )));
-            }
-
-            return Ok(record.clone());
-        }
-
-        let record = ActivityCallRecord {
-            call_key: key.to_string(),
-            activity: activity.to_string(),
-            input: input.clone(),
-            output: None,
-            error: None,
-            state: CallState::Pending,
-        };
-
-        self.records.insert(key.to_string(), record.clone());
-        self.commands.push(ActivityCallCommand {
-            call_key: key.to_string(),
-            activity: activity.to_string(),
-            input: input.clone(),
-        });
-
-        Ok(record)
-    }
-
-    fn drain_commands(&mut self) -> Vec<ActivityCallCommand> {
-        std::mem::take(&mut self.commands)
-    }
-}
-
-impl<S, Set> Context<S, Set> {
-    /// Emits a durable fire-and-forget activity call.
-    ///
-    /// The call is persisted as part of the current step transaction boundary.
-    /// If the step fails and retries before that boundary is reached, the emit
-    /// intent is not recorded.
-    ///
-    /// `key` should be deterministic for this step execution.
-    pub async fn emit<A, Idx>(&self, key: impl Into<String>, input: &A::Input) -> TaskResult<()>
-    where
-        A: activity::Activity,
-        Set: Contains<A, Idx>,
-    {
-        let key = key.into();
-        let input = serde_json::to_value(input).map_err(|err| TaskError::Fatal(err.to_string()))?;
-
-        self.register_activity_call(&key, A::NAME, &input)?;
-
-        Ok(())
-    }
-
-    /// Calls an activity and waits for its durable result.
-    ///
-    /// If the call has not completed yet this returns
-    /// [`task::Error::Suspended`](crate::task::Error::Suspended).
-    ///
-    /// In normal step code you should propagate that with `?` instead of
-    /// looping manually. The worker marks the task as waiting and re-runs the
-    /// step after the activity completes, at which point this call returns the
-    /// durable result for the same call key.
-    ///
-    /// This method takes `&mut self`, which enforces sequential call issuance
-    /// within a step at compile time.
-    ///
-    /// For v1 semantics, calls are sequential: only one unresolved call is
-    /// permitted at a time in a single step execution.
-    pub async fn call<A, Idx>(
-        &mut self,
-        key: impl Into<String>,
-        input: &A::Input,
-    ) -> TaskResult<A::Output>
-    where
-        A: activity::Activity,
-        Set: Contains<A, Idx>,
-    {
-        let key = key.into();
-        let input = serde_json::to_value(input).map_err(|err| TaskError::Fatal(err.to_string()))?;
-
-        let record = self.register_activity_call(&key, A::NAME, &input)?;
-
-        match record.state {
-            CallState::Succeeded => {
-                let output = record.output.ok_or_else(|| {
-                    TaskError::Fatal(format!(
-                        "Missing output for activity call `{activity}` with key `{key}`.",
-                        activity = A::NAME
-                    ))
-                })?;
-
-                serde_json::from_value(output).map_err(|err| TaskError::Fatal(err.to_string()))
-            }
-
-            CallState::Failed => {
-                let error = record
-                    .error
-                    .and_then(|value| serde_json::from_value::<activity::Error>(value).ok())
-                    .unwrap_or_else(|| {
-                        activity::Error::fatal(
-                            "activity_call_failed",
-                            format!(
-                                "Activity call `{activity}` with key `{key}` failed without an \
-                                 error envelope.",
-                                activity = A::NAME
-                            ),
-                        )
-                    });
-
-                if error.retryable {
-                    Err(TaskError::Retryable(error.to_string()))
-                } else {
-                    Err(TaskError::Fatal(error.to_string()))
-                }
-            }
-
-            CallState::Pending | CallState::InProgress => {
-                self.register_call_sequence_wait(&key)?;
-
-                Err(TaskError::Suspended(format!(
-                    "Waiting on activity call `{activity}` with key `{key}",
-                    activity = A::NAME
-                )))
-            }
-        }
-    }
-
-    fn register_activity_call(
-        &self,
-        key: &str,
-        activity: &str,
-        input: &serde_json::Value,
-    ) -> TaskResult<ActivityCallRecord> {
-        let mut activity_call_buffer = self
-            .activity_call_buffer
-            .lock()
-            .map_err(|_| TaskError::Fatal("Activity call buffer lock was poisoned.".to_string()))?;
-
-        activity_call_buffer.register_call(key, activity, input)
-    }
-
-    fn register_call_sequence_wait(&self, key: &str) -> TaskResult<()> {
-        let mut call_sequence_state = self
-            .call_sequence_state
-            .lock()
-            .map_err(|_| TaskError::Fatal("Call sequence state lock was poisoned.".to_string()))?;
-
-        if let Some(existing) = &call_sequence_state.unresolved_call_key {
-            if existing != key {
-                return Err(TaskError::Fatal(
-                    "Multiple unresolved `call` operations in a single step execution are not \
-                     supported. Await each call result before issuing another call."
-                        .to_string(),
-                ));
-            }
-        } else {
-            call_sequence_state.unresolved_call_key = Some(key.to_string());
-        }
-
-        Ok(())
-    }
-}
-
-struct StepConfig<S, A> {
-    executor: Box<dyn StepExecutor<S, A>>,
-    task_config: StepTaskConfig,
-}
-
-#[derive(Clone)]
-struct StepTaskConfig {
-    retry_policy: RetryPolicy,
-    timeout: Span,
-    ttl: Span,
-    delay: Span,
-    heartbeat: Span,
-    concurrency_key: Option<String>,
-    priority: i32,
-}
-
-impl Default for StepTaskConfig {
-    fn default() -> Self {
-        Self {
-            retry_policy: RetryPolicy::default(),
-            timeout: 15.minutes(),
-            ttl: 14.days(),
-            delay: Span::new(),
-            heartbeat: 30.seconds(),
-            concurrency_key: None,
-            priority: 0,
-        }
-    }
-}
+type WorkflowQueue<T, S> = Queue<Workflow<T, S>>;
 
 mod sealed {
     use serde::{Deserialize, Serialize};
@@ -1164,20 +891,19 @@ impl<T: Task> EnqueuedWorkflow<T> {
 
 /// Sequential set of functions, where the output of the last is the input to
 /// the next.
-pub struct Workflow<I, S, A = activity::registration::Nil>
+pub struct Workflow<I, S>
 where
     I: Sync + Send + 'static,
     S: Clone + Sync + Send + 'static,
-    A: 'static,
 {
-    queue: Arc<WorkflowQueue<I, S, A>>,
-    steps: Arc<Vec<StepConfig<S, A>>>,
+    queue: Arc<WorkflowQueue<I, S>>,
+    steps: Arc<Vec<StepConfig<S>>>,
     state: S,
-    activity_registry: crate::activity_worker::ActivityRegistry,
-    _marker: PhantomData<fn() -> (I, A)>,
+    activity_registry: ActivityRegistry,
+    _marker: PhantomData<fn() -> I>,
 }
 
-impl<I, S> Workflow<I, S, activity::registration::Nil>
+impl<I, S> Workflow<I, S>
 where
     I: Serialize + Sync + Send + 'static,
     S: Clone + Send + Sync + 'static,
@@ -1210,16 +936,15 @@ where
     /// # });
     /// # }
     /// ```
-    pub fn builder() -> Builder<I, I, S, Initial, activity::registration::Nil> {
-        Builder::<I, I, S, Initial, activity::registration::Nil>::new()
+    pub fn builder() -> Builder<I, I, S, Initial, NoActivities> {
+        Builder::<I, I, S, Initial, NoActivities>::new()
     }
 }
 
-impl<I, S, A> Workflow<I, S, A>
+impl<I, S> Workflow<I, S>
 where
     I: Serialize + Sync + Send + 'static,
     S: Clone + Send + Sync + 'static,
-    A: 'static,
 {
     /// Enqueue the workflow using a connection from the queue's pool.
     ///
@@ -1777,7 +1502,7 @@ where
         Arc::clone(&self.queue)
     }
 
-    pub(crate) fn activity_registry(&self) -> crate::activity_worker::ActivityRegistry {
+    pub(crate) fn activity_registry(&self) -> ActivityRegistry {
         self.activity_registry.clone()
     }
 
@@ -1809,7 +1534,7 @@ where
     /// # });
     /// # }
     /// ```
-    pub fn runtime(&self) -> Runtime<I, S, A> {
+    pub fn runtime(&self) -> Runtime<I, S> {
         Runtime::new(self.clone())
     }
 
@@ -1825,11 +1550,10 @@ where
     }
 }
 
-impl<I, S, A> Workflow<I, S, A>
+impl<I, S> Workflow<I, S>
 where
     I: Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
-    A: 'static,
 {
     fn step_task_config(&self, step_index: usize) -> StepTaskConfig {
         self.steps
@@ -1914,11 +1638,10 @@ where
     }
 }
 
-impl<I, S, A> Task for Workflow<I, S, A>
+impl<I, S> Task for Workflow<I, S>
 where
     I: Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
-    A: 'static,
 {
     type Input = WorkflowState;
     type Output = ();
@@ -1954,7 +1677,7 @@ where
         )));
         let call_sequence_state = Arc::new(Mutex::new(CallSequenceState::default()));
 
-        let cx = Context {
+        let cx = ContextParts {
             state: self.state.clone(),
             step_index,
             workflow_id,
@@ -1962,7 +1685,6 @@ where
             queue_name: self.queue.name.clone(),
             activity_call_buffer: Arc::clone(&activity_call_buffer),
             call_sequence_state,
-            _activity_set: PhantomData,
         };
 
         // Execute the step and handle any errors.
@@ -2070,11 +1792,10 @@ where
     }
 }
 
-impl<I, S, A> Clone for Workflow<I, S, A>
+impl<I, S> Clone for Workflow<I, S>
 where
     I: Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
-    A: 'static,
 {
     fn clone(&self) -> Self {
         Self {
@@ -2082,876 +1803,6 @@ where
             state: self.state.clone(),
             steps: self.steps.clone(),
             activity_registry: self.activity_registry.clone(),
-            _marker: PhantomData,
-        }
-    }
-}
-
-/// Represents the state after executing a step.
-#[derive(Deserialize, Serialize)]
-pub enum To<N> {
-    /// The next step to transition to.
-    Next(N),
-
-    /// The next step to transition to after the delay.
-    Delay {
-        /// The step itself.
-        next: N,
-
-        /// The delay before which the step will not be run.
-        delay: Span,
-    },
-
-    /// The terminal state.
-    Done,
-}
-
-impl<S> To<S> {
-    /// Transitions from the current step to the next step.
-    pub fn next(step: S) -> TaskResult<Self> {
-        Ok(Self::Next(step))
-    }
-
-    /// Transitions from the current step to the next step, but after the given
-    /// delay.
-    ///
-    /// The next step will be enqueued immediately, but won't be dequeued until
-    /// the span has elapsed.
-    pub fn delay_for(step: S, delay: Span) -> TaskResult<Self> {
-        Ok(Self::Delay { next: step, delay })
-    }
-}
-
-impl To<()> {
-    /// Signals that this is the final step and no more steps will follow.
-    pub fn done() -> TaskResult<To<()>> {
-        Ok(To::Done)
-    }
-}
-
-// A concrete implementation of a step using a closure.
-type StepFnMarker<I, O, S, A> = fn() -> (I, O, S, A);
-
-struct StepFn<I, O, S, A, F>
-where
-    F: Fn(Context<S, A>, I) -> Pin<Box<dyn Future<Output = TaskResult<To<O>>> + Send>>
-        + Send
-        + Sync
-        + 'static,
-{
-    func: Arc<F>,
-    _marker: PhantomData<StepFnMarker<I, O, S, A>>,
-}
-
-impl<I, O, S, A, F> StepFn<I, O, S, A, F>
-where
-    F: Fn(Context<S, A>, I) -> Pin<Box<dyn Future<Output = TaskResult<To<O>>> + Send>>
-        + Send
-        + Sync
-        + 'static,
-{
-    fn new(func: F) -> Self {
-        Self {
-            func: Arc::new(func),
-            _marker: PhantomData,
-        }
-    }
-}
-
-type StepResult = TaskResult<Option<(serde_json::Value, Span)>>;
-
-// A trait object wrapper for steps to allow heterogeneous step types in a
-// vector.
-trait StepExecutor<S, A>: Send + Sync {
-    // Execute the step with the given input serialized as JSON.
-    fn execute_step(
-        &self,
-        cx: Context<S, A>,
-        input: serde_json::Value,
-    ) -> Pin<Box<dyn Future<Output = StepResult> + Send>>;
-}
-
-impl<I, O, S, A, F> StepExecutor<S, A> for StepFn<I, O, S, A, F>
-where
-    I: DeserializeOwned + Serialize + Send + Sync + 'static,
-    O: Serialize + Send + Sync + 'static,
-    S: Send + Sync + 'static,
-    F: Fn(Context<S, A>, I) -> Pin<Box<dyn Future<Output = TaskResult<To<O>>> + Send>>
-        + Send
-        + Sync
-        + 'static,
-{
-    fn execute_step(
-        &self,
-        cx: Context<S, A>,
-        input: serde_json::Value,
-    ) -> Pin<Box<dyn Future<Output = StepResult> + Send>> {
-        let deserialized_input: I = match serde_json::from_value(input) {
-            Ok(val) => val,
-            Err(e) => return Box::pin(async move { Err(TaskError::Fatal(e.to_string())) }),
-        };
-        let fut = (self.func)(cx, deserialized_input);
-
-        Box::pin(async move {
-            match fut.await {
-                Ok(To::Next(output)) => {
-                    let serialized_output = serde_json::to_value(output)
-                        .map_err(|e| TaskError::Fatal(e.to_string()))?;
-                    Ok(Some((serialized_output, Span::new())))
-                }
-
-                Ok(To::Delay {
-                    next: output,
-                    delay,
-                }) => {
-                    let serialized_output = serde_json::to_value(output)
-                        .map_err(|e| TaskError::Fatal(e.to_string()))?;
-                    Ok(Some((serialized_output, delay)))
-                }
-
-                Ok(To::Done) => Ok(None),
-
-                Err(e) => Err(e),
-            }
-        })
-    }
-}
-
-mod builder_states {
-    use std::marker::PhantomData;
-
-    use sqlx::PgPool;
-
-    use super::WorkflowQueue;
-
-    pub struct Initial;
-
-    pub struct StateSet<S> {
-        pub state: S,
-    }
-
-    pub struct StepSet<Current, S> {
-        pub state: S,
-        pub _marker: PhantomData<Current>,
-    }
-
-    pub struct QueueSet<I, S, A>
-    where
-        I: Send + Sync + 'static,
-        S: Clone + Send + Sync + 'static,
-        A: 'static,
-    {
-        pub state: S,
-        pub queue: WorkflowQueue<I, S, A>,
-    }
-
-    pub struct QueueNameSet<S> {
-        pub state: S,
-        pub queue_name: String,
-    }
-
-    pub struct PoolSet<S> {
-        pub state: S,
-        pub queue_name: String,
-        pub pool: PgPool,
-    }
-}
-
-type BuilderMarker<I, O, S, A> = fn() -> (I, O, S, A);
-
-/// Builder for constructing a `Workflow` with a sequence of steps.
-pub struct Builder<I, O, S, B, A = activity::registration::Nil>
-where
-    A: 'static,
-{
-    builder_state: B,
-    steps: Vec<StepConfig<S, A>>,
-    activity_registry: crate::activity_worker::ActivityRegistry,
-    _marker: PhantomData<BuilderMarker<I, O, S, A>>,
-}
-
-impl<I, S> Default for Builder<I, I, S, Initial, activity::registration::Nil> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<I, S, ASet> Builder<I, I, S, Initial, ASet> {
-    /// Registers an activity handler for subsequent steps.
-    pub fn activity<A>(
-        mut self,
-        activity: A,
-    ) -> Builder<I, I, S, Initial, activity::registration::Cons<A, ASet>>
-    where
-        A: activity::Activity,
-    {
-        self.activity_registry.register(activity);
-
-        Builder {
-            builder_state: Initial,
-            steps: Vec::new(),
-            activity_registry: self.activity_registry,
-            _marker: PhantomData,
-        }
-    }
-
-    /// Create a new builder.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use underway::Workflow;
-    ///
-    /// // Instantiate a new builder from the `Workflow` method.
-    /// let workflow_builder = Workflow::<(), ()>::builder();
-    /// ```
-    pub fn new() -> Builder<I, I, S, Initial, activity::registration::Nil> {
-        Builder::<I, I, S, _, activity::registration::Nil> {
-            builder_state: Initial,
-            steps: Vec::new(),
-            activity_registry: crate::activity_worker::ActivityRegistry::default(),
-            _marker: PhantomData,
-        }
-    }
-
-    /// Provides a state shared amongst all steps.
-    ///
-    /// The state type must be `Clone`.
-    ///
-    /// State is useful for providing shared resources to steps. This could
-    /// include shared connections, clients, or other configuration that may be
-    /// used throughout step functions.
-    ///
-    /// **Note:** State is not persisted and therefore should not be relied on
-    /// when durability is needed.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use underway::Workflow;
-    ///
-    /// #[derive(Clone)]
-    /// struct State {
-    ///     data: String,
-    /// }
-    ///
-    /// // Set state.
-    /// let workflow_builder = Workflow::<(), _>::builder().state(State {
-    ///     data: "foo".to_string(),
-    /// });
-    /// ```
-    pub fn state(self, state: S) -> Builder<I, I, S, StateSet<S>, ASet> {
-        Builder {
-            builder_state: StateSet { state },
-            steps: self.steps,
-            activity_registry: self.activity_registry,
-            _marker: PhantomData,
-        }
-    }
-
-    /// Add a step to the workflow.
-    ///
-    /// A step function should take the workflow context as its first argument
-    /// followed by some type that's `Serialize` and `Deserialize` as its
-    /// second argument.
-    ///
-    /// It should also return one of the [`To`] variants. For convenience, `To`
-    /// provides methods that return the correct types. Most commonly these
-    /// will be [`To::next`], when going on to another step, or [`To::done`],
-    /// when there are no more steps.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use underway::{To, Workflow};
-    ///
-    /// // Set a step.
-    /// let workflow_builder = Workflow::<(), ()>::builder().step(|_cx, _| async move { To::done() });
-    /// ```
-    pub fn step<F, O, Fut>(mut self, func: F) -> Builder<I, O, S, StepSet<O, ()>, ASet>
-    where
-        I: DeserializeOwned + Serialize + Send + Sync + 'static,
-        O: Serialize + Send + Sync + 'static,
-        S: Send + Sync + 'static,
-        F: Fn(Context<S, ASet>, I) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = TaskResult<To<O>>> + Send + 'static,
-    {
-        let step_fn = StepFn::new(move |cx, input| Box::pin(func(cx, input)));
-        self.steps.push(StepConfig {
-            executor: Box::new(step_fn),
-            task_config: StepTaskConfig::default(),
-        });
-
-        Builder {
-            builder_state: StepSet {
-                state: (),
-                _marker: PhantomData,
-            },
-            steps: self.steps,
-            activity_registry: self.activity_registry,
-            _marker: PhantomData,
-        }
-    }
-}
-
-// After state set, before first step set.
-impl<I, S, ASet> Builder<I, I, S, StateSet<S>, ASet> {
-    /// Registers an activity handler for subsequent steps.
-    pub fn activity<A>(
-        mut self,
-        activity: A,
-    ) -> Builder<I, I, S, StateSet<S>, activity::registration::Cons<A, ASet>>
-    where
-        A: activity::Activity,
-    {
-        self.activity_registry.register(activity);
-
-        Builder {
-            builder_state: StateSet {
-                state: self.builder_state.state,
-            },
-            steps: Vec::new(),
-            activity_registry: self.activity_registry,
-            _marker: PhantomData,
-        }
-    }
-
-    /// Add a step to the workflow.
-    ///
-    /// A step function should take the workflow context as its first argument
-    /// followed by some type that's `Serialize` and `Deserialize` as its
-    /// second argument.
-    ///
-    /// It should also return one of the [`To`] variants. For convenience, `To`
-    /// provides methods that return the correct types. Most commonly these
-    /// will be [`To::next`], when going on to another step, or [`To::done`],
-    /// when there are no more steps.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use underway::{To, Workflow};
-    ///
-    /// #[derive(Clone)]
-    /// struct State {
-    ///     data: String,
-    /// }
-    ///
-    /// // Set a step with state.
-    /// let workflow_builder = Workflow::<(), _>::builder()
-    ///     .state(State {
-    ///         data: "foo".to_string(),
-    ///     })
-    ///     .step(|cx, _| async move {
-    ///         println!("State data: {}", cx.state.data);
-    ///         To::done()
-    ///     });
-    /// ```
-    pub fn step<F, O, Fut>(mut self, func: F) -> Builder<I, O, S, StepSet<O, S>, ASet>
-    where
-        I: DeserializeOwned + Serialize + Send + Sync + 'static,
-        O: Serialize + Send + Sync + 'static,
-        S: Send + Sync + 'static,
-        F: Fn(Context<S, ASet>, I) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = TaskResult<To<O>>> + Send + 'static,
-    {
-        let step_fn = StepFn::new(move |cx, input| Box::pin(func(cx, input)));
-        self.steps.push(StepConfig {
-            executor: Box::new(step_fn),
-            task_config: StepTaskConfig::default(),
-        });
-
-        Builder {
-            builder_state: StepSet {
-                state: self.builder_state.state,
-                _marker: PhantomData,
-            },
-            steps: self.steps,
-            activity_registry: self.activity_registry,
-            _marker: PhantomData,
-        }
-    }
-}
-
-// After first step set.
-impl<I, Current, S, ASet> Builder<I, Current, S, StepSet<Current, S>, ASet> {
-    /// Add a subsequent step to the workflow.
-    ///
-    /// This method ensures that the input type of the new step matches the
-    /// output type of the previous step.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use serde::{Deserialize, Serialize};
-    /// use underway::{To, Workflow};
-    ///
-    /// #[derive(Deserialize, Serialize)]
-    /// struct Step2 {
-    ///     n: usize,
-    /// }
-    ///
-    /// // Set one step after another.
-    /// let workflow_builder = Workflow::<(), ()>::builder()
-    ///     .step(|_cx, _| async move { To::next(Step2 { n: 42 }) })
-    ///     .step(|_cx, Step2 { n }| async move { To::done() });
-    /// ```
-    pub fn step<F, New, Fut>(mut self, func: F) -> Builder<I, New, S, StepSet<New, S>, ASet>
-    where
-        Current: DeserializeOwned + Serialize + Send + Sync + 'static,
-        New: Serialize + Send + Sync + 'static,
-        S: Send + Sync + 'static,
-        F: Fn(Context<S, ASet>, Current) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = TaskResult<To<New>>> + Send + 'static,
-    {
-        let step_fn = StepFn::new(move |cx, input| Box::pin(func(cx, input)));
-        self.steps.push(StepConfig {
-            executor: Box::new(step_fn),
-            task_config: StepTaskConfig::default(),
-        });
-
-        Builder {
-            builder_state: StepSet {
-                state: self.builder_state.state,
-                _marker: PhantomData,
-            },
-            steps: self.steps,
-            activity_registry: self.activity_registry,
-            _marker: PhantomData,
-        }
-    }
-
-    /// Sets the retry policy of the previous step.
-    ///
-    /// This policy applies to the step immediately before the method. That
-    /// means that a retry policy may be defined for each step and each
-    /// step's policy may differ from the others.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use underway::{task::RetryPolicy, To, Workflow};
-    ///
-    /// // Set a retry policy for the step.
-    /// let retry_policy = RetryPolicy::builder().max_attempts(15).build();
-    /// let workflow_builder = Workflow::<(), ()>::builder()
-    ///     .step(|_cx, _| async move { To::done() })
-    ///     .retry_policy(retry_policy);
-    /// ```
-    pub fn retry_policy(
-        mut self,
-        retry_policy: RetryPolicy,
-    ) -> Builder<I, Current, S, StepSet<Current, S>, ASet> {
-        let step_config = self.steps.last_mut().expect("Steps should not be empty");
-        step_config.task_config.retry_policy = retry_policy;
-
-        Builder {
-            builder_state: StepSet {
-                state: self.builder_state.state,
-                _marker: PhantomData,
-            },
-            steps: self.steps,
-            activity_registry: self.activity_registry,
-            _marker: PhantomData,
-        }
-    }
-
-    /// Sets the timeout of the previous step.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use jiff::ToSpan;
-    /// use underway::{To, Workflow};
-    ///
-    /// let workflow_builder = Workflow::<(), ()>::builder()
-    ///     .step(|_cx, _| async move { To::done() })
-    ///     .timeout(1.minute());
-    /// ```
-    pub fn timeout(mut self, timeout: Span) -> Builder<I, Current, S, StepSet<Current, S>, ASet> {
-        let step_config = self.steps.last_mut().expect("Steps should not be empty");
-        step_config.task_config.timeout = timeout;
-
-        Builder {
-            builder_state: StepSet {
-                state: self.builder_state.state,
-                _marker: PhantomData,
-            },
-            steps: self.steps,
-            activity_registry: self.activity_registry,
-            _marker: PhantomData,
-        }
-    }
-
-    /// Sets the TTL of the previous step.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use jiff::ToSpan;
-    /// use underway::{To, Workflow};
-    ///
-    /// let workflow_builder = Workflow::<(), ()>::builder()
-    ///     .step(|_cx, _| async move { To::done() })
-    ///     .ttl(7.days());
-    /// ```
-    pub fn ttl(mut self, ttl: Span) -> Builder<I, Current, S, StepSet<Current, S>, ASet> {
-        let step_config = self.steps.last_mut().expect("Steps should not be empty");
-        step_config.task_config.ttl = ttl;
-
-        Builder {
-            builder_state: StepSet {
-                state: self.builder_state.state,
-                _marker: PhantomData,
-            },
-            steps: self.steps,
-            activity_registry: self.activity_registry,
-            _marker: PhantomData,
-        }
-    }
-
-    /// Sets a base delay before the previous step can be dequeued.
-    ///
-    /// This delay is added to any delay specified by [`To::delay_for`].
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use jiff::ToSpan;
-    /// use underway::{To, Workflow};
-    ///
-    /// let workflow_builder = Workflow::<(), ()>::builder()
-    ///     .step(|_cx, _| async move { To::done() })
-    ///     .delay(30.seconds());
-    /// ```
-    pub fn delay(mut self, delay: Span) -> Builder<I, Current, S, StepSet<Current, S>, ASet> {
-        let step_config = self.steps.last_mut().expect("Steps should not be empty");
-        step_config.task_config.delay = delay;
-
-        Builder {
-            builder_state: StepSet {
-                state: self.builder_state.state,
-                _marker: PhantomData,
-            },
-            steps: self.steps,
-            activity_registry: self.activity_registry,
-            _marker: PhantomData,
-        }
-    }
-
-    /// Sets the heartbeat interval of the previous step.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use jiff::ToSpan;
-    /// use underway::{To, Workflow};
-    ///
-    /// let workflow_builder = Workflow::<(), ()>::builder()
-    ///     .step(|_cx, _| async move { To::done() })
-    ///     .heartbeat(5.seconds());
-    /// ```
-    pub fn heartbeat(
-        mut self,
-        heartbeat: Span,
-    ) -> Builder<I, Current, S, StepSet<Current, S>, ASet> {
-        let step_config = self.steps.last_mut().expect("Steps should not be empty");
-        step_config.task_config.heartbeat = heartbeat;
-
-        Builder {
-            builder_state: StepSet {
-                state: self.builder_state.state,
-                _marker: PhantomData,
-            },
-            steps: self.steps,
-            activity_registry: self.activity_registry,
-            _marker: PhantomData,
-        }
-    }
-
-    /// Sets the concurrency key of the previous step.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use underway::{To, Workflow};
-    ///
-    /// let workflow_builder = Workflow::<(), ()>::builder()
-    ///     .step(|_cx, _| async move { To::done() })
-    ///     .concurrency_key("customer:42");
-    /// ```
-    pub fn concurrency_key(
-        mut self,
-        concurrency_key: impl Into<String>,
-    ) -> Builder<I, Current, S, StepSet<Current, S>, ASet> {
-        let step_config = self.steps.last_mut().expect("Steps should not be empty");
-        step_config.task_config.concurrency_key = Some(concurrency_key.into());
-
-        Builder {
-            builder_state: StepSet {
-                state: self.builder_state.state,
-                _marker: PhantomData,
-            },
-            steps: self.steps,
-            activity_registry: self.activity_registry,
-            _marker: PhantomData,
-        }
-    }
-
-    /// Sets the priority of the previous step.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use underway::{To, Workflow};
-    ///
-    /// let workflow_builder = Workflow::<(), ()>::builder()
-    ///     .step(|_cx, _| async move { To::done() })
-    ///     .priority(10);
-    /// ```
-    pub fn priority(mut self, priority: i32) -> Builder<I, Current, S, StepSet<Current, S>, ASet> {
-        let step_config = self.steps.last_mut().expect("Steps should not be empty");
-        step_config.task_config.priority = priority;
-
-        Builder {
-            builder_state: StepSet {
-                state: self.builder_state.state,
-                _marker: PhantomData,
-            },
-            steps: self.steps,
-            activity_registry: self.activity_registry,
-            _marker: PhantomData,
-        }
-    }
-}
-
-// Encapsulate queue creation.
-impl<I, S, ASet> Builder<I, (), S, StepSet<(), S>, ASet>
-where
-    I: Send + Sync + 'static,
-    S: Clone + Send + Sync + 'static,
-{
-    /// Set the name of the workflow's queue.
-    ///
-    /// This provides the name of the underlying queue that will be created for
-    /// this workflow.
-    ///
-    /// **Note:** It's important that this name be unique amongst all tasks. If
-    /// it's not and other tasks define differing input types this will
-    /// cause runtime errors when mismatching types are deserialized from
-    /// the database.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use underway::{To, Workflow};
-    ///
-    /// // Set a name.
-    /// let workflow_builder = Workflow::<(), ()>::builder()
-    ///     .step(|_cx, _| async move { To::done() })
-    ///     .name("example");
-    /// ```
-    pub fn name(self, name: impl Into<String>) -> Builder<I, (), S, QueueNameSet<S>, ASet> {
-        Builder {
-            builder_state: QueueNameSet {
-                state: self.builder_state.state,
-                queue_name: name.into(),
-            },
-            steps: self.steps,
-            activity_registry: self.activity_registry,
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<I, S, ASet> Builder<I, (), S, QueueNameSet<S>, ASet>
-where
-    I: Send + Sync + 'static,
-    S: Clone + Send + Sync + 'static,
-{
-    /// Set the pool of the workflow's queue.
-    ///
-    /// This provides the connection pool to the database that the underlying
-    /// queue will use for this workflow.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// use std::env;
-    ///
-    /// use sqlx::PgPool;
-    /// use underway::{To, Workflow};
-    /// # use tokio::runtime::Runtime;
-    /// # fn main() {
-    /// # let rt = Runtime::new().unwrap();
-    /// # rt.block_on(async {
-    ///
-    /// let pool = PgPool::connect(&env::var("DATABASE_URL").unwrap()).await?;
-    ///
-    /// // Set a pool.
-    /// let workflow_builder = Workflow::<(), ()>::builder()
-    ///     .step(|_cx, _| async move { To::done() })
-    ///     .name("example")
-    ///     .pool(pool);
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// # });
-    /// # }
-    /// ```
-    pub fn pool(self, pool: PgPool) -> Builder<I, (), S, PoolSet<S>, ASet> {
-        let QueueNameSet { queue_name, state } = self.builder_state;
-        Builder {
-            builder_state: PoolSet {
-                state,
-                queue_name,
-                pool,
-            },
-            steps: self.steps,
-            activity_registry: self.activity_registry,
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<I, S, ASet> Builder<I, (), S, PoolSet<S>, ASet>
-where
-    I: Send + Sync + 'static,
-    S: Clone + Send + Sync + 'static,
-{
-    /// Finalize the builder into a `Workflow`.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// use std::env;
-    ///
-    /// use sqlx::PgPool;
-    /// use underway::{To, Workflow};
-    ///
-    /// # use tokio::runtime::Runtime;
-    /// # fn main() {
-    /// # let rt = Runtime::new().unwrap();
-    /// # rt.block_on(async {
-    /// let pool = PgPool::connect(&env::var("DATABASE_URL").unwrap()).await?;
-    ///
-    /// // Build the workflow.
-    /// let workflow = Workflow::<(), ()>::builder()
-    ///     .step(|_cx, _| async move { To::done() })
-    ///     .name("example")
-    ///     .pool(pool)
-    ///     .build()
-    ///     .await?;
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// # });
-    /// # }
-    /// ```
-    pub async fn build(self) -> Result<Workflow<I, S, ASet>> {
-        let PoolSet {
-            state,
-            queue_name,
-            pool,
-        } = self.builder_state;
-        let queue = Queue::builder().name(queue_name).pool(pool).build().await?;
-        Ok(Workflow {
-            queue: Arc::new(queue),
-            steps: Arc::new(self.steps),
-            state,
-            activity_registry: self.activity_registry,
-            _marker: PhantomData,
-        })
-    }
-}
-
-// Directly provide queue.
-impl<I, S, ASet> Builder<I, (), S, StepSet<(), S>, ASet>
-where
-    I: Send + Sync + 'static,
-    S: Clone + Send + Sync + 'static,
-{
-    /// Set the queue.
-    ///
-    /// This allows providing a `Queue` directly, for situations where the queue
-    /// has been defined separately from the workflow.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # use sqlx::PgPool;
-    /// use underway::{Queue, To, Workflow};
-    ///
-    /// # use tokio::runtime::Runtime;
-    /// # fn main() {
-    /// # let rt = Runtime::new().unwrap();
-    /// # rt.block_on(async {
-    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
-    /// # /*
-    /// let pool = { /* A `PgPool`. */ };
-    /// # */
-    /// #
-    /// let queue = Queue::builder().name("example").pool(pool).build().await?;
-    ///
-    /// // Set a queue.
-    /// let workflow = Workflow::<(), ()>::builder()
-    ///     .step(|_cx, _| async move { To::done() })
-    ///     .queue(queue);
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// # });
-    /// # }
-    /// ```
-    pub fn queue(
-        self,
-        queue: WorkflowQueue<I, S, ASet>,
-    ) -> Builder<I, (), S, QueueSet<I, S, ASet>, ASet> {
-        Builder {
-            builder_state: QueueSet {
-                state: self.builder_state.state,
-                queue,
-            },
-            steps: self.steps,
-            activity_registry: self.activity_registry,
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<I, S, ASet> Builder<I, (), S, QueueSet<I, S, ASet>, ASet>
-where
-    I: Send + Sync + 'static,
-    S: Clone + Send + Sync + 'static,
-{
-    /// Finalize the builder into a `Workflow`.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # use sqlx::PgPool;
-    /// use underway::{Workflow, To, Queue};
-    ///
-    /// # use tokio::runtime::Runtime;
-    /// # fn main() {
-    /// # let rt = Runtime::new().unwrap();
-    /// # rt.block_on(async {
-    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
-    /// # /*
-    /// let pool = { /* A `PgPool`. */ };
-    /// # */
-    /// #
-    /// let queue = Queue::builder().name("example").pool(pool).build().await?;
-    ///
-    /// // Build the workflow.
-    /// let workflow = Workflow::<(), ()>::builder()
-    ///     .step(|_cx, _| async move { To::done() })
-    ///     .queue(queue)
-    ///     .build();
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// # });
-    /// # }
-    pub fn build(self) -> Workflow<I, S, ASet> {
-        let QueueSet { state, queue } = self.builder_state;
-        Workflow {
-            queue: Arc::new(queue),
-            steps: Arc::new(self.steps),
-            state,
-            activity_registry: self.activity_registry,
             _marker: PhantomData,
         }
     }
