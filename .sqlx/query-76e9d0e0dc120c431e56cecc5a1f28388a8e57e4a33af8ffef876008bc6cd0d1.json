@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            select state as \"state: TaskState\"\n            from underway.task\n            where input->>'job_id' = $1\n            ",
+  "query": "\n            select state as \"state: TaskState\"\n            from underway.task\n            where input->>'workflow_id' = $1\n            ",
   "describe": {
     "columns": [
       {
@@ -32,5 +32,5 @@
       false
     ]
   },
-  "hash": "0d302d44aacf1e8ee3233b8c4814e7355fc4b57d98550cd43aec5c424ac4cdca"
+  "hash": "76e9d0e0dc120c431e56cecc5a1f28388a8e57e4a33af8ffef876008bc6cd0d1"
 }

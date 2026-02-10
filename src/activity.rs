@@ -4,8 +4,8 @@
 //! Unlike workflow code, activity handlers are expected to perform external
 //! I/O such as HTTP requests, emails, or writes to other systems.
 //!
-//! Workflow steps call activities via [`crate::job::Context::call`] and
-//! [`crate::job::Context::emit`]. Calls are persisted and executed by the
+//! Workflow steps call activities via [`crate::workflow::Context::call`] and
+//! [`crate::workflow::Context::emit`]. Calls are persisted and executed by the
 //! activity worker managed by [`crate::Runtime`].
 //!
 //! # Defining activities

@@ -1,4 +1,4 @@
-//! Jobs are a series of sequential steps, where each step is a [`Task`].
+//! Workflows are a series of sequential steps, where each step is a [`Task`].
 //!
 //! Each step is given the output of the previous step as input. In other words,
 //! steps form a chain, where one step is linked to the next, until the last
@@ -13,35 +13,36 @@
 //!
 //! Because each step is treated as its own task, steps are executed and then
 //! persisted, before the next task is enqueued. This means that when a step,
-//! the job will be resumed from where it was.
+//! the workflow will be resumed from where it was.
 //!
-//! # Defining jobs
+//! # Defining workflows
 //!
-//! Jobs are formed from at least one step function.
+//! Workflows are formed from at least one step function.
 //!
 //! ```rust
-//! use underway::{Activity, Job, To};
+//! use underway::{Activity, To, Workflow};
 //!
-//! let job_builder = Job::<(), ()>::builder().step(|_cx, _| async move { To::done() });
+//! let workflow_builder = Workflow::<(), ()>::builder().step(|_cx, _| async move { To::done() });
 //! ```
 //!
 //! Instead of a closure, we could also use a named function.
 //!
 //! ```rust
-//! use underway::{job::Context, task::Result as TaskResult, Job, To};
+//! use underway::{task::Result as TaskResult, workflow::Context, To, Workflow};
 //!
 //! async fn named_step(_cx: Context<()>, _: ()) -> TaskResult<To<()>> {
 //!     To::done()
 //! }
 //!
-//! let job_builder = Job::<_, ()>::builder().step(named_step);
+//! let workflow_builder = Workflow::<_, ()>::builder().step(named_step);
 //! ```
 //!
 //! Notice that the first argument to our function is [a context
-//! binding](crate::job::Context). This provides access to fields like
-//! [`state`](crate::job::Context::state) and
-//! [`job_id`](crate::job::Context::job_id), as well as workflow helpers like
-//! [`call`](crate::job::Context::call) and [`emit`](crate::job::Context::emit).
+//! binding](crate::workflow::Context). This provides access to fields like
+//! [`state`](crate::workflow::Context::state) and
+//! [`workflow_id`](crate::workflow::Context::workflow_id), as well as workflow
+//! helpers like [`call`](crate::workflow::Context::call) and
+//! [`emit`](crate::workflow::Context::emit).
 //!
 //! The second argument is a type we provide as input to the step. In our
 //! example it's the unit type. But if we were to specify another type it would
@@ -52,7 +53,7 @@
 //!
 //! ```rust
 //! use serde::{Deserialize, Serialize};
-//! use underway::{Activity, Job, To};
+//! use underway::{Activity, To, Workflow};
 //!
 //! // Our very own input type.
 //! #[derive(Serialize, Deserialize)]
@@ -60,21 +61,21 @@
 //!     name: String,
 //! };
 //!
-//! let job_builder =
-//!     Job::<_, ()>::builder().step(|_cx, MyArgs { name }| async move { To::done() });
+//! let workflow_builder =
+//!     Workflow::<_, ()>::builder().step(|_cx, MyArgs { name }| async move { To::done() });
 //! ```
 //!
 //! Besides input, it's also important to point out that we return a specific
 //! type that indicates what to do next. So far, we've only had a single step
 //! and so we've returned [`To::done`].
 //!
-//! But jobs may be composed of any number of sequential steps. Each step is
-//! structured to take the output of the last step. By returning [`To::next`]
+//! But workflows may be composed of any number of sequential steps. Each step
+//! is structured to take the output of the last step. By returning [`To::next`]
 //! with the input of the next step, we move on to that step.
 //!
 //! ```rust
 //! use serde::{Deserialize, Serialize};
-//! use underway::{Job, To};
+//! use underway::{To, Workflow};
 //!
 //! // Here's the input for our first step.
 //! #[derive(Serialize, Deserialize)]
@@ -89,7 +90,7 @@
 //!     new: usize,
 //! };
 //!
-//! let job_builder = Job::<_, ()>::builder()
+//! let workflow_builder = Workflow::<_, ()>::builder()
 //!     .step(|_cx, Step1 { n }| async move {
 //!         println!("Got {n}");
 //!
@@ -115,7 +116,7 @@
 //!
 //! ```rust,compile_fail
 //! use serde::{Deserialize, Serialize};
-//! use underway::{Activity, Job, To};
+//! use underway::{Activity, Workflow, To};
 //!
 //! #[derive(Serialize, Deserialize)]
 //! struct Step1 {
@@ -128,7 +129,7 @@
 //!     new: usize,
 //! };
 //!
-//! let job_builder = Job::<_, ()>::builder()
+//! let workflow_builder = Workflow::<_, ()>::builder()
 //!     .step(|_cx, Step1 { n }| async move {
 //!         println!("Got {n}");
 //!
@@ -151,7 +152,7 @@
 //! ```rust
 //! use jiff::ToSpan;
 //! use serde::{Deserialize, Serialize};
-//! use underway::{Activity, Job, To};
+//! use underway::{Activity, To, Workflow};
 //!
 //! #[derive(Serialize, Deserialize)]
 //! struct Step1 {
@@ -164,7 +165,7 @@
 //!     new: usize,
 //! };
 //!
-//! let job_builder = Job::<_, ()>::builder()
+//! let workflow_builder = Workflow::<_, ()>::builder()
 //!     .step(|_cx, Step1 { n }| async move {
 //!         println!("Got {n}");
 //!
@@ -202,16 +203,16 @@
 //!
 //! Then this span may be used as our delay given to `To::delay`.
 //!
-//! # Stateful jobs
+//! # Stateful workflows
 //!
 //! So far, we've ignored the context binding. One reason we need it is to
-//! access shared state we've set on the job.
+//! access shared state we've set on the workflow.
 //!
 //! State like this can be useful when there may be resources or configuration
 //! that all steps should have access to. The only requirement is that the state
 //! type be `Clone`, as it will be cloned into each step.
 //! ```rust
-//! use underway::{job::Context, Job, To};
+//! use underway::{workflow::Context, To, Workflow};
 //!
 //! // A simple state that'll be provided to our steps.
 //! #[derive(Clone)]
@@ -223,7 +224,7 @@
 //!     data: "data".to_string(),
 //! };
 //!
-//! let job_builder = Job::<(), _>::builder()
+//! let workflow_builder = Workflow::<(), _>::builder()
 //!     .state(state) // Here we've set the state.
 //!     .step(|Context { state, .. }, _| async move {
 //!         println!("State data is: {}", state.data);
@@ -243,11 +244,11 @@
 //! It's possible to use state in shared mutable fashion via patterns for
 //! interior mutability like `Arc<Mutex<..>>`.
 //!
-//! However, **please use caution**: state is maintained between job executions
-//! and is not reset. This means that independent step executions, **including
-//! those that may have originated from different enqueues of the job**,
-//! will have access to the same state. For this reason, this pattern is
-//! discouraged.
+//! However, **please use caution**: state is maintained between workflow
+//! executions and is not reset. This means that independent step executions,
+//! **including those that may have originated from different enqueues of the
+//! workflow**, will have access to the same state. For this reason, this
+//! pattern is discouraged.
 //!
 //! # Durable side effects
 //!
@@ -266,7 +267,7 @@
 //!
 //! ```rust
 //! use serde::{Deserialize, Serialize};
-//! use underway::{Activity, Job, To};
+//! use underway::{Activity, To, Workflow};
 //!
 //! #[derive(Serialize, Deserialize)]
 //! struct Step1 {
@@ -304,7 +305,7 @@
 //!     }
 //! }
 //!
-//! let job_builder = Job::<_, ()>::builder()
+//! let workflow_builder = Workflow::<_, ()>::builder()
 //!     .activity(CreateProfile)
 //!     .activity(WriteAuditLog)
 //!     .step(|cx, Step1 { user_id }| async move {
@@ -336,7 +337,7 @@
 //!
 //! ```rust
 //! use serde::{Deserialize, Serialize};
-//! use underway::{task::RetryPolicy, Job, To};
+//! use underway::{task::RetryPolicy, To, Workflow};
 //!
 //! #[derive(Serialize, Deserialize)]
 //! struct Step1 {
@@ -349,7 +350,7 @@
 //!     new: usize,
 //! };
 //!
-//! let job_builder = Job::<_, ()>::builder()
+//! let workflow_builder = Workflow::<_, ()>::builder()
 //!     .step(|_cx, Step1 { n }| async move {
 //!         println!("Got {n}");
 //!         To::next(Step2 {
@@ -374,9 +375,9 @@
 //!
 //! ```rust
 //! use jiff::ToSpan;
-//! use underway::{Job, To};
+//! use underway::{To, Workflow};
 //!
-//! let job_builder = Job::<(), ()>::builder()
+//! let workflow_builder = Workflow::<(), ()>::builder()
 //!     .step(|_cx, _| async move { To::done() })
 //!     .timeout(2.minutes())
 //!     .ttl(7.days())
@@ -386,14 +387,14 @@
 //!     .priority(10);
 //! ```
 //!
-//! # Enqueuing jobs
+//! # Enqueuing workflows
 //!
-//! Once we've configured our job with its sequence of one or more steps we can
-//! build the job and enqueue it with input.
+//! Once we've configured our workflow with its sequence of one or more steps we
+//! can build the workflow and enqueue it with input.
 //!
 //! ```rust,no_run
 //! # use sqlx::PgPool;
-//! use underway::{Job, To};
+//! use underway::{To, Workflow};
 //!
 //! # use tokio::runtime::Runtime;
 //! # fn main() {
@@ -405,26 +406,26 @@
 //! # */
 //! #
 //!
-//! let job = Job::builder()
+//! let workflow = Workflow::builder()
 //!     .step(|_cx, _| async move { To::done() })
-//!     .name("example-job")
+//!     .name("example-workflow")
 //!     .pool(pool)
 //!     .build()
 //!     .await?;
 //!
-//! // Enqueue a new job with the given input `()`.
-//! job.enqueue(&()).await?;
+//! // Enqueue a new workflow with the given input `()`.
+//! workflow.enqueue(&()).await?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! # });
 //! # }
 //! ```
 //!
 //! We could also supply a queue that's already been constructed, to use as our
-//! job's queue. This obviates the need to await the job build method.
+//! workflow's queue. This obviates the need to await the workflow build method.
 //!
 //! ```rust,no_run
 //! # use sqlx::PgPool;
-//! use underway::{Job, Queue, To};
+//! use underway::{Queue, To, Workflow};
 //!
 //! # use tokio::runtime::Runtime;
 //! # fn main() {
@@ -438,17 +439,17 @@
 //!
 //! // We've defined a queue directly.
 //! let queue = Queue::builder()
-//!     .name("example-job")
+//!     .name("example-workflow")
 //!     .pool(pool)
 //!     .build()
 //!     .await?;
 //!
-//! let job = Job::builder()
+//! let workflow = Workflow::builder()
 //!     .step(|_cx, _| async move { To::done() })
 //!     .queue(queue)
 //!     .build();
 //!
-//! job.enqueue(&()).await?;
+//! workflow.enqueue(&()).await?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! # });
 //! # }
@@ -461,7 +462,7 @@
 //! ```rust,no_run
 //! # use sqlx::PgPool;
 //! use serde::{Deserialize, Serialize};
-//! use underway::{Job, To};
+//! use underway::{To, Workflow};
 //!
 //! # use tokio::runtime::Runtime;
 //! # fn main() {
@@ -478,31 +479,32 @@
 //!     bucket_name: String,
 //! }
 //!
-//! let job = Job::builder()
+//! let workflow = Workflow::builder()
 //!     .step(|_cx, Input { bucket_name }| async move { To::done() })
-//!     .name("example-job")
+//!     .name("example-workflow")
 //!     .pool(pool)
 //!     .build()
 //!     .await?;
 //!
-//! // Enqueue a new job with a slightly more interesting value.
-//! job.enqueue(&Input {
-//!     bucket_name: "my_bucket".to_string(),
-//! })
-//! .await?;
+//! // Enqueue a new workflow with a slightly more interesting value.
+//! workflow
+//!     .enqueue(&Input {
+//!         bucket_name: "my_bucket".to_string(),
+//!     })
+//!     .await?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! # });
 //! # }
 //! ```
 //!
 //! While we're only demonstrating a single step here for brevity, the process
-//! is the same for jobs with multiple steps.
+//! is the same for workflows with multiple steps.
 //!
 //! ## Atomic enqueue
 //!
 //! The `enqueue` method uses a connection from the queue's pool. If we prefer
 //! instead to use a transaction supplied by the surrounding code we can use
-//! [`enqueue_using`](Job::enqueue_using).
+//! [`enqueue_using`](Workflow::enqueue_using).
 //!
 //! By doing so, we can ensure that the enqueue will only happen when the
 //! transaction is committed.
@@ -510,7 +512,7 @@
 //! ```rust,no_run
 //! # use sqlx::PgPool;
 //! use serde::{Deserialize, Serialize};
-//! use underway::{Job, To};
+//! use underway::{To, Workflow};
 //!
 //! # use tokio::runtime::Runtime;
 //! # fn main() {
@@ -522,7 +524,7 @@
 //! # */
 //! #
 //!
-//! let job = Job::builder()
+//! let workflow = Workflow::builder()
 //!     .step(|_cx, _| async move { To::done() })
 //!     .name("atomic-enqueue")
 //!     .pool(pool.clone())
@@ -537,7 +539,7 @@
 //! #
 //!
 //! // Enqueue using a transaction that we supply.
-//! job.enqueue_using(&mut *tx, &()).await?;
+//! workflow.enqueue_using(&mut *tx, &()).await?;
 //!
 //! # /*
 //! /* ...And more intervening logic involving `tx`. */
@@ -547,14 +549,14 @@
 //! # }
 //! ```
 //!
-//! # Running jobs
+//! # Running workflows
 //!
-//! Jobs are run via [`Runtime`], which orchestrates workers,
+//! Workflows are run via [`Runtime`], which orchestrates workers,
 //! schedulers, and activity execution.
 //!
 //! ```rust,no_run
 //! # use sqlx::PgPool;
-//! use underway::{Job, To};
+//! use underway::{To, Workflow};
 //!
 //! # use tokio::runtime::Runtime;
 //! # fn main() {
@@ -566,15 +568,15 @@
 //! # */
 //! #
 //!
-//! let job = Job::builder()
+//! let workflow = Workflow::builder()
 //!     .step(|_cx, _: ()| async move { To::done() })
-//!     .name("example-job")
+//!     .name("example-workflow")
 //!     .pool(pool)
 //!     .build()
 //!     .await?;
 //!
 //! // This starts runtime workers in the background (non-blocking).
-//! let runtime_handle = job.runtime().start();
+//! let runtime_handle = workflow.runtime().start();
 //! runtime_handle.shutdown().await?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! # });
@@ -585,7 +587,7 @@
 //!
 //! ```rust,no_run
 //! # use sqlx::PgPool;
-//! use underway::{Job, To};
+//! use underway::{To, Workflow};
 //!
 //! # use tokio::runtime::Runtime;
 //! # fn main() {
@@ -597,25 +599,25 @@
 //! # */
 //! #
 //!
-//! let job = Job::builder()
+//! let workflow = Workflow::builder()
 //!     .step(|_cx, _: ()| async move { To::done() })
-//!     .name("example-job")
+//!     .name("example-workflow")
 //!     .pool(pool)
 //!     .build()
 //!     .await?;
 //!
 //! // This starts runtime workers and blocks.
-//! job.runtime().run().await?;
+//! workflow.runtime().run().await?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! # });
 //! # }
 //! ```
 //!
-//! Workers and schedulers can be used directly too.
+//! Workers and schedulers can be used directly via runtime helpers too.
 //!
 //! ```rust,no_run
 //! # use sqlx::PgPool;
-//! use underway::{Job, Queue, Scheduler, To, Worker};
+//! use underway::{To, Workflow};
 //!
 //! # use tokio::runtime::Runtime;
 //! # fn main() {
@@ -627,28 +629,29 @@
 //! # */
 //! #
 //!
-//! let job = Job::builder()
+//! let workflow = Workflow::builder()
 //!     .step(|_cx, _: ()| async move { To::done() })
-//!     .name("example-job")
+//!     .name("example-workflow")
 //!     .pool(pool)
 //!     .build()
 //!     .await?;
 //!
-//! let worker = job.worker();
-//! let scheduler = job.scheduler();
+//! let runtime = workflow.runtime();
+//! let worker = runtime.worker();
+//! let scheduler = runtime.scheduler();
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! # });
 //! # }
 //! ```
 //!
-//! # Scheduling jobs
+//! # Scheduling workflows
 //!
-//! Jobs may also be run on a schedule that follows the form of a cron-like
+//! Workflows may also be run on a schedule that follows the form of a cron-like
 //! expression.
 //!
 //! ```rust,no_run
 //! # use sqlx::PgPool;
-//! use underway::{Job, To};
+//! use underway::{To, Workflow};
 //!
 //! # use tokio::runtime::Runtime;
 //! # fn main() {
@@ -660,28 +663,28 @@
 //! # */
 //! #
 //!
-//! let job = Job::builder()
+//! let workflow = Workflow::builder()
 //!     .step(|_cx, _: ()| async move { To::done() })
-//!     .name("scheduled-job")
+//!     .name("scheduled-workflow")
 //!     .pool(pool)
 //!     .build()
 //!     .await?;
 //!
 //! // Sets a weekly schedule with the given input.
 //! let weekly = "@weekly[America/Los_Angeles]".parse()?;
-//! job.schedule(&weekly, &()).await?;
+//! workflow.schedule(&weekly, &()).await?;
 //!
-//! let runtime_handle = job.runtime().start();
+//! let runtime_handle = workflow.runtime().start();
 //! runtime_handle.shutdown().await?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! # });
 //! # }
 //! ```
 //!
-//! Often input to a scheduled job would consist of static configuration or
+//! Often input to a scheduled workflow would consist of static configuration or
 //! other fields that are shared for scheduled runs.
 //!
-//! Also note that jobs with schedules may still be enqueued manually when
+//! Also note that workflows with schedules may still be enqueued manually when
 //! desired.
 
 use std::{
@@ -695,7 +698,7 @@ use std::{
 
 use builder_states::{Initial, PoolSet, QueueNameSet, QueueSet, StateSet, StepSet};
 use jiff::{Span, ToSpan};
-use sealed::JobState;
+use sealed::WorkflowState;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sqlx::{PgConnection, PgExecutor, PgPool, Postgres, Transaction};
 use tracing::instrument;
@@ -706,16 +709,16 @@ use crate::{
     activity::{self, registration::Contains, CallState},
     queue::{Error as QueueError, InProgressTask, Queue},
     runtime::Runtime,
-    scheduler::{Error as SchedulerError, Scheduler, ZonedSchedule},
+    scheduler::{Error as SchedulerError, ZonedSchedule},
     task::{
         Error as TaskError, Result as TaskResult, RetryPolicy, State as TaskState, Task, TaskId,
     },
-    worker::{Error as WorkerError, Worker},
+    worker::Error as WorkerError,
 };
 
 type Result<T = ()> = std::result::Result<T, Error>;
 
-/// Job errors.
+/// Workflow errors.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// Error returned from queue operations.
@@ -741,10 +744,9 @@ pub enum Error {
     /// Error returned from database operations.
     #[error(transparent)]
     Database(#[from] sqlx::Error),
-
 }
 
-type JobQueue<T, S, A> = Queue<Job<T, S, A>>;
+type WorkflowQueue<T, S, A> = Queue<Workflow<T, S, A>>;
 
 /// Context passed in to each step.
 pub struct Context<S, Set = activity::registration::Nil> {
@@ -758,17 +760,17 @@ pub struct Context<S, Set = activity::registration::Nil> {
 
     /// Current index of the step being executed zero-based.
     ///
-    /// In multi-step job definitions, this points to the current step the job
-    /// is processing currently.
+    /// In multi-step workflow definitions, this points to the current step the
+    /// workflow is processing currently.
     pub step_index: usize,
 
     /// Total steps count.
     ///
-    /// The number of steps in this job definition.
+    /// The number of steps in this workflow definition.
     pub step_count: usize,
 
-    /// This `JobId`.
-    pub job_id: JobId,
+    /// This `WorkflowId`.
+    pub workflow_id: WorkflowId,
 
     /// Queue name.
     ///
@@ -1029,33 +1031,33 @@ impl Default for StepTaskConfig {
 mod sealed {
     use serde::{Deserialize, Serialize};
 
-    use super::JobId;
+    use super::WorkflowId;
 
     #[derive(Debug, Serialize, Deserialize, PartialEq)]
-    pub struct JobState {
+    pub struct WorkflowState {
         pub step_index: usize,
         pub step_input: serde_json::Value,
-        pub(crate) job_id: JobId,
+        pub(crate) workflow_id: WorkflowId,
     } // TODO: Versioning?
 }
 
-/// Unique identifier of a job.
+/// Unique identifier of a workflow.
 ///
 /// Wraps a UUID which is generated via a ULID.
 ///
-/// Each enqueue of a job receives its own ID. IDs are embedded in the input of
-/// tasks on the queue. This means that each task related to a job will have
-/// the same job ID.
+/// Each enqueue of a workflow receives its own ID. IDs are embedded in the
+/// input of tasks on the queue. This means that each task related to a workflow
+/// will have the same workflow ID.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
-pub struct JobId(Uuid);
+pub struct WorkflowId(Uuid);
 
-impl JobId {
+impl WorkflowId {
     fn new() -> Self {
         Self(Ulid::new().into())
     }
 }
 
-impl Deref for JobId {
+impl Deref for WorkflowId {
     type Target = Uuid;
 
     fn deref(&self) -> &Self::Target {
@@ -1063,19 +1065,19 @@ impl Deref for JobId {
     }
 }
 
-/// Represents a specific job that's been enqueued.
+/// Represents a specific workflow that's been enqueued.
 ///
-/// This handle allows for manipulating the state of the job in the queue.
-pub struct EnqueuedJob<T: Task> {
-    id: JobId,
+/// This handle allows for manipulating the state of the workflow in the queue.
+pub struct EnqueuedWorkflow<T: Task> {
+    id: WorkflowId,
     queue: Arc<Queue<T>>,
 }
 
-impl<T: Task> EnqueuedJob<T> {
-    /// Cancels the job if it's still pending.
+impl<T: Task> EnqueuedWorkflow<T> {
+    /// Cancels the workflow if it's still pending.
     ///
-    /// Because jobs may be composed of multiple steps, the full set of tasks is
-    /// searched and any pending tasks are cancelled.
+    /// Because workflows may be composed of multiple steps, the full set of
+    /// tasks is searched and any pending tasks are cancelled.
     ///
     /// Returns `true` if any tasks were successfully cancelled. Put another
     /// way, if tasks are already cancelled or not eligible for cancellation
@@ -1090,26 +1092,26 @@ impl<T: Task> EnqueuedJob<T> {
     ///
     /// ```rust,no_run
     /// # use sqlx::PgPool;
-    /// # use underway::{Job, To};
+    /// # use underway::{Workflow, To};
     /// # use tokio::runtime::Runtime;
     /// # fn main() {
     /// # let rt = Runtime::new().unwrap();
     /// # rt.block_on(async {
     /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
-    /// # let job = Job::builder()
+    /// # let workflow = Workflow::builder()
     /// #     .step(|_cx, _| async move { To::done() })
     /// #     .name("example")
     /// #     .pool(pool)
     /// #     .build()
     /// #     .await?;
     /// # /*
-    /// let job = { /* A `Job`. */ };
+    /// let workflow = { /* A `Workflow`. */ };
     /// # */
     /// #
     ///
-    /// let enqueued = job.enqueue(&()).await?;
+    /// let enqueued = workflow.enqueue(&()).await?;
     ///
-    /// // Cancel the enqueued job.
+    /// // Cancel the enqueued workflow.
     /// enqueued.cancel().await?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
@@ -1130,7 +1132,7 @@ impl<T: Task> EnqueuedJob<T> {
               concurrency_key,
               0 as "attempt_number!"
             from underway.task
-            where input->>'job_id' = $1
+            where input->>'workflow_id' = $1
               and state = $2
             for update skip locked
             "#,
@@ -1154,31 +1156,31 @@ impl<T: Task> EnqueuedJob<T> {
 
 /// Sequential set of functions, where the output of the last is the input to
 /// the next.
-pub struct Job<I, S, A = activity::registration::Nil>
+pub struct Workflow<I, S, A = activity::registration::Nil>
 where
     I: Sync + Send + 'static,
     S: Clone + Sync + Send + 'static,
     A: 'static,
 {
-    queue: Arc<JobQueue<I, S, A>>,
+    queue: Arc<WorkflowQueue<I, S, A>>,
     steps: Arc<Vec<StepConfig<S, A>>>,
     state: S,
     activity_registry: crate::activity_worker::ActivityRegistry,
     _marker: PhantomData<fn() -> (I, A)>,
 }
 
-impl<I, S> Job<I, S, activity::registration::Nil>
+impl<I, S> Workflow<I, S, activity::registration::Nil>
 where
     I: Serialize + Sync + Send + 'static,
     S: Clone + Send + Sync + 'static,
 {
-    /// Creates a new job builder.
+    /// Creates a new workflow builder.
     ///
     /// # Example
     ///
     /// ```rust,no_run
     /// # use sqlx::PgPool;
-    /// use underway::{Job, To};
+    /// use underway::{To, Workflow};
     ///
     /// # use tokio::runtime::Runtime;
     /// # fn main() {
@@ -1190,7 +1192,7 @@ where
     /// # */
     /// #
     ///
-    /// let job = Job::<(), ()>::builder()
+    /// let workflow = Workflow::<(), ()>::builder()
     ///     .step(|_cx, _| async move { To::done() })
     ///     .name("example")
     ///     .pool(pool)
@@ -1205,13 +1207,13 @@ where
     }
 }
 
-impl<I, S, A> Job<I, S, A>
+impl<I, S, A> Workflow<I, S, A>
 where
     I: Serialize + Sync + Send + 'static,
     S: Clone + Send + Sync + 'static,
     A: 'static,
 {
-    /// Enqueue the job using a connection from the queue's pool.
+    /// Enqueue the workflow using a connection from the queue's pool.
     ///
     /// # Errors
     ///
@@ -1221,35 +1223,36 @@ where
     ///
     /// ```rust,no_run
     /// # use sqlx::PgPool;
-    /// # use underway::{Job, To};
+    /// # use underway::{Workflow, To};
     /// # use tokio::runtime::Runtime;
     /// # fn main() {
     /// # let rt = Runtime::new().unwrap();
     /// # rt.block_on(async {
     /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
-    /// # let job = Job::builder()
+    /// # let workflow = Workflow::builder()
     /// #     .step(|_cx, _| async move { To::done() })
     /// #     .name("example")
     /// #     .pool(pool)
     /// #     .build()
     /// #     .await?;
     /// # /*
-    /// let job = { /* A `Job`. */ };
+    /// let workflow = { /* A `Workflow`. */ };
     /// # */
     /// #
     ///
-    /// // Enqueue a new job with the given input.
-    /// job.enqueue(&()).await?;
+    /// // Enqueue a new workflow with the given input.
+    /// workflow.enqueue(&()).await?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
     /// # }
     /// ```
-    pub async fn enqueue(&self, input: &I) -> Result<EnqueuedJob<Self>> {
+    pub async fn enqueue(&self, input: &I) -> Result<EnqueuedWorkflow<Self>> {
         let mut conn = self.queue.pool.acquire().await?;
         self.enqueue_using(&mut *conn, input).await
     }
 
-    /// Enqueue the job multiple times using a connection from the queue's pool.
+    /// Enqueue the workflow multiple times using a connection from the queue's
+    /// pool.
     ///
     /// # Errors
     ///
@@ -1259,37 +1262,37 @@ where
     ///
     /// ```rust,no_run
     /// # use sqlx::PgPool;
-    /// # use underway::{Job, To};
+    /// # use underway::{Workflow, To};
     /// # use tokio::runtime::Runtime;
     /// # fn main() {
     /// # let rt = Runtime::new().unwrap();
     /// # rt.block_on(async {
     /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
-    /// # let job = Job::builder()
+    /// # let workflow = Workflow::builder()
     /// #     .step(|_cx, _| async move { To::done() })
     /// #     .name("example")
     /// #     .pool(pool)
     /// #     .build()
     /// #     .await?;
     /// # /*
-    /// let job = { /* A `Job`. */ };
+    /// let workflow = { /* A `Workflow`. */ };
     /// # */
     /// #
     ///
-    /// // Enqueue a few jobs at once.
-    /// let enqueued = job.enqueue_many(&[(), ()]).await?;
+    /// // Enqueue a few workflows at once.
+    /// let enqueued = workflow.enqueue_many(&[(), ()]).await?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
     /// # }
     /// ```
-    pub async fn enqueue_many(&self, inputs: &[I]) -> Result<Vec<EnqueuedJob<Self>>> {
+    pub async fn enqueue_many(&self, inputs: &[I]) -> Result<Vec<EnqueuedWorkflow<Self>>> {
         let mut conn = self.queue.pool.acquire().await?;
         self.enqueue_many_using(&mut *conn, inputs).await
     }
 
-    /// Enqueue the job using the provided executor.
+    /// Enqueue the workflow using the provided executor.
     ///
-    /// This allows jobs to be enqueued using the same transaction as an
+    /// This allows workflows to be enqueued using the same transaction as an
     /// application may already be using in a given context.
     ///
     /// **Note:** If you pass a transactional executor and the transaction is
@@ -1304,7 +1307,7 @@ where
     ///
     /// ```rust,no_run
     /// # use sqlx::PgPool;
-    /// # use underway::{Job, To};
+    /// # use underway::{Workflow, To};
     /// # use tokio::runtime::Runtime;
     /// # fn main() {
     /// # let rt = Runtime::new().unwrap();
@@ -1318,38 +1321,42 @@ where
     /// // Our own transaction.
     /// let mut tx = pool.begin().await?;
     ///
-    /// # let job = Job::builder()
+    /// # let workflow = Workflow::builder()
     /// #     .step(|_cx, _| async move { To::done() })
     /// #     .name("example")
     /// #     .pool(pool.clone())
     /// #     .build()
     /// #     .await?;
     /// # /*
-    /// let job = { /* A `Job`. */ };
+    /// let workflow = { /* A `Workflow`. */ };
     /// # */
     /// #
     ///
     /// // Enqueue using the transaction we already have.
-    /// job.enqueue_using(&mut *tx, &()).await?;
+    /// workflow.enqueue_using(&mut *tx, &()).await?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
     /// # }
     /// ```
-    pub async fn enqueue_using<'a, E>(&self, executor: E, input: &I) -> Result<EnqueuedJob<Self>>
+    pub async fn enqueue_using<'a, E>(
+        &self,
+        executor: E,
+        input: &I,
+    ) -> Result<EnqueuedWorkflow<Self>>
     where
         E: PgExecutor<'a>,
     {
         self.enqueue_after_using(executor, input, Span::new()).await
     }
 
-    /// Enqueue the job multiple times using the provided executor.
+    /// Enqueue the workflow multiple times using the provided executor.
     ///
-    /// This allows jobs to be enqueued using the same transaction as an
+    /// This allows workflows to be enqueued using the same transaction as an
     /// application may already be using in a given context.
     ///
     /// **Note:** If you pass a transactional executor and the transaction is
-    /// rolled back, the returned job IDs will not correspond to any persisted
-    /// tasks.
+    /// rolled back, the returned workflow IDs will not correspond to any
+    /// persisted tasks.
     ///
     /// # Errors
     ///
@@ -1359,7 +1366,7 @@ where
     ///
     /// ```rust,no_run
     /// # use sqlx::PgPool;
-    /// # use underway::{Job, To};
+    /// # use underway::{Workflow, To};
     /// # use tokio::runtime::Runtime;
     /// # fn main() {
     /// # let rt = Runtime::new().unwrap();
@@ -1372,19 +1379,19 @@ where
     ///
     /// let mut tx = pool.begin().await?;
     ///
-    /// # let job = Job::builder()
+    /// # let workflow = Workflow::builder()
     /// #     .step(|_cx, _| async move { To::done() })
     /// #     .name("example")
     /// #     .pool(pool.clone())
     /// #     .build()
     /// #     .await?;
     /// # /*
-    /// let job = { /* A `Job`. */ };
+    /// let workflow = { /* A `Workflow`. */ };
     /// # */
     /// #
     ///
     /// // Enqueue using the transaction we already have.
-    /// let enqueued = job.enqueue_many_using(&mut *tx, &[(), ()]).await?;
+    /// let enqueued = workflow.enqueue_many_using(&mut *tx, &[(), ()]).await?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
     /// # }
@@ -1393,7 +1400,7 @@ where
         &self,
         executor: E,
         inputs: &[I],
-    ) -> Result<Vec<EnqueuedJob<Self>>>
+    ) -> Result<Vec<EnqueuedWorkflow<Self>>>
     where
         E: PgExecutor<'a> + sqlx::Acquire<'a, Database = sqlx::Postgres>,
     {
@@ -1401,17 +1408,19 @@ where
             return Ok(Vec::new());
         }
 
-        let job_inputs = inputs
+        let workflow_inputs = inputs
             .iter()
-            .map(|input| self.first_job_input(input))
+            .map(|input| self.first_workflow_input(input))
             .collect::<Result<Vec<_>>>()?;
 
-        self.queue.enqueue_many(executor, self, &job_inputs).await?;
+        self.queue
+            .enqueue_many(executor, self, &workflow_inputs)
+            .await?;
 
-        let enqueued = job_inputs
+        let enqueued = workflow_inputs
             .into_iter()
-            .map(|job_input| EnqueuedJob {
-                id: job_input.job_id,
+            .map(|workflow_input| EnqueuedWorkflow {
+                id: workflow_input.workflow_id,
                 queue: self.queue.clone(),
             })
             .collect();
@@ -1419,7 +1428,7 @@ where
         Ok(enqueued)
     }
 
-    /// Enqueue the job after the given delay using a connection from the
+    /// Enqueue the workflow after the given delay using a connection from the
     /// queue's pool
     ///
     /// The given delay is added to the task's configured delay, if one is set.
@@ -1432,7 +1441,7 @@ where
     ///
     /// ```rust,no_run
     /// # use sqlx::PgPool;
-    /// # use underway::{Job, To};
+    /// # use underway::{Workflow, To};
     /// use jiff::ToSpan;
     ///
     /// # use tokio::runtime::Runtime;
@@ -1440,33 +1449,33 @@ where
     /// # let rt = Runtime::new().unwrap();
     /// # rt.block_on(async {
     /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
-    /// # let job = Job::builder()
+    /// # let workflow = Workflow::builder()
     /// #     .step(|_cx, _| async move { To::done() })
     /// #     .name("example")
     /// #     .pool(pool)
     /// #     .build()
     /// #     .await?;
     /// # /*
-    /// let job = { /* A `Job`. */ };
+    /// let workflow = { /* A `Workflow`. */ };
     /// # */
     /// #
     ///
     /// // Enqueue after an hour.
-    /// job.enqueue_after(&(), 1.hour()).await?;
+    /// workflow.enqueue_after(&(), 1.hour()).await?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
     /// # }
     /// ```
-    pub async fn enqueue_after(&self, input: &I, delay: Span) -> Result<EnqueuedJob<Self>> {
+    pub async fn enqueue_after(&self, input: &I, delay: Span) -> Result<EnqueuedWorkflow<Self>> {
         let mut conn = self.queue.pool.acquire().await?;
         self.enqueue_after_using(&mut *conn, input, delay).await
     }
 
-    /// Enqueue the job using the provided executor after the given delay.
+    /// Enqueue the workflow using the provided executor after the given delay.
     ///
     /// The given delay is added to the task's configured delay, if one is set.
     ///
-    /// This allows jobs to be enqueued using the same transaction as an
+    /// This allows workflows to be enqueued using the same transaction as an
     /// application may already be using in a given context.
     ///
     /// **Note:** If you pass a transactional executor and the transaction is
@@ -1481,7 +1490,7 @@ where
     ///
     /// ```rust,no_run
     /// # use sqlx::PgPool;
-    /// # use underway::{Job, To};
+    /// # use underway::{Workflow, To};
     /// use jiff::ToSpan;
     ///
     /// # use tokio::runtime::Runtime;
@@ -1497,19 +1506,21 @@ where
     /// // Our own transaction.
     /// let mut tx = pool.begin().await?;
     ///
-    /// # let job = Job::builder()
+    /// # let workflow = Workflow::builder()
     /// #     .step(|_cx, _| async move { To::done() })
     /// #     .name("example")
     /// #     .pool(pool.clone())
     /// #     .build()
     /// #     .await?;
     /// # /*
-    /// let job = { /* A `Job`. */ };
+    /// let workflow = { /* A `Workflow`. */ };
     /// # */
     /// #
     ///
     /// // Enqueue after two days using the transaction we already have.
-    /// job.enqueue_after_using(&mut *tx, &(), 2.days()).await?;
+    /// workflow
+    ///     .enqueue_after_using(&mut *tx, &(), 2.days())
+    ///     .await?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
     /// # }
@@ -1519,25 +1530,25 @@ where
         executor: E,
         input: &I,
         delay: Span,
-    ) -> Result<EnqueuedJob<Self>>
+    ) -> Result<EnqueuedWorkflow<Self>>
     where
         E: PgExecutor<'a>,
     {
-        let job_input = self.first_job_input(input)?;
+        let workflow_input = self.first_workflow_input(input)?;
 
         self.queue
-            .enqueue_after(executor, self, &job_input, delay)
+            .enqueue_after(executor, self, &workflow_input, delay)
             .await?;
 
-        let enqueue = EnqueuedJob {
-            id: job_input.job_id,
+        let enqueue = EnqueuedWorkflow {
+            id: workflow_input.workflow_id,
             queue: self.queue.clone(),
         };
 
         Ok(enqueue)
     }
 
-    /// Schedule the job using a connection from the queue's pool.
+    /// Schedule the workflow using a connection from the queue's pool.
     ///
     /// # Errors
     ///
@@ -1547,25 +1558,25 @@ where
     ///
     /// ```rust,no_run
     /// # use sqlx::PgPool;
-    /// # use underway::{Job, To};
+    /// # use underway::{Workflow, To};
     /// # use tokio::runtime::Runtime;
     /// # fn main() {
     /// # let rt = Runtime::new().unwrap();
     /// # rt.block_on(async {
     /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
-    /// # let job = Job::builder()
+    /// # let workflow = Workflow::builder()
     /// #     .step(|_cx, _| async move { To::done() })
     /// #     .name("example")
     /// #     .pool(pool)
     /// #     .build()
     /// #     .await?;
     /// # /*
-    /// let job = { /* A `Job`. */ };
+    /// let workflow = { /* A `Workflow`. */ };
     /// # */
     /// #
     ///
     /// let every_minute = "0 * * * *[America/Los_Angeles]".parse()?;
-    /// job.schedule(&every_minute, &()).await?;
+    /// workflow.schedule(&every_minute, &()).await?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
     /// # }
@@ -1575,9 +1586,9 @@ where
         self.schedule_using(&mut *conn, zoned_schedule, input).await
     }
 
-    /// Schedule the job using the provided executor.
+    /// Schedule the workflow using the provided executor.
     ///
-    /// This allows jobs to be scheduled using the same transaction as an
+    /// This allows workflows to be scheduled using the same transaction as an
     /// application may already be using in a given context.
     ///
     /// # Errors
@@ -1588,7 +1599,7 @@ where
     ///
     /// ```rust,no_run
     /// # use sqlx::PgPool;
-    /// # use underway::{Job, To};
+    /// # use underway::{Workflow, To};
     /// # use tokio::runtime::Runtime;
     /// # fn main() {
     /// # let rt = Runtime::new().unwrap();
@@ -1602,20 +1613,20 @@ where
     /// // Our own transaction.
     /// let mut tx = pool.acquire().await?;
     ///
-    /// # let job = Job::builder()
+    /// # let workflow = Workflow::builder()
     /// #     .step(|_cx, _| async move { To::done() })
     /// #     .name("example")
     /// #     .pool(pool.clone())
     /// #     .build()
     /// #     .await?;
     /// # /*
-    /// let job = { /* A `Job`. */ };
+    /// let workflow = { /* A `Workflow`. */ };
     /// # */
     /// #
     ///
     /// // Schedule weekly using the transaction we already have.
     /// let weekly = "@weekly[America/Los_Angeles]".parse()?;
-    /// job.schedule_using(&mut *tx, &weekly, &()).await?;
+    /// workflow.schedule_using(&mut *tx, &weekly, &()).await?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
     /// # }
@@ -1629,15 +1640,16 @@ where
     where
         E: PgExecutor<'a>,
     {
-        let job_input = self.first_job_input(input)?;
+        let workflow_input = self.first_workflow_input(input)?;
         self.queue
-            .schedule(executor, zoned_schedule, &job_input)
+            .schedule(executor, zoned_schedule, &workflow_input)
             .await?;
 
         Ok(())
     }
 
-    /// Removes the job's schedule using a connection from the queue's pool.
+    /// Removes the workflow's schedule using a connection from the queue's
+    /// pool.
     ///
     /// # Errors
     ///
@@ -1647,25 +1659,25 @@ where
     ///
     /// ```rust,no_run
     /// # use sqlx::PgPool;
-    /// # use underway::{Job, To};
+    /// # use underway::{Workflow, To};
     /// # use tokio::runtime::Runtime;
     /// # fn main() {
     /// # let rt = Runtime::new().unwrap();
     /// # rt.block_on(async {
     /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
-    /// # let job = Job::<(), _>::builder()
+    /// # let workflow = Workflow::<(), _>::builder()
     /// #     .step(|_cx, _| async move { To::done() })
     /// #     .name("example")
     /// #     .pool(pool)
     /// #     .build()
     /// #     .await?;
     /// # /*
-    /// let job = { /* A `Job`. */ };
+    /// let workflow = { /* A `Workflow`. */ };
     /// # */
     /// #
     ///
     /// // Remove the schedule if one is set.
-    /// job.unschedule().await?;
+    /// workflow.unschedule().await?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
     /// # }
@@ -1674,9 +1686,9 @@ where
         self.unschedule_using(&mut *conn).await
     }
 
-    /// Removes the job's schedule using the provided executor.
+    /// Removes the workflow's schedule using the provided executor.
     ///
-    /// This allows jobs to be unscheduled using the same transaction as an
+    /// This allows workflows to be unscheduled using the same transaction as an
     /// application may already be using in a given context.
     ///
     /// # Errors
@@ -1687,7 +1699,7 @@ where
     ///
     /// ```rust,no_run
     /// # use sqlx::PgPool;
-    /// # use underway::{Job, To};
+    /// # use underway::{Workflow, To};
     /// # use tokio::runtime::Runtime;
     /// # fn main() {
     /// # let rt = Runtime::new().unwrap();
@@ -1700,19 +1712,19 @@ where
     ///
     /// let mut tx = pool.acquire().await?;
     ///
-    /// # let job = Job::<(), _>::builder()
+    /// # let workflow = Workflow::<(), _>::builder()
     /// #     .step(|_cx, _| async move { To::done() })
     /// #     .name("example")
     /// #     .pool(pool.clone())
     /// #     .build()
     /// #     .await?;
     /// # /*
-    /// let job = { /* A `Job`. */ };
+    /// let workflow = { /* A `Workflow`. */ };
     /// # */
     /// #
     ///
     /// // Remove the schedule using a transaction we provide.
-    /// job.unschedule_using(&mut *tx).await?;
+    /// workflow.unschedule_using(&mut *tx).await?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
     /// # }
@@ -1726,30 +1738,30 @@ where
         Ok(())
     }
 
-    /// Returns this job's `Queue`.
+    /// Returns this workflow's `Queue`.
     ///
     /// # Example
     ///
     /// ```rust,no_run
     /// # use sqlx::PgPool;
-    /// # use underway::{Job, To};
+    /// # use underway::{Workflow, To};
     /// # use tokio::runtime::Runtime;
     /// # fn main() {
     /// # let rt = Runtime::new().unwrap();
     /// # rt.block_on(async {
     /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
-    /// # let job = Job::<(), _>::builder()
+    /// # let workflow = Workflow::<(), _>::builder()
     /// #     .step(|_cx, _| async move { To::done() })
     /// #     .name("example")
     /// #     .pool(pool)
     /// #     .build()
     /// #     .await?;
     /// # /*
-    /// let job = { /* A `Job`. */ };
+    /// let workflow = { /* A `Workflow`. */ };
     /// # */
     /// #
     ///
-    /// let job_queue = job.queue();
+    /// let workflow_queue = workflow.queue();
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
     /// # }
@@ -1761,29 +1773,29 @@ where
         self.activity_registry.clone()
     }
 
-    /// Creates a [`Runtime`] for this job.
+    /// Creates a [`Runtime`] for this workflow.
     ///
     /// # Example
     ///
     /// ```rust,no_run
     /// # use sqlx::PgPool;
-    /// # use underway::{Job, To};
+    /// # use underway::{Workflow, To};
     /// # use tokio::runtime::Runtime as TokioRuntime;
     /// # fn main() {
     /// # let rt = TokioRuntime::new().unwrap();
     /// # rt.block_on(async {
     /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
-    /// # let job = Job::<(), _>::builder()
+    /// # let workflow = Workflow::<(), _>::builder()
     /// #     .step(|_cx, _| async move { To::done() })
     /// #     .name("example")
     /// #     .pool(pool)
     /// #     .build()
     /// #     .await?;
     /// # /*
-    /// let job = { /* A `Job`. */ };
+    /// let workflow = { /* A `Workflow`. */ };
     /// # */
     /// #
-    /// let runtime = job.runtime();
+    /// let runtime = workflow.runtime();
     /// runtime.run().await?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
@@ -1793,83 +1805,19 @@ where
         Runtime::new(self.clone())
     }
 
-    /// Creates a `Worker` for this job.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # use sqlx::PgPool;
-    /// # use underway::{Job, To};
-    /// # use tokio::runtime::Runtime;
-    /// # fn main() {
-    /// # let rt = Runtime::new().unwrap();
-    /// # rt.block_on(async {
-    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
-    /// # let job = Job::<(), _>::builder()
-    /// #     .step(|_cx, _| async move { To::done() })
-    /// #     .name("example")
-    /// #     .pool(pool)
-    /// #     .build()
-    /// #     .await?;
-    /// # /*
-    /// let job = { /* A `Job`. */ };
-    /// # */
-    /// #
-    ///
-    /// let job_worker = job.worker();
-    /// job_worker.run().await?; // Run the worker directly.
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// # });
-    /// # }
-    pub fn worker(&self) -> Worker<Self> {
-        Worker::new(self.queue(), self.clone())
-    }
-
-    /// Creates a `Scheduler` for this job.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # use sqlx::PgPool;
-    /// # use underway::{Job, To};
-    /// # use tokio::runtime::Runtime;
-    /// # fn main() {
-    /// # let rt = Runtime::new().unwrap();
-    /// # rt.block_on(async {
-    /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
-    /// # let job = Job::<(), _>::builder()
-    /// #     .step(|_cx, _| async move { To::done() })
-    /// #     .name("example")
-    /// #     .pool(pool)
-    /// #     .build()
-    /// #     .await?;
-    /// # /*
-    /// let job = { /* A `Job`. */ };
-    /// # */
-    /// #
-    ///
-    /// let job_scheduler = job.scheduler();
-    /// job_scheduler.run().await?; // Run the scheduler directly.
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// # });
-    /// # }
-    pub fn scheduler(&self) -> Scheduler<Self> {
-        Scheduler::new(self.queue(), self.clone())
-    }
-
-    fn first_job_input(&self, input: &I) -> Result<JobState> {
+    fn first_workflow_input(&self, input: &I) -> Result<WorkflowState> {
         let step_input = serde_json::to_value(input)?;
         let step_index = 0;
-        let job_id = JobId::new();
-        Ok(JobState {
+        let workflow_id = WorkflowId::new();
+        Ok(WorkflowState {
             step_input,
             step_index,
-            job_id,
+            workflow_id,
         })
     }
 }
 
-impl<I, S, A> Job<I, S, A>
+impl<I, S, A> Workflow<I, S, A>
 where
     I: Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
@@ -1885,7 +1833,7 @@ where
     async fn fetch_activity_calls(
         &self,
         conn: &mut PgConnection,
-        job_id: JobId,
+        workflow_id: WorkflowId,
         step_index: usize,
     ) -> TaskResult<Vec<ActivityCallRecord>> {
         sqlx::query_as!(
@@ -1900,11 +1848,11 @@ where
                 state as "state: CallState"
             from underway.activity_call
             where task_queue_name = $1
-              and job_id = $2
+              and workflow_id = $2
               and step_index = $3
             "#,
             self.queue.name,
-            *job_id,
+            *workflow_id,
             step_index as i32,
         )
         .fetch_all(&mut *conn)
@@ -1915,7 +1863,7 @@ where
     async fn persist_activity_call_commands(
         &self,
         conn: &mut PgConnection,
-        job_id: JobId,
+        workflow_id: WorkflowId,
         step_index: usize,
         activity_call_buffer: &Arc<Mutex<ActivityCallBuffer>>,
     ) -> TaskResult<()> {
@@ -1932,18 +1880,18 @@ where
                 insert into underway.activity_call (
                     id,
                     task_queue_name,
-                    job_id,
+                    workflow_id,
                     step_index,
                     call_key,
                     activity,
                     input,
                     state
                 ) values ($1, $2, $3, $4, $5, $6, $7, 'pending'::underway.activity_call_state)
-                on conflict (task_queue_name, job_id, step_index, call_key) do nothing
+                on conflict (task_queue_name, workflow_id, step_index, call_key) do nothing
                 "#,
                 Uuid::new_v4(),
                 self.queue.name,
-                *job_id,
+                *workflow_id,
                 step_index as i32,
                 command.call_key,
                 command.activity,
@@ -1958,19 +1906,19 @@ where
     }
 }
 
-impl<I, S, A> Task for Job<I, S, A>
+impl<I, S, A> Task for Workflow<I, S, A>
 where
     I: Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
     A: 'static,
 {
-    type Input = JobState;
+    type Input = WorkflowState;
     type Output = ();
 
     #[instrument(
         skip_all,
         fields(
-            job.id = %input.job_id.as_hyphenated(),
+            workflow.id = %input.workflow_id.as_hyphenated(),
             step = input.step_index + 1,
             steps = self.steps.len()
         ),
@@ -1981,10 +1929,10 @@ where
         mut tx: Transaction<'_, Postgres>,
         input: Self::Input,
     ) -> TaskResult<Self::Output> {
-        let JobState {
+        let WorkflowState {
             step_index,
             step_input,
-            job_id,
+            workflow_id,
         } = input;
 
         if step_index >= self.steps.len() {
@@ -1993,7 +1941,7 @@ where
 
         let step = &self.steps[step_index].executor;
         let activity_call_buffer = Arc::new(Mutex::new(ActivityCallBuffer::new(
-            self.fetch_activity_calls(&mut tx, job_id, step_index)
+            self.fetch_activity_calls(&mut tx, workflow_id, step_index)
                 .await?,
         )));
         let call_sequence_state = Arc::new(Mutex::new(CallSequenceState::default()));
@@ -2001,7 +1949,7 @@ where
         let cx = Context {
             state: self.state.clone(),
             step_index,
-            job_id,
+            workflow_id,
             step_count: self.steps.len(),
             queue_name: self.queue.name.clone(),
             activity_call_buffer: Arc::clone(&activity_call_buffer),
@@ -2015,8 +1963,13 @@ where
         // Persist activity call intents only when step execution reached a
         // transactional boundary (`Ok`) or intentionally suspended.
         if matches!(step_result.as_ref(), Ok(_) | Err(TaskError::Suspended(_))) {
-            self.persist_activity_call_commands(&mut tx, job_id, step_index, &activity_call_buffer)
-                .await?;
+            self.persist_activity_call_commands(
+                &mut tx,
+                workflow_id,
+                step_index,
+                &activity_call_buffer,
+            )
+            .await?;
         }
 
         // Execute the step and handle any errors.
@@ -2034,14 +1987,14 @@ where
             // Advance to the next step after executing the step.
             let next_index = step_index + 1;
 
-            let next_job_input = JobState {
+            let next_workflow_input = WorkflowState {
                 step_input: next_input,
                 step_index: next_index,
-                job_id,
+                workflow_id,
             };
 
             self.queue
-                .enqueue_after(&mut *tx, self, &next_job_input, delay)
+                .enqueue_after(&mut *tx, self, &next_workflow_input, delay)
                 .await
                 .map_err(|err| TaskError::Retryable(err.to_string()))?;
         }
@@ -2109,7 +2062,7 @@ where
     }
 }
 
-impl<I, S, A> Clone for Job<I, S, A>
+impl<I, S, A> Clone for Workflow<I, S, A>
 where
     I: Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
@@ -2261,7 +2214,7 @@ mod builder_states {
 
     use sqlx::PgPool;
 
-    use super::JobQueue;
+    use super::WorkflowQueue;
 
     pub struct Initial;
 
@@ -2281,7 +2234,7 @@ mod builder_states {
         A: 'static,
     {
         pub state: S,
-        pub queue: JobQueue<I, S, A>,
+        pub queue: WorkflowQueue<I, S, A>,
     }
 
     pub struct QueueNameSet<S> {
@@ -2298,7 +2251,7 @@ mod builder_states {
 
 type BuilderMarker<I, O, S, A> = fn() -> (I, O, S, A);
 
-/// Builder for constructing a `Job` with a sequence of steps.
+/// Builder for constructing a `Workflow` with a sequence of steps.
 pub struct Builder<I, O, S, B, A = activity::registration::Nil>
 where
     A: 'static,
@@ -2339,10 +2292,10 @@ impl<I, S, ASet> Builder<I, I, S, Initial, ASet> {
     /// # Example
     ///
     /// ```rust
-    /// use underway::Job;
+    /// use underway::Workflow;
     ///
-    /// // Instantiate a new builder from the `Job` method.
-    /// let job_builder = Job::<(), ()>::builder();
+    /// // Instantiate a new builder from the `Workflow` method.
+    /// let workflow_builder = Workflow::<(), ()>::builder();
     /// ```
     pub fn new() -> Builder<I, I, S, Initial, activity::registration::Nil> {
         Builder::<I, I, S, _, activity::registration::Nil> {
@@ -2367,7 +2320,7 @@ impl<I, S, ASet> Builder<I, I, S, Initial, ASet> {
     /// # Example
     ///
     /// ```rust
-    /// use underway::Job;
+    /// use underway::Workflow;
     ///
     /// #[derive(Clone)]
     /// struct State {
@@ -2375,7 +2328,7 @@ impl<I, S, ASet> Builder<I, I, S, Initial, ASet> {
     /// }
     ///
     /// // Set state.
-    /// let job_builder = Job::<(), _>::builder().state(State {
+    /// let workflow_builder = Workflow::<(), _>::builder().state(State {
     ///     data: "foo".to_string(),
     /// });
     /// ```
@@ -2388,9 +2341,9 @@ impl<I, S, ASet> Builder<I, I, S, Initial, ASet> {
         }
     }
 
-    /// Add a step to the job.
+    /// Add a step to the workflow.
     ///
-    /// A step function should take the job context as its first argument
+    /// A step function should take the workflow context as its first argument
     /// followed by some type that's `Serialize` and `Deserialize` as its
     /// second argument.
     ///
@@ -2402,10 +2355,10 @@ impl<I, S, ASet> Builder<I, I, S, Initial, ASet> {
     /// # Example
     ///
     /// ```rust
-    /// use underway::{Job, To};
+    /// use underway::{To, Workflow};
     ///
     /// // Set a step.
-    /// let job_builder = Job::<(), ()>::builder().step(|_cx, _| async move { To::done() });
+    /// let workflow_builder = Workflow::<(), ()>::builder().step(|_cx, _| async move { To::done() });
     /// ```
     pub fn step<F, O, Fut>(mut self, func: F) -> Builder<I, O, S, StepSet<O, ()>, ASet>
     where
@@ -2455,9 +2408,9 @@ impl<I, S, ASet> Builder<I, I, S, StateSet<S>, ASet> {
         }
     }
 
-    /// Add a step to the job.
+    /// Add a step to the workflow.
     ///
-    /// A step function should take the job context as its first argument
+    /// A step function should take the workflow context as its first argument
     /// followed by some type that's `Serialize` and `Deserialize` as its
     /// second argument.
     ///
@@ -2469,7 +2422,7 @@ impl<I, S, ASet> Builder<I, I, S, StateSet<S>, ASet> {
     /// # Example
     ///
     /// ```rust
-    /// use underway::{Job, To};
+    /// use underway::{To, Workflow};
     ///
     /// #[derive(Clone)]
     /// struct State {
@@ -2477,7 +2430,7 @@ impl<I, S, ASet> Builder<I, I, S, StateSet<S>, ASet> {
     /// }
     ///
     /// // Set a step with state.
-    /// let job_builder = Job::<(), _>::builder()
+    /// let workflow_builder = Workflow::<(), _>::builder()
     ///     .state(State {
     ///         data: "foo".to_string(),
     ///     })
@@ -2514,7 +2467,7 @@ impl<I, S, ASet> Builder<I, I, S, StateSet<S>, ASet> {
 
 // After first step set.
 impl<I, Current, S, ASet> Builder<I, Current, S, StepSet<Current, S>, ASet> {
-    /// Add a subsequent step to the job.
+    /// Add a subsequent step to the workflow.
     ///
     /// This method ensures that the input type of the new step matches the
     /// output type of the previous step.
@@ -2523,7 +2476,7 @@ impl<I, Current, S, ASet> Builder<I, Current, S, StepSet<Current, S>, ASet> {
     ///
     /// ```rust
     /// use serde::{Deserialize, Serialize};
-    /// use underway::{Job, To};
+    /// use underway::{To, Workflow};
     ///
     /// #[derive(Deserialize, Serialize)]
     /// struct Step2 {
@@ -2531,7 +2484,7 @@ impl<I, Current, S, ASet> Builder<I, Current, S, StepSet<Current, S>, ASet> {
     /// }
     ///
     /// // Set one step after another.
-    /// let job_builder = Job::<(), ()>::builder()
+    /// let workflow_builder = Workflow::<(), ()>::builder()
     ///     .step(|_cx, _| async move { To::next(Step2 { n: 42 }) })
     ///     .step(|_cx, Step2 { n }| async move { To::done() });
     /// ```
@@ -2569,11 +2522,11 @@ impl<I, Current, S, ASet> Builder<I, Current, S, StepSet<Current, S>, ASet> {
     /// # Example
     ///
     /// ```rust
-    /// use underway::{task::RetryPolicy, Job, To};
+    /// use underway::{task::RetryPolicy, To, Workflow};
     ///
     /// // Set a retry policy for the step.
     /// let retry_policy = RetryPolicy::builder().max_attempts(15).build();
-    /// let job_builder = Job::<(), ()>::builder()
+    /// let workflow_builder = Workflow::<(), ()>::builder()
     ///     .step(|_cx, _| async move { To::done() })
     ///     .retry_policy(retry_policy);
     /// ```
@@ -2601,9 +2554,9 @@ impl<I, Current, S, ASet> Builder<I, Current, S, StepSet<Current, S>, ASet> {
     ///
     /// ```rust
     /// use jiff::ToSpan;
-    /// use underway::{Job, To};
+    /// use underway::{To, Workflow};
     ///
-    /// let job_builder = Job::<(), ()>::builder()
+    /// let workflow_builder = Workflow::<(), ()>::builder()
     ///     .step(|_cx, _| async move { To::done() })
     ///     .timeout(1.minute());
     /// ```
@@ -2628,9 +2581,9 @@ impl<I, Current, S, ASet> Builder<I, Current, S, StepSet<Current, S>, ASet> {
     ///
     /// ```rust
     /// use jiff::ToSpan;
-    /// use underway::{Job, To};
+    /// use underway::{To, Workflow};
     ///
-    /// let job_builder = Job::<(), ()>::builder()
+    /// let workflow_builder = Workflow::<(), ()>::builder()
     ///     .step(|_cx, _| async move { To::done() })
     ///     .ttl(7.days());
     /// ```
@@ -2657,9 +2610,9 @@ impl<I, Current, S, ASet> Builder<I, Current, S, StepSet<Current, S>, ASet> {
     ///
     /// ```rust
     /// use jiff::ToSpan;
-    /// use underway::{Job, To};
+    /// use underway::{To, Workflow};
     ///
-    /// let job_builder = Job::<(), ()>::builder()
+    /// let workflow_builder = Workflow::<(), ()>::builder()
     ///     .step(|_cx, _| async move { To::done() })
     ///     .delay(30.seconds());
     /// ```
@@ -2684,9 +2637,9 @@ impl<I, Current, S, ASet> Builder<I, Current, S, StepSet<Current, S>, ASet> {
     ///
     /// ```rust
     /// use jiff::ToSpan;
-    /// use underway::{Job, To};
+    /// use underway::{To, Workflow};
     ///
-    /// let job_builder = Job::<(), ()>::builder()
+    /// let workflow_builder = Workflow::<(), ()>::builder()
     ///     .step(|_cx, _| async move { To::done() })
     ///     .heartbeat(5.seconds());
     /// ```
@@ -2713,9 +2666,9 @@ impl<I, Current, S, ASet> Builder<I, Current, S, StepSet<Current, S>, ASet> {
     /// # Example
     ///
     /// ```rust
-    /// use underway::{Job, To};
+    /// use underway::{To, Workflow};
     ///
-    /// let job_builder = Job::<(), ()>::builder()
+    /// let workflow_builder = Workflow::<(), ()>::builder()
     ///     .step(|_cx, _| async move { To::done() })
     ///     .concurrency_key("customer:42");
     /// ```
@@ -2742,9 +2695,9 @@ impl<I, Current, S, ASet> Builder<I, Current, S, StepSet<Current, S>, ASet> {
     /// # Example
     ///
     /// ```rust
-    /// use underway::{Job, To};
+    /// use underway::{To, Workflow};
     ///
-    /// let job_builder = Job::<(), ()>::builder()
+    /// let workflow_builder = Workflow::<(), ()>::builder()
     ///     .step(|_cx, _| async move { To::done() })
     ///     .priority(10);
     /// ```
@@ -2770,10 +2723,10 @@ where
     I: Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
 {
-    /// Set the name of the job's queue.
+    /// Set the name of the workflow's queue.
     ///
     /// This provides the name of the underlying queue that will be created for
-    /// this job.
+    /// this workflow.
     ///
     /// **Note:** It's important that this name be unique amongst all tasks. If
     /// it's not and other tasks define differing input types this will
@@ -2783,10 +2736,10 @@ where
     /// # Example
     ///
     /// ```rust
-    /// use underway::{Job, To};
+    /// use underway::{To, Workflow};
     ///
     /// // Set a name.
-    /// let job_builder = Job::<(), ()>::builder()
+    /// let workflow_builder = Workflow::<(), ()>::builder()
     ///     .step(|_cx, _| async move { To::done() })
     ///     .name("example");
     /// ```
@@ -2808,10 +2761,10 @@ where
     I: Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
 {
-    /// Set the pool of the job's queue.
+    /// Set the pool of the workflow's queue.
     ///
     /// This provides the connection pool to the database that the underlying
-    /// queue will use for this job.
+    /// queue will use for this workflow.
     ///
     /// # Example
     ///
@@ -2819,7 +2772,7 @@ where
     /// use std::env;
     ///
     /// use sqlx::PgPool;
-    /// use underway::{Job, To};
+    /// use underway::{To, Workflow};
     /// # use tokio::runtime::Runtime;
     /// # fn main() {
     /// # let rt = Runtime::new().unwrap();
@@ -2828,7 +2781,7 @@ where
     /// let pool = PgPool::connect(&env::var("DATABASE_URL").unwrap()).await?;
     ///
     /// // Set a pool.
-    /// let job_builder = Job::<(), ()>::builder()
+    /// let workflow_builder = Workflow::<(), ()>::builder()
     ///     .step(|_cx, _| async move { To::done() })
     ///     .name("example")
     ///     .pool(pool);
@@ -2856,7 +2809,7 @@ where
     I: Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
 {
-    /// Finalize the builder into a `Job`.
+    /// Finalize the builder into a `Workflow`.
     ///
     /// # Example
     ///
@@ -2864,7 +2817,7 @@ where
     /// use std::env;
     ///
     /// use sqlx::PgPool;
-    /// use underway::{Job, To};
+    /// use underway::{To, Workflow};
     ///
     /// # use tokio::runtime::Runtime;
     /// # fn main() {
@@ -2872,8 +2825,8 @@ where
     /// # rt.block_on(async {
     /// let pool = PgPool::connect(&env::var("DATABASE_URL").unwrap()).await?;
     ///
-    /// // Build the job.
-    /// let job = Job::<(), ()>::builder()
+    /// // Build the workflow.
+    /// let workflow = Workflow::<(), ()>::builder()
     ///     .step(|_cx, _| async move { To::done() })
     ///     .name("example")
     ///     .pool(pool)
@@ -2883,14 +2836,14 @@ where
     /// # });
     /// # }
     /// ```
-    pub async fn build(self) -> Result<Job<I, S, ASet>> {
+    pub async fn build(self) -> Result<Workflow<I, S, ASet>> {
         let PoolSet {
             state,
             queue_name,
             pool,
         } = self.builder_state;
         let queue = Queue::builder().name(queue_name).pool(pool).build().await?;
-        Ok(Job {
+        Ok(Workflow {
             queue: Arc::new(queue),
             steps: Arc::new(self.steps),
             state,
@@ -2909,13 +2862,13 @@ where
     /// Set the queue.
     ///
     /// This allows providing a `Queue` directly, for situations where the queue
-    /// has been defined separately from the job.
+    /// has been defined separately from the workflow.
     ///
     /// # Example
     ///
     /// ```rust,no_run
     /// # use sqlx::PgPool;
-    /// use underway::{Job, Queue, To};
+    /// use underway::{Queue, To, Workflow};
     ///
     /// # use tokio::runtime::Runtime;
     /// # fn main() {
@@ -2929,7 +2882,7 @@ where
     /// let queue = Queue::builder().name("example").pool(pool).build().await?;
     ///
     /// // Set a queue.
-    /// let job = Job::<(), ()>::builder()
+    /// let workflow = Workflow::<(), ()>::builder()
     ///     .step(|_cx, _| async move { To::done() })
     ///     .queue(queue);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -2938,7 +2891,7 @@ where
     /// ```
     pub fn queue(
         self,
-        queue: JobQueue<I, S, ASet>,
+        queue: WorkflowQueue<I, S, ASet>,
     ) -> Builder<I, (), S, QueueSet<I, S, ASet>, ASet> {
         Builder {
             builder_state: QueueSet {
@@ -2957,13 +2910,13 @@ where
     I: Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
 {
-    /// Finalize the builder into a `Job`.
+    /// Finalize the builder into a `Workflow`.
     ///
     /// # Example
     ///
     /// ```rust,no_run
     /// # use sqlx::PgPool;
-    /// use underway::{Job, To, Queue};
+    /// use underway::{Workflow, To, Queue};
     ///
     /// # use tokio::runtime::Runtime;
     /// # fn main() {
@@ -2976,17 +2929,17 @@ where
     /// #
     /// let queue = Queue::builder().name("example").pool(pool).build().await?;
     ///
-    /// // Build the job.
-    /// let job = Job::<(), ()>::builder()
+    /// // Build the workflow.
+    /// let workflow = Workflow::<(), ()>::builder()
     ///     .step(|_cx, _| async move { To::done() })
     ///     .queue(queue)
     ///     .build();
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
     /// # }
-    pub fn build(self) -> Job<I, S, ASet> {
+    pub fn build(self) -> Workflow<I, S, ASet> {
         let QueueSet { state, queue } = self.builder_state;
-        Job {
+        Workflow {
             queue: Arc::new(queue),
             steps: Arc::new(self.steps),
             state,
@@ -3057,29 +3010,29 @@ mod tests {
             .build()
             .await?;
 
-        let job = Job::builder()
+        let workflow = Workflow::builder()
             .step(|_cx, Input { message }| async move {
-                println!("Executing job with message: {message}");
+                println!("Executing workflow with message: {message}");
                 To::done()
             })
             .queue(queue.clone())
             .build();
 
-        assert_eq!(job.retry_policy(), RetryPolicy::default());
+        assert_eq!(workflow.retry_policy(), RetryPolicy::default());
 
         let input = Input {
             message: "Hello, world!".to_string(),
         };
-        job.enqueue(&input).await?;
+        workflow.enqueue(&input).await?;
 
         let pending_task = queue
             .dequeue()
             .await?
             .expect("There should be an enqueued task");
 
-        let job_state: JobState = serde_json::from_value(pending_task.input)?;
-        assert_eq!(job_state.step_index, 0);
-        assert_eq!(job_state.step_input, serde_json::to_value(&input)?);
+        let workflow_state: WorkflowState = serde_json::from_value(pending_task.input)?;
+        assert_eq!(workflow_state.step_index, 0);
+        assert_eq!(workflow_state.step_input, serde_json::to_value(&input)?);
 
         Ok(())
     }
@@ -3092,7 +3045,7 @@ mod tests {
         }
 
         async fn step(_cx: Context<()>, Input { message }: Input) -> TaskResult<To<()>> {
-            println!("Executing job with message: {message}");
+            println!("Executing workflow with message: {message}");
             To::done()
         }
 
@@ -3102,23 +3055,23 @@ mod tests {
             .build()
             .await?;
 
-        let job = Job::builder().step(step).queue(queue.clone()).build();
+        let workflow = Workflow::builder().step(step).queue(queue.clone()).build();
 
-        assert_eq!(job.retry_policy(), RetryPolicy::default());
+        assert_eq!(workflow.retry_policy(), RetryPolicy::default());
 
         let input = Input {
             message: "Hello, world!".to_string(),
         };
-        job.enqueue(&input).await?;
+        workflow.enqueue(&input).await?;
 
         let pending_task = queue
             .dequeue()
             .await?
             .expect("There should be an enqueued task");
 
-        let job_state: JobState = serde_json::from_value(pending_task.input)?;
-        assert_eq!(job_state.step_index, 0);
-        assert_eq!(job_state.step_input, serde_json::to_value(&input)?);
+        let workflow_state: WorkflowState = serde_json::from_value(pending_task.input)?;
+        assert_eq!(workflow_state.step_index, 0);
+        assert_eq!(workflow_state.step_input, serde_json::to_value(&input)?);
 
         Ok(())
     }
@@ -3141,13 +3094,13 @@ mod tests {
             .build()
             .await?;
 
-        let job = Job::builder()
+        let workflow = Workflow::builder()
             .state(State {
                 data: "data".to_string(),
             })
             .step(|cx, Input { message }| async move {
                 println!(
-                    "Executing job with message: {message} and state: {state}",
+                    "Executing workflow with message: {message} and state: {state}",
                     state = cx.state.data
                 );
                 To::done()
@@ -3155,21 +3108,21 @@ mod tests {
             .queue(queue.clone())
             .build();
 
-        assert_eq!(job.retry_policy(), RetryPolicy::default());
+        assert_eq!(workflow.retry_policy(), RetryPolicy::default());
 
         let input = Input {
             message: "Hello, world!".to_string(),
         };
-        job.enqueue(&input).await?;
+        workflow.enqueue(&input).await?;
 
         let pending_task = queue
             .dequeue()
             .await?
             .expect("There should be an enqueued task");
 
-        let job_state: JobState = serde_json::from_value(pending_task.input)?;
-        assert_eq!(job_state.step_index, 0);
-        assert_eq!(job_state.step_input, serde_json::to_value(&input)?);
+        let workflow_state: WorkflowState = serde_json::from_value(pending_task.input)?;
+        assert_eq!(workflow_state.step_index, 0);
+        assert_eq!(workflow_state.step_input, serde_json::to_value(&input)?);
 
         Ok(())
     }
@@ -3185,7 +3138,7 @@ mod tests {
             data: Arc::new(Mutex::new("foo".to_string())),
         };
 
-        let job = Job::builder()
+        let workflow = Workflow::builder()
             .state(state.clone())
             .step(|cx, _| async move {
                 let mut data = cx.state.data.lock().expect("Mutex should not be poisoned");
@@ -3197,11 +3150,11 @@ mod tests {
             .build()
             .await?;
 
-        job.enqueue(&()).await?;
+        workflow.enqueue(&()).await?;
 
-        let runtime_handle = job.runtime().start();
+        let runtime_handle = workflow.runtime().start();
 
-        // Give the job a moment to process.
+        // Give the workflow a moment to process.
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
         assert_eq!(
@@ -3234,7 +3187,7 @@ mod tests {
 
         async fn step(cx: Context<State>, Input { message }: Input) -> TaskResult<To<()>> {
             println!(
-                "Executing job with message: {message} and state: {data}",
+                "Executing workflow with message: {message} and state: {data}",
                 data = cx.state.data
             );
             To::done()
@@ -3250,27 +3203,27 @@ mod tests {
             .build()
             .await?;
 
-        let job = Job::builder()
+        let workflow = Workflow::builder()
             .state(state)
             .step(step)
             .queue(queue.clone())
             .build();
 
-        assert_eq!(job.retry_policy(), RetryPolicy::default());
+        assert_eq!(workflow.retry_policy(), RetryPolicy::default());
 
         let input = Input {
             message: "Hello, world!".to_string(),
         };
-        job.enqueue(&input).await?;
+        workflow.enqueue(&input).await?;
 
         let pending_task = queue
             .dequeue()
             .await?
             .expect("There should be an enqueued task");
 
-        let job_state: JobState = serde_json::from_value(pending_task.input)?;
-        assert_eq!(job_state.step_index, 0);
-        assert_eq!(job_state.step_input, serde_json::to_value(&input)?);
+        let workflow_state: WorkflowState = serde_json::from_value(pending_task.input)?;
+        assert_eq!(workflow_state.step_index, 0);
+        assert_eq!(workflow_state.step_input, serde_json::to_value(&input)?);
 
         Ok(())
     }
@@ -3288,9 +3241,9 @@ mod tests {
             .build()
             .await?;
 
-        let job = Job::builder()
+        let workflow = Workflow::builder()
             .step(|_cx, Input { message }| async move {
-                println!("Executing job with message: {message}");
+                println!("Executing workflow with message: {message}");
                 To::done()
             })
             .queue(queue.clone())
@@ -3299,16 +3252,16 @@ mod tests {
         let input = Input {
             message: "Hello, world!".to_string(),
         };
-        job.enqueue(&input).await?;
+        workflow.enqueue(&input).await?;
 
         let pending_task = queue
             .dequeue()
             .await?
             .expect("There should be an enqueued task");
 
-        let job_state: JobState = serde_json::from_value(pending_task.input)?;
-        assert_eq!(job_state.step_index, 0);
-        assert_eq!(job_state.step_input, serde_json::to_value(&input)?);
+        let workflow_state: WorkflowState = serde_json::from_value(pending_task.input)?;
+        assert_eq!(workflow_state.step_index, 0);
+        assert_eq!(workflow_state.step_input, serde_json::to_value(&input)?);
 
         Ok(())
     }
@@ -3326,7 +3279,7 @@ mod tests {
             .build()
             .await?;
 
-        let job = Job::builder()
+        let workflow = Workflow::builder()
             .step(|_cx, Input { message }| async move {
                 println!("Processing {message}");
                 To::done()
@@ -3343,14 +3296,14 @@ mod tests {
             },
         ];
 
-        let enqueued = job.enqueue_many(&inputs).await?;
+        let enqueued = workflow.enqueue_many(&inputs).await?;
         assert_eq!(enqueued.len(), 2);
 
-        let mut job_ids: Vec<String> = enqueued
+        let mut workflow_ids: Vec<String> = enqueued
             .iter()
             .map(|handle| handle.id.to_string())
             .collect();
-        job_ids.sort();
+        workflow_ids.sort();
 
         let pending_tasks = sqlx::query!(
             r#"
@@ -3365,16 +3318,16 @@ mod tests {
         .fetch_all(&pool)
         .await?;
 
-        let mut pending_job_ids = Vec::new();
+        let mut pending_workflow_ids = Vec::new();
         for task in pending_tasks {
-            let job_state: JobState = serde_json::from_value(task.input)?;
-            assert_eq!(job_state.step_index, 0);
-            pending_job_ids.push(job_state.job_id.to_string());
+            let workflow_state: WorkflowState = serde_json::from_value(task.input)?;
+            assert_eq!(workflow_state.step_index, 0);
+            pending_workflow_ids.push(workflow_state.workflow_id.to_string());
         }
 
-        pending_job_ids.sort();
+        pending_workflow_ids.sort();
 
-        assert_eq!(pending_job_ids, job_ids);
+        assert_eq!(pending_workflow_ids, workflow_ids);
 
         Ok(())
     }
@@ -3394,7 +3347,7 @@ mod tests {
             .backoff_coefficient(1.25)
             .build();
 
-        let job = Job::builder()
+        let workflow = Workflow::builder()
             .step(|_cx, _| async move { To::done() })
             .retry_policy(retry_policy)
             .timeout(2.minutes())
@@ -3406,7 +3359,7 @@ mod tests {
             .queue(queue.clone())
             .build();
 
-        job.enqueue(&()).await?;
+        workflow.enqueue(&()).await?;
 
         let timeout: PgInterval = sqlx::query_scalar(
             r#"
@@ -3520,7 +3473,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn step_config_is_per_job_run(pool: PgPool) -> sqlx::Result<(), Error> {
+    async fn step_config_is_per_workflow_run(pool: PgPool) -> sqlx::Result<(), Error> {
         #[derive(Serialize, Deserialize)]
         struct Step1 {
             message: String,
@@ -3532,14 +3485,14 @@ mod tests {
         }
 
         let queue = Queue::builder()
-            .name("step_config_is_per_job_run")
+            .name("step_config_is_per_workflow_run")
             .pool(pool.clone())
             .build()
             .await?;
 
         let step2_policy = RetryPolicy::builder().max_attempts(9).build();
 
-        let job = Job::builder()
+        let workflow = Workflow::builder()
             .step(|_cx, Step1 { message }| async move { To::next(Step2 { message }) })
             .step(|_cx, Step2 { message }| async move {
                 println!("Processed {message}");
@@ -3550,16 +3503,18 @@ mod tests {
             .queue(queue.clone())
             .build();
 
-        job.enqueue(&Step1 {
-            message: "first".to_string(),
-        })
-        .await?;
-        job.worker().process_next_task().await?;
+        workflow
+            .enqueue(&Step1 {
+                message: "first".to_string(),
+            })
+            .await?;
+        workflow.runtime().worker().process_next_task().await?;
 
-        job.enqueue(&Step1 {
-            message: "second".to_string(),
-        })
-        .await?;
+        workflow
+            .enqueue(&Step1 {
+                message: "second".to_string(),
+            })
+            .await?;
 
         let pending_tasks = sqlx::query!(
             r#"
@@ -3581,8 +3536,8 @@ mod tests {
         let mut step1 = None;
 
         for task in pending_tasks {
-            let job_state: JobState = serde_json::from_value(task.input.clone())?;
-            match job_state.step_index {
+            let workflow_state: WorkflowState = serde_json::from_value(task.input.clone())?;
+            match workflow_state.step_index {
                 0 => step0 = Some(task),
                 1 => step1 = Some(task),
                 _ => {}
@@ -3608,7 +3563,7 @@ mod tests {
             .build()
             .await?;
 
-        let job = Job::builder()
+        let workflow = Workflow::builder()
             .step(|_, _| async { To::done() })
             .queue(queue.clone())
             .build();
@@ -3616,7 +3571,7 @@ mod tests {
         let monthly = "@monthly[America/Los_Angeles]"
             .parse()
             .expect("A valid zoned scheduled should be provided");
-        job.schedule(&monthly, &()).await?;
+        workflow.schedule(&monthly, &()).await?;
 
         let (schedule, _) = queue
             .task_schedule(&pool)
@@ -3635,7 +3590,7 @@ mod tests {
 
     #[sqlx::test]
     async fn one_step_context_attributes(pool: PgPool) -> sqlx::Result<(), Error> {
-        let job = Job::builder()
+        let workflow = Workflow::builder()
             .step(|ctx, _| async move {
                 assert_eq!(ctx.step_index, 0);
                 assert_eq!(ctx.step_count, 1);
@@ -3647,10 +3602,10 @@ mod tests {
             .build()
             .await?;
 
-        job.enqueue(&()).await?;
+        workflow.enqueue(&()).await?;
 
         // Process the first task.
-        let task_id = job.worker().process_next_task().await?;
+        let task_id = workflow.runtime().worker().process_next_task().await?;
 
         assert!(task_id.is_some());
 
@@ -3664,7 +3619,7 @@ mod tests {
             message: String,
         }
 
-        let job = Job::builder()
+        let workflow = Workflow::builder()
             .activity(EchoActivity)
             .step(|cx, Input { message }| async move {
                 let _: String = cx.call::<EchoActivity, _>("echo-main", &message).await?;
@@ -3675,22 +3630,22 @@ mod tests {
             .build()
             .await?;
 
-        let enqueued = job
+        let enqueued = workflow
             .enqueue(&Input {
                 message: "hello".to_string(),
             })
             .await?;
 
-        job.worker().process_next_task().await?;
+        workflow.runtime().worker().process_next_task().await?;
 
         let task_state = sqlx::query_scalar!(
             r#"
             select state as "state: TaskState"
             from underway.task
             where task_queue_name = $1
-              and (input->>'job_id')::uuid = $2
+              and (input->>'workflow_id')::uuid = $2
             "#,
-            job.queue.name,
+            workflow.queue.name,
             *enqueued.id,
         )
         .fetch_one(&pool)
@@ -3703,11 +3658,11 @@ mod tests {
             select state as "state: CallState"
             from underway.activity_call
             where task_queue_name = $1
-              and job_id = $2
+              and workflow_id = $2
               and step_index = $3
               and call_key = $4
             "#,
-            job.queue.name,
+            workflow.queue.name,
             *enqueued.id,
             0_i32,
             "echo-main",
@@ -3727,7 +3682,7 @@ mod tests {
             message: String,
         }
 
-        let job = Job::builder()
+        let workflow = Workflow::builder()
             .activity(EmailActivity)
             .step(|cx, Input { message }| async move {
                 cx.emit::<EmailActivity, _>("notify", &message).await?;
@@ -3738,22 +3693,22 @@ mod tests {
             .build()
             .await?;
 
-        let enqueued = job
+        let enqueued = workflow
             .enqueue(&Input {
                 message: "hello".to_string(),
             })
             .await?;
 
-        job.worker().process_next_task().await?;
+        workflow.runtime().worker().process_next_task().await?;
 
         let activity_call_count = sqlx::query_scalar!(
             r#"
             select count(*)::int as "count!"
             from underway.activity_call
             where task_queue_name = $1
-              and job_id = $2
+              and workflow_id = $2
             "#,
-            job.queue.name,
+            workflow.queue.name,
             *enqueued.id,
         )
         .fetch_one(&pool)
@@ -3771,7 +3726,7 @@ mod tests {
             message: String,
         }
 
-        let job = Job::builder()
+        let workflow = Workflow::builder()
             .activity(EmailActivity)
             .step(|cx, Input { message }| async move {
                 cx.emit::<EmailActivity, _>("notify", &message).await?;
@@ -3782,22 +3737,22 @@ mod tests {
             .build()
             .await?;
 
-        let enqueued = job
+        let enqueued = workflow
             .enqueue(&Input {
                 message: "hello".to_string(),
             })
             .await?;
 
-        job.worker().process_next_task().await?;
+        workflow.runtime().worker().process_next_task().await?;
 
         let activity_call_count = sqlx::query_scalar!(
             r#"
             select count(*)::int as "count!"
             from underway.activity_call
             where task_queue_name = $1
-              and job_id = $2
+              and workflow_id = $2
             "#,
-            job.queue.name,
+            workflow.queue.name,
             *enqueued.id,
         )
         .fetch_one(&pool)
@@ -3815,7 +3770,7 @@ mod tests {
             message: String,
         }
 
-        let job = Job::builder()
+        let workflow = Workflow::builder()
             .activity(EchoActivity)
             .step(|cx, Input { message }| async move {
                 let call_one = cx.call::<EchoActivity, _>("call-1", &message);
@@ -3838,22 +3793,22 @@ mod tests {
             .build()
             .await?;
 
-        let enqueued = job
+        let enqueued = workflow
             .enqueue(&Input {
                 message: "hello".to_string(),
             })
             .await?;
 
-        job.worker().process_next_task().await?;
+        workflow.runtime().worker().process_next_task().await?;
 
         let task_state = sqlx::query_scalar!(
             r#"
             select state as "state: TaskState"
             from underway.task
             where task_queue_name = $1
-              and (input->>'job_id')::uuid = $2
+              and (input->>'workflow_id')::uuid = $2
             "#,
-            job.queue.name,
+            workflow.queue.name,
             *enqueued.id,
         )
         .fetch_one(&pool)
@@ -3866,9 +3821,9 @@ mod tests {
             select count(*)::int as "count!"
             from underway.activity_call
             where task_queue_name = $1
-              and job_id = $2
+              and workflow_id = $2
             "#,
-            job.queue.name,
+            workflow.queue.name,
             *enqueued.id,
         )
         .fetch_one(&pool)
@@ -3897,29 +3852,29 @@ mod tests {
             .build()
             .await?;
 
-        let job = Job::builder()
+        let workflow = Workflow::builder()
             .step(|_cx, Step1 { message }| async move {
-                println!("Executing job with message: {message}");
+                println!("Executing workflow with message: {message}");
                 To::next(Step2 {
                     data: message.as_bytes().into(),
                 })
             })
             .step(|_cx, Step2 { data }| async move {
-                println!("Executing job with data: {data:?}");
+                println!("Executing workflow with data: {data:?}");
                 To::done()
             })
             .queue(queue.clone())
             .build();
 
-        assert_eq!(job.retry_policy(), RetryPolicy::default());
+        assert_eq!(workflow.retry_policy(), RetryPolicy::default());
 
         let input = Step1 {
             message: "Hello, world!".to_string(),
         };
-        job.enqueue(&input).await?;
+        workflow.enqueue(&input).await?;
 
         // Process the first task.
-        job.worker().process_next_task().await?;
+        workflow.runtime().worker().process_next_task().await?;
 
         // Inspect the second task.
         let pending_task = queue
@@ -3927,10 +3882,10 @@ mod tests {
             .await?
             .expect("There should be an enqueued task");
 
-        let job_state: JobState = serde_json::from_value(pending_task.input)?;
-        assert_eq!(job_state.step_index, 1);
+        let workflow_state: WorkflowState = serde_json::from_value(pending_task.input)?;
+        assert_eq!(workflow_state.step_index, 1);
         assert_eq!(
-            job_state.step_input,
+            workflow_state.step_input,
             serde_json::to_value(&Step2 {
                 data: "Hello, world!".as_bytes().to_vec()
             })?
@@ -3961,28 +3916,28 @@ mod tests {
             .build()
             .await?;
 
-        let job = Job::builder()
+        let workflow = Workflow::builder()
             .step(|_cx, Step1 { message }| async move {
-                println!("Executing job with message: {message}");
+                println!("Executing workflow with message: {message}");
                 To::next(Step2 {
                     data: message.as_bytes().into(),
                 })
             })
             .retry_policy(step1_policy)
             .step(|_cx, Step2 { data }| async move {
-                println!("Executing job with data: {data:?}");
+                println!("Executing workflow with data: {data:?}");
                 To::done()
             })
             .retry_policy(step2_policy)
             .queue(queue.clone())
             .build();
 
-        assert_eq!(job.retry_policy(), step1_policy);
+        assert_eq!(workflow.retry_policy(), step1_policy);
 
         let input = Step1 {
             message: "Hello, world!".to_string(),
         };
-        let enqueued_job = job.enqueue(&input).await?;
+        let enqueued_workflow = workflow.enqueue(&input).await?;
 
         // Dequeue the first task.
         let Some(dequeued_task) = queue.dequeue().await? else {
@@ -3990,13 +3945,13 @@ mod tests {
         };
 
         assert_eq!(
-            enqueued_job.id,
+            enqueued_workflow.id,
             dequeued_task
                 .input
-                .get("job_id")
+                .get("workflow_id")
                 .cloned()
                 .map(serde_json::from_value)
-                .expect("Failed to deserialize 'job_id'")?
+                .expect("Failed to deserialize 'workflow_id'")?
         );
         assert_eq!(dequeued_task.retry_policy.max_attempts, 1);
 
@@ -4012,7 +3967,7 @@ mod tests {
         .await?;
 
         // Process the task to ensure the next task is enqueued.
-        job.worker().process_next_task().await?;
+        workflow.runtime().worker().process_next_task().await?;
 
         // Dequeue the second task.
         let Some(dequeued_task) = queue.dequeue().await? else {
@@ -4047,13 +4002,13 @@ mod tests {
             .build()
             .await?;
 
-        let job = Job::builder()
+        let workflow = Workflow::builder()
             .state(State {
                 data: "data".to_string(),
             })
             .step(|cx, Step1 { message }| async move {
                 println!(
-                    "Executing job with message: {message} and state: {state}",
+                    "Executing workflow with message: {message} and state: {state}",
                     state = cx.state.data
                 );
                 To::next(Step2 {
@@ -4062,7 +4017,7 @@ mod tests {
             })
             .step(|cx, Step2 { data }| async move {
                 println!(
-                    "Executing job with data: {data:?} and state: {state}",
+                    "Executing workflow with data: {data:?} and state: {state}",
                     state = cx.state.data
                 );
                 To::done()
@@ -4070,15 +4025,15 @@ mod tests {
             .queue(queue.clone())
             .build();
 
-        assert_eq!(job.retry_policy(), RetryPolicy::default());
+        assert_eq!(workflow.retry_policy(), RetryPolicy::default());
 
         let input = Step1 {
             message: "Hello, world!".to_string(),
         };
-        job.enqueue(&input).await?;
+        workflow.enqueue(&input).await?;
 
         // Process the first task.
-        job.worker().process_next_task().await?;
+        workflow.runtime().worker().process_next_task().await?;
 
         // Inspect the second task.
         let pending_task = queue
@@ -4086,10 +4041,10 @@ mod tests {
             .await?
             .expect("There should be an enqueued task");
 
-        let job_state: JobState = serde_json::from_value(pending_task.input)?;
-        assert_eq!(job_state.step_index, 1);
+        let workflow_state: WorkflowState = serde_json::from_value(pending_task.input)?;
+        assert_eq!(workflow_state.step_index, 1);
         assert_eq!(
-            job_state.step_input,
+            workflow_state.step_input,
             serde_json::to_value(&Step2 {
                 data: "Hello, world!".as_bytes().to_vec()
             })?
@@ -4116,15 +4071,15 @@ mod tests {
             .build()
             .await?;
 
-        let job = Job::builder()
+        let workflow = Workflow::builder()
             .step(|_cx, Step1 { message }| async move {
-                println!("Executing job with message: {message}",);
+                println!("Executing workflow with message: {message}",);
                 To::next(Step2 {
                     data: message.as_bytes().into(),
                 })
             })
             .step(|_cx, Step2 { data }| async move {
-                println!("Executing job with data: {data:?}");
+                println!("Executing workflow with data: {data:?}");
                 To::done()
             })
             .queue(queue.clone())
@@ -4133,7 +4088,7 @@ mod tests {
         let input = Step1 {
             message: "Hello, world!".to_string(),
         };
-        let enqueued_job = job.enqueue(&input).await?;
+        let enqueued_workflow = workflow.enqueue(&input).await?;
 
         // Dequeue the first task.
         let Some(dequeued_task) = queue.dequeue().await? else {
@@ -4141,23 +4096,23 @@ mod tests {
         };
 
         assert_eq!(
-            enqueued_job.id,
+            enqueued_workflow.id,
             dequeued_task
                 .input
-                .get("job_id")
+                .get("workflow_id")
                 .cloned()
                 .map(serde_json::from_value)
-                .expect("Failed to deserialize 'job_id'")?
+                .expect("Failed to deserialize 'workflow_id'")?
         );
 
-        let job_state: JobState = serde_json::from_value(dequeued_task.input).unwrap();
+        let workflow_state: WorkflowState = serde_json::from_value(dequeued_task.input).unwrap();
         assert_eq!(
-            JobState {
+            WorkflowState {
                 step_index: 0,
                 step_input: serde_json::to_value(input).unwrap(),
-                job_id: job_state.job_id
+                workflow_id: workflow_state.workflow_id
             },
-            job_state
+            workflow_state
         );
 
         // TODO: This really should be a method on `Queue`.
@@ -4172,7 +4127,7 @@ mod tests {
         .await?;
 
         // Process the task to ensure the next task is enqueued.
-        job.worker().process_next_task().await?;
+        workflow.runtime().worker().process_next_task().await?;
 
         // Dequeue the second task.
         let Some(dequeued_task) = queue.dequeue().await? else {
@@ -4182,14 +4137,14 @@ mod tests {
         let step2_input = Step2 {
             data: "Hello, world!".to_string().as_bytes().into(),
         };
-        let job_state: JobState = serde_json::from_value(dequeued_task.input).unwrap();
+        let workflow_state: WorkflowState = serde_json::from_value(dequeued_task.input).unwrap();
         assert_eq!(
-            JobState {
+            WorkflowState {
                 step_index: 1,
                 step_input: serde_json::to_value(step2_input).unwrap(),
-                job_id: job_state.job_id
+                workflow_id: workflow_state.workflow_id
             },
-            job_state
+            workflow_state
         );
 
         Ok(())
@@ -4208,15 +4163,15 @@ mod tests {
             .build()
             .await?;
 
-        let job = Job::builder()
+        let workflow = Workflow::builder()
             .step(|_cx, Input { message }| async move {
-                println!("Executing job with message: {message}");
+                println!("Executing workflow with message: {message}");
                 To::done()
             })
             .queue(queue.clone())
             .build();
 
-        assert_eq!(job.retry_policy(), RetryPolicy::default());
+        assert_eq!(workflow.retry_policy(), RetryPolicy::default());
 
         let daily = "@daily[America/Los_Angeles]"
             .parse()
@@ -4224,7 +4179,7 @@ mod tests {
         let input = Input {
             message: "Hello, world!".to_string(),
         };
-        job.schedule(&daily, &input).await?;
+        workflow.schedule(&daily, &input).await?;
 
         let (zoned_schedule, schedule_input) = queue
             .task_schedule(&pool)
@@ -4251,15 +4206,15 @@ mod tests {
             .build()
             .await?;
 
-        let job = Job::builder()
+        let workflow = Workflow::builder()
             .step(|_cx, Input { message }| async move {
-                println!("Executing job with message: {message}");
+                println!("Executing workflow with message: {message}");
                 To::done()
             })
             .queue(queue.clone())
             .build();
 
-        assert_eq!(job.retry_policy(), RetryPolicy::default());
+        assert_eq!(workflow.retry_policy(), RetryPolicy::default());
 
         let daily = "@daily[America/Los_Angeles]"
             .parse()
@@ -4267,8 +4222,8 @@ mod tests {
         let input = Input {
             message: "Hello, world!".to_string(),
         };
-        job.schedule(&daily, &input).await?;
-        job.unschedule().await?;
+        workflow.schedule(&daily, &input).await?;
+        workflow.unschedule().await?;
 
         assert!(queue.task_schedule(&pool).await?.is_none());
 
@@ -4288,55 +4243,55 @@ mod tests {
             .build()
             .await?;
 
-        let job = Job::builder()
+        let workflow = Workflow::builder()
             .step(|_cx, Input { message }| async move {
-                println!("Executing job with message: {message}");
+                println!("Executing workflow with message: {message}");
                 To::done()
             })
             .queue(queue.clone())
             .build();
 
-        assert_eq!(job.retry_policy(), RetryPolicy::default());
+        assert_eq!(workflow.retry_policy(), RetryPolicy::default());
 
-        assert!(job.unschedule().await.is_ok());
+        assert!(workflow.unschedule().await.is_ok());
         assert!(queue.task_schedule(&pool).await?.is_none());
 
         Ok(())
     }
 
     #[sqlx::test]
-    async fn enqueued_job_cancel(pool: PgPool) -> sqlx::Result<(), Error> {
+    async fn enqueued_workflow_cancel(pool: PgPool) -> sqlx::Result<(), Error> {
         let queue = Queue::builder()
-            .name("enqueued_job_cancel")
+            .name("enqueued_workflow_cancel")
             .pool(pool.clone())
             .build()
             .await?;
 
-        let job = Job::builder()
+        let workflow = Workflow::builder()
             .step(|_cx, _| async move { To::done() })
             .queue(queue.clone())
             .build();
 
-        let enqueued_job = job.enqueue(&()).await?;
+        let enqueued_workflow = workflow.enqueue(&()).await?;
 
         // Should return `true`.
-        assert!(enqueued_job.cancel().await?);
+        assert!(enqueued_workflow.cancel().await?);
 
         let task = sqlx::query!(
             r#"
             select state as "state: TaskState"
             from underway.task
-            where input->>'job_id' = $1
+            where input->>'workflow_id' = $1
             "#,
-            enqueued_job.id.to_string()
+            enqueued_workflow.id.to_string()
         )
         .fetch_one(&pool)
         .await?;
 
         assert_eq!(task.state, TaskState::Cancelled);
 
-        // Should return `false` since the job is already cancelled.
-        assert!(!enqueued_job.cancel().await?);
+        // Should return `false` since the workflow is already cancelled.
+        assert!(!enqueued_workflow.cancel().await?);
 
         Ok(())
     }

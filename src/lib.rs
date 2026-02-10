@@ -4,9 +4,9 @@
 //!
 //! # Overview
 //!
-//! **Underway** provides durable background jobs over Postgres. Jobs are
-//! composed of a sequence of one or more steps. Each step takes the output of
-//! the previous step as its input. These simple workflows provide a powerful
+//! **Underway** provides durable background workflows over Postgres. Workflows
+//! are composed of a sequence of one or more steps. Each step takes the output
+//! of the previous step as its input. These simple workflows provide a powerful
 //! interface to common deferred work use cases.
 //!
 //! Key Features:
@@ -20,15 +20,15 @@
 //! - **Automatic Retries**: Configurable retry strategies ensure tasks are
 //!   reliably completed, even after transient failures.
 //! - **Cron-Like Scheduling**: Schedule recurring tasks with cron-like
-//!   expressions for automated, time-based job execution.
+//!   expressions for automated, time-based workflow execution.
 //! - **Scalable and Flexible**: Easily scales from a single worker to many,
-//!   enabling seamless background job processing with minimal setup.
+//!   enabling seamless background workflow processing with minimal setup.
 //!
 //! ## Workflow Activities
 //!
 //! In addition to plain step chaining, workflows can invoke durable activities
-//! through [`job::Context::call`](crate::job::Context::call) and
-//! [`job::Context::emit`](crate::job::Context::emit).
+//! through [`workflow::Context::call`](crate::workflow::Context::call) and
+//! [`workflow::Context::emit`](crate::workflow::Context::emit).
 //!
 //! - `call` is request/response and may suspend a step until the activity
 //!   completes.
@@ -40,7 +40,7 @@
 //! ```rust,no_run
 //! use serde::{Deserialize, Serialize};
 //! use sqlx::PgPool;
-//! use underway::{Activity, ActivityError, Job, Runtime, To};
+//! use underway::{Activity, ActivityError, Runtime, To, Workflow};
 //!
 //! #[derive(Deserialize, Serialize)]
 //! struct Input {
@@ -72,7 +72,7 @@
 //! # let rt = TokioRuntime::new().unwrap();
 //! # rt.block_on(async {
 //! # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
-//! let workflow = Job::builder()
+//! let workflow = Workflow::builder()
 //!     .activity(ResolveEmail)
 //!     .step(|cx, Input { user_id }| async move {
 //!         let _email: String = cx.call::<ResolveEmail, _>("resolve", &user_id).await?;
@@ -92,8 +92,8 @@
 //! # Examples
 //!
 //! Underway is suitable for many different use cases, ranging from simple
-//! single-step jobs to more sophisticated multi-step jobs, where dependencies
-//! are built up between steps.
+//! single-step workflows to more sophisticated multi-step workflows, where
+//! dependencies are built up between steps.
 //!
 //! ## Welcome emails
 //!
@@ -101,18 +101,18 @@
 //! instance, during user registration, we might want to send a welcome email to
 //! new users. Rather than handling this within the registration process (e.g.,
 //! form validation, database insertion), we can offload it to run "out-of-band"
-//! using Underway. By defining a job for sending the welcome email, Underway
-//! ensures it gets processed in the background, without slowing down the user
-//! registration flow.
+//! using Underway. By defining a workflow for sending the welcome email,
+//! Underway ensures it gets processed in the background, without slowing down
+//! the user registration flow.
 //!
 //! ```rust,no_run
 //! use std::env;
 //!
 //! use serde::{Deserialize, Serialize};
 //! use sqlx::PgPool;
-//! use underway::{Job, To};
+//! use underway::{To, Workflow};
 //!
-//! // This is the input we'll provide to the job when we enqueue it.
+//! // This is the input we'll provide to the workflow when we enqueue it.
 //! #[derive(Deserialize, Serialize)]
 //! struct WelcomeEmail {
 //!     user_id: i32,
@@ -129,8 +129,8 @@
 //!     // Run migrations.
 //!     underway::run_migrations(&pool).await?;
 //!
-//!     // Build the job.
-//!     let job = Job::builder()
+//!     // Build the workflow.
+//!     let workflow = Workflow::builder()
 //!         .step(
 //!             |_cx,
 //!              WelcomeEmail {
@@ -149,16 +149,17 @@
 //!         .build()
 //!         .await?;
 //!
-//!     // Here we enqueue a new job to be processed later.
-//!     job.enqueue(&WelcomeEmail {
-//!         user_id: 42,
-//!         email: "ferris@example.com".to_string(),
-//!         name: "Ferris".to_string(),
-//!     })
-//!     .await?;
+//!     // Here we enqueue a new workflow to be processed later.
+//!     workflow
+//!         .enqueue(&WelcomeEmail {
+//!             user_id: 42,
+//!             email: "ferris@example.com".to_string(),
+//!             name: "Ferris".to_string(),
+//!         })
+//!         .await?;
 //!
-//!     // Start processing enqueued jobs.
-//!     let runtime_handle = job.runtime().start();
+//!     // Start processing enqueued workflows.
+//!     let runtime_handle = workflow.runtime().start();
 //!     runtime_handle.shutdown().await?;
 //!
 //!     Ok(())
@@ -168,9 +169,9 @@
 //! ## Order receipts
 //!
 //! Another common use case is defining dependencies between discrete steps of a
-//! job. For instance, we might generate PDF receipts for orders and then email
-//! these to customers. With Underway, each step is handled separately, making
-//! it easy to create a job that first generates the PDF and, once
+//! workflow. For instance, we might generate PDF receipts for orders and then
+//! email these to customers. With Underway, each step is handled separately,
+//! making it easy to create a workflow that first generates the PDF and, once
 //! completed, proceeds to send the email.
 //!
 //! This separation provides significant value: if the email sending service
@@ -182,7 +183,7 @@
 //!
 //! use serde::{Deserialize, Serialize};
 //! use sqlx::PgPool;
-//! use underway::{Job, To};
+//! use underway::{To, Workflow};
 //!
 //! #[derive(Deserialize, Serialize)]
 //! struct GenerateReceipt {
@@ -205,8 +206,8 @@
 //!     // Run migrations.
 //!     underway::run_migrations(&pool).await?;
 //!
-//!     // Build the job.
-//!     let job = Job::builder()
+//!     // Build the workflow.
+//!     let workflow = Workflow::builder()
 //!         .step(|_cx, GenerateReceipt { order_id }| async move {
 //!             // Use the order ID to build a receipt PDF...
 //!             let receipt_key = format!("receipts_bucket/{order_id}-receipt.pdf");
@@ -225,11 +226,11 @@
 //!         .build()
 //!         .await?;
 //!
-//!     // Enqueue the job for the given order.
-//!     job.enqueue(&GenerateReceipt { order_id: 42 }).await?;
+//!     // Enqueue the workflow for the given order.
+//!     workflow.enqueue(&GenerateReceipt { order_id: 42 }).await?;
 //!
-//!     // Start processing enqueued jobs.
-//!     let runtime_handle = job.runtime().start();
+//!     // Start processing enqueued workflows.
+//!     let runtime_handle = workflow.runtime().start();
 //!     runtime_handle.shutdown().await?;
 //!
 //!     Ok(())
@@ -242,16 +243,16 @@
 //!
 //! ## Daily reports
 //!
-//! Jobs may also be run on a schedule. This makes them useful for situations
-//! where we want to do things on a regular cadence, such as creating a daily
-//! business report.
+//! Workflows may also be run on a schedule. This makes them useful for
+//! situations where we want to do things on a regular cadence, such as creating
+//! a daily business report.
 //!
 //! ```rust,no_run
 //! use std::env;
 //!
 //! use serde::{Deserialize, Serialize};
 //! use sqlx::PgPool;
-//! use underway::{Job, To};
+//! use underway::{To, Workflow};
 //!
 //! #[derive(Deserialize, Serialize)]
 //! struct DailyReport;
@@ -265,8 +266,8 @@
 //!     // Run migrations.
 //!     underway::run_migrations(&pool).await?;
 //!
-//!     // Build the job.
-//!     let job = Job::builder()
+//!     // Build the workflow.
+//!     let workflow = Workflow::builder()
 //!         .step(|_cx, _| async move {
 //!             // Here we would generate and store the report.
 //!             To::done()
@@ -278,10 +279,10 @@
 //!
 //!     // Set a daily schedule with the given input.
 //!     let daily = "@daily[America/Los_Angeles]".parse()?;
-//!     job.schedule(&daily, &DailyReport).await?;
+//!     workflow.schedule(&daily, &DailyReport).await?;
 //!
-//!     // Start processing enqueued jobs.
-//!     let runtime_handle = job.runtime().start();
+//!     // Start processing enqueued workflows.
+//!     let runtime_handle = workflow.runtime().start();
 //!     runtime_handle.shutdown().await?;
 //!
 //!     Ok(())
@@ -291,11 +292,11 @@
 //! # Concepts
 //!
 //! Underway has been designed around several core concepts, which build on one
-//! another to deliver a robust background-job framework:
+//! another to deliver a robust background-workflow framework:
 //!
 //! - [Tasks](#tasks) represent a well-structured unit of work.
-//! - [Jobs](#jobs) are a series of sequential steps, where each step is a
-//!   [`Task`].
+//! - [Workflows](#workflows) are a series of sequential steps, where each step
+//!   is a [`Task`].
 //! - [Queues](#queues) provide an interface for managing task lifecycle.
 //! - [Workers](#workers) interface with queues to execute tasks.
 //!
@@ -309,15 +310,15 @@
 //!
 //! See [`task`] for more details about tasks.
 //!
-//! ## Jobs
+//! ## Workflows
 //!
-//! Jobs are a series of sequential steps. Each step provides input to the next
-//! step in the series.
+//! Workflows are a series of sequential steps. Each step provides input to the
+//! next step in the series.
 //!
-//! In most cases, applications will use jobs to define tasks instead of using
-//! the `Task` trait directly.
+//! In most cases, applications will use workflows to define tasks instead of
+//! using the `Task` trait directly.
 //!
-//! See [`job`] for more details about jobs.
+//! See [`workflow`] for more details about workflows.
 //!
 //! ## Queues
 //!
@@ -336,7 +337,7 @@
 //! ## Strata
 //!
 //! The Underway system is split into a **lower-level** and a **higher-level**
-//! system, where the latter is the **job** abstraction and the former is
+//! system, where the latter is the **workflow** abstraction and the former is
 //! everything else. More specifically the lower-level components are the
 //! **queue**, **worker**, **scheduler**, and **task**. The locus of the
 //! composite system is the task, with all components being built with or around
@@ -344,7 +345,7 @@
 //!
 //! ```text
 //!                        ╭───────────────╮
-//!                        │      Job      │
+//!                        │      Workflow      │
 //!                        │  (impl Task)  │
 //!                        ╰───────────────╯
 //!                                │
@@ -368,9 +369,10 @@
 //! and schedulers interface with the queue to process tasks or enqueue tasks
 //! for execution, respectively.
 //!
-//! At the uppermost layer, jobs are built on top of this subsystem, and are an
-//! implementation of the `Task` trait. Put another way, the lower-level system
-//! is unawre of the concept of a "job" and treats it like any other task.
+//! At the uppermost layer, workflows are built on top of this subsystem, and
+//! are an implementation of the `Task` trait. Put another way, the lower-level
+//! system is unawre of the concept of a "workflow" and treats it like any other
+//! task.
 //!
 //! [SoC]: https://en.wikipedia.org/wiki/Separation_of_concerns
 #![warn(clippy::all, nonstandard_style, future_incompatible, missing_docs)]
@@ -380,22 +382,22 @@ use sqlx::{migrate::Migrator, Acquire, Postgres};
 
 pub use crate::{
     activity::{Activity, CallState as ActivityCallState, Error as ActivityError},
-    job::{Job, To},
     queue::Queue,
     runtime::Runtime,
     scheduler::{Scheduler, ZonedSchedule},
     task::{Task, ToTaskResult},
     worker::Worker,
+    workflow::{To, Workflow},
 };
 
 pub mod activity;
 mod activity_worker;
-pub mod job;
 pub mod queue;
 pub mod runtime;
 mod scheduler;
 pub mod task;
 pub mod worker;
+pub mod workflow;
 
 static MIGRATOR: Migrator = sqlx::migrate!();
 

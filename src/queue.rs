@@ -62,14 +62,14 @@
 //! # Processing tasks
 //!
 //! Note that while queues provide methods for enqueuing and dequeuing tasks,
-//! you will generaly not use these methods directly and instead use jobs and
-//! their workers, respectively.
+//! you will generaly not use these methods directly and instead use workflows
+//! and their workers, respectively.
 //!
-//! For example, `Job` provides an [`enqueue`](crate::Job::enqueue) method,
-//! which wraps its queue's enqueue method. Likewise, when a job runtime starts
-//! workers via [`Runtime::run`](crate::Runtime::run), those workers use the
-//! queue's dequeue method and in both cases there's no need to use the queue
-//! methods directly.
+//! For example, `Workflow` provides an [`enqueue`](crate::Workflow::enqueue)
+//! method, which wraps its queue's enqueue method. Likewise, when a workflow
+//! runtime starts workers via [`Runtime::run`](crate::Runtime::run), those
+//! workers use the queue's dequeue method and in both cases there's no need to
+//! use the queue methods directly.
 //!
 //! With that said, a queue may be interfaced with directly and operated
 //! manually if desired:
@@ -135,9 +135,9 @@
 //! It's important to note that a schedule **must** be set on the queue before
 //! the scheduler can be run.
 //!
-//! As with task processing, jobs provide an interface for scheduling. For
-//! example, the [`schedule`](crate::Job::schedule) method schedules the job.
-//! Once scheduled, a scheduler must be run to ensure exeuction.
+//! As with task processing, workflows provide an interface for scheduling. For
+//! example, the [`schedule`](crate::Workflow::schedule) method schedules the
+//! workflow. Once scheduled, a scheduler must be run to ensure exeuction.
 //!
 //! Of course it's also possible to interface directly with the queue to achieve
 //! the same if desired. Schedules can be set with the

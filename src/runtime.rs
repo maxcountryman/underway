@@ -1,9 +1,9 @@
 //! Runtime orchestration for workflows.
 //!
 //! [`Runtime`] is the high-level entrypoint for workflow execution.
-//! It wraps a [`Job`] and coordinates:
-//! - the job worker,
-//! - the job scheduler,
+//! It wraps a [`Workflow`] and coordinates:
+//! - the workflow worker,
+//! - the workflow scheduler,
 //! - and the activity worker used by workflow calls/emit.
 //!
 //! # Why runtime?
@@ -17,7 +17,7 @@
 //! ```rust,no_run
 //! use serde::{Deserialize, Serialize};
 //! use sqlx::PgPool;
-//! use underway::{Activity, ActivityError, Job, Runtime, To};
+//! use underway::{Activity, ActivityError, Runtime, To, Workflow};
 //!
 //! #[derive(Deserialize, Serialize)]
 //! struct FetchUser {
@@ -47,7 +47,7 @@
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
-//!     let workflow = Job::builder()
+//!     let workflow = Workflow::builder()
 //!         .activity(LookupEmail)
 //!         .step(|cx, FetchUser { user_id }| async move {
 //!             let email: String = cx.call::<LookupEmail, _>("lookup", &user_id).await?;
@@ -71,9 +71,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     activity_worker::{ActivityWorker, Error as ActivityWorkerError},
-    job::Job,
-    scheduler::Error as SchedulerError,
-    worker::Error as WorkerError,
+    scheduler::{Error as SchedulerError, Scheduler},
+    worker::{Error as WorkerError, Worker},
+    workflow::Workflow,
 };
 
 /// A type alias for runtime execution results.
@@ -126,15 +126,28 @@ impl RuntimeHandle {
 }
 
 /// High-level workflow runtime.
-#[derive(Clone)]
 pub struct Runtime<I, S, A = crate::activity::registration::Nil>
 where
     I: Serialize + Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
     A: 'static,
 {
-    workflow: Job<I, S, A>,
+    workflow: Workflow<I, S, A>,
     activity_worker: ActivityWorker,
+}
+
+impl<I, S, A> Clone for Runtime<I, S, A>
+where
+    I: Serialize + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
+    A: 'static,
+{
+    fn clone(&self) -> Self {
+        Self {
+            workflow: self.workflow.clone(),
+            activity_worker: self.activity_worker.clone(),
+        }
+    }
 }
 
 impl<I, S, A> Runtime<I, S, A>
@@ -146,7 +159,7 @@ where
     /// Creates a runtime from a workflow.
     ///
     /// Registered activity handlers are sourced from the workflow's builder.
-    pub fn new(workflow: Job<I, S, A>) -> Self {
+    pub fn new(workflow: Workflow<I, S, A>) -> Self {
         let activity_worker = ActivityWorker::with_registry(
             workflow.queue().pool.clone(),
             workflow.activity_registry(),
@@ -158,8 +171,24 @@ where
     }
 
     /// Returns a reference to the workflow managed by this runtime.
-    pub fn workflow(&self) -> &Job<I, S, A> {
+    pub fn workflow(&self) -> &Workflow<I, S, A> {
         &self.workflow
+    }
+
+    /// Creates a `Worker` for this runtime's workflow.
+    ///
+    /// This is useful when running worker loops manually instead of calling
+    /// [`Runtime::run`] or [`Runtime::start`].
+    pub fn worker(&self) -> Worker<Workflow<I, S, A>> {
+        Worker::new(self.workflow.queue(), self.workflow.clone())
+    }
+
+    /// Creates a `Scheduler` for this runtime's workflow.
+    ///
+    /// This is useful when running scheduler loops manually instead of calling
+    /// [`Runtime::run`] or [`Runtime::start`].
+    pub fn scheduler(&self) -> Scheduler<Workflow<I, S, A>> {
+        Scheduler::new(self.workflow.queue(), self.workflow.clone())
     }
 
     /// Runs this runtime to completion.
@@ -170,10 +199,10 @@ where
     pub async fn run(&self) -> Result {
         let shutdown_token = CancellationToken::new();
 
-        let mut worker = self.workflow.worker();
+        let mut worker = self.worker();
         worker.set_shutdown_token(shutdown_token.clone());
 
-        let mut scheduler = self.workflow.scheduler();
+        let mut scheduler = self.scheduler();
         scheduler.set_shutdown_token(shutdown_token.clone());
 
         let mut activity_worker = self.activity_worker.clone();
@@ -210,10 +239,10 @@ where
     pub fn start(&self) -> RuntimeHandle {
         let shutdown_token = CancellationToken::new();
 
-        let mut worker = self.workflow.worker();
+        let mut worker = self.worker();
         worker.set_shutdown_token(shutdown_token.clone());
 
-        let mut scheduler = self.workflow.scheduler();
+        let mut scheduler = self.scheduler();
         scheduler.set_shutdown_token(shutdown_token.clone());
 
         let mut activity_worker = self.activity_worker.clone();
@@ -234,13 +263,13 @@ where
     }
 }
 
-impl<I, S, A> From<Job<I, S, A>> for Runtime<I, S, A>
+impl<I, S, A> From<Workflow<I, S, A>> for Runtime<I, S, A>
 where
     I: Serialize + Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
     A: 'static,
 {
-    fn from(workflow: Job<I, S, A>) -> Self {
+    fn from(workflow: Workflow<I, S, A>) -> Self {
         Self::new(workflow)
     }
 }
@@ -259,7 +288,7 @@ mod tests {
     use super::Runtime;
     use crate::{
         activity::{Activity, CallState, Result as ActivityResult},
-        Job, To,
+        To, Workflow,
     };
 
     struct EchoActivity;
@@ -292,7 +321,7 @@ mod tests {
         let outputs = Arc::new(Mutex::new(Vec::new()));
         let outputs_step = outputs.clone();
 
-        let workflow = Job::builder()
+        let workflow = Workflow::builder()
             .activity(EchoActivity)
             .step(|cx, Step1 { message }| async move {
                 let echoed: String = cx.call::<EchoActivity, _>("echo-main", &message).await?;

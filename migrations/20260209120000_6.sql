@@ -20,7 +20,7 @@ $$;
 create table if not exists underway.activity_call (
     id              uuid not null primary key,
     task_queue_name text not null,
-    job_id          uuid not null,
+    workflow_id          uuid not null,
     step_index      integer not null,
     call_key        text not null,
     activity        text not null,
@@ -34,7 +34,7 @@ create table if not exists underway.activity_call (
     updated_at      timestamp with time zone not null default now(),
     started_at      timestamp with time zone,
     completed_at    timestamp with time zone,
-    unique (task_queue_name, job_id, step_index, call_key)
+    unique (task_queue_name, workflow_id, step_index, call_key)
 );
 
 create index if not exists idx_activity_call_pending
@@ -42,7 +42,7 @@ on underway.activity_call (state, available_at, created_at)
 where state = 'pending';
 
 create index if not exists idx_activity_call_workflow
-on underway.activity_call (task_queue_name, job_id, step_index, state);
+on underway.activity_call (task_queue_name, workflow_id, step_index, state);
 
 create or replace function underway.activity_call_change_notify()
 returns trigger as $$
@@ -52,7 +52,7 @@ begin
             'activity_call_change',
             json_build_object(
                 'task_queue_name', new.task_queue_name,
-                'job_id', new.job_id,
+                'workflow_id', new.workflow_id,
                 'step_index', new.step_index,
                 'call_key', new.call_key
             )::text

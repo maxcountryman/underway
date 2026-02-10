@@ -1,12 +1,12 @@
 # Repository Guidelines
 
 ## Project Overview
-- Underway is a Rust 2021 library for durable background jobs on Postgres.
-- Core concepts: tasks, queues, workers, schedulers, and jobs (jobs wrap tasks).
+- Underway is a Rust 2021 library for durable background workflows on Postgres.
+- Core concepts: tasks, queues, workers, schedulers, and workflows (workflows wrap tasks).
 - Public APIs are documented and linted; clippy warnings are treated as errors.
 
 ## Project Structure
-- src/ contains library modules: job, queue, worker, scheduler, task.
+- src/ contains library modules: workflow, queue, worker, scheduler, task.
 - examples/ contains standalone crates with their own Cargo.toml files.
 - migrations/ holds SQL migrations executed by `underway::run_migrations`.
 - .sqlx/ stores SQLX query metadata for offline builds.
@@ -38,14 +38,14 @@ Use these to filter by name or module path.
 ```bash
 cargo test --lib task::tests::retry_policy_defaults
 cargo test --lib task_execution_failure -- --nocapture
-cargo test --doc Job
+cargo test --doc Workflow
 ```
 
 ### Example crates
-- `examples/basic` basic job usage.
-- `examples/scheduled` scheduled jobs.
+- `examples/basic` basic workflow usage.
+- `examples/scheduled` scheduled workflows.
 - `examples/step` step-by-step usage.
-- `examples/multitask` multi-task jobs.
+- `examples/multitask` multi-task workflows.
 - `examples/graceful_shutdown` shutdown flow.
 - `examples/tracing` tracing instrumentation.
 - `examples/rag` sample integration (see its README).
@@ -81,15 +81,15 @@ cargo test --lib
 - Use snake_case for functions/vars/modules and CamelCase for types/traits.
 - Use SCREAMING_SNAKE_CASE for consts and static values.
 - Keep public re-exports in `src/lib.rs` and document them.
-- Favor builder patterns (Job::builder, Queue::builder) and typestate modules.
+- Favor builder patterns (Workflow::builder, Queue::builder) and typestate modules.
 - Keep internal helpers `pub(crate)` unless needed in the public API.
 
 ### Types and Trait Bounds
 - Use Result aliases: `type Result<T = ()> = std::result::Result<T, Error>`.
 - Task inputs must be `Serialize + DeserializeOwned + Send + 'static`.
 - Task outputs must be `Serialize + Send + 'static`.
-- Job state requires `Clone + Send + Sync + 'static`.
-- Use newtypes (TaskId/JobId) around Uuid and implement Display/Deref.
+- Workflow state requires `Clone + Send + Sync + 'static`.
+- Use newtypes (TaskId/WorkflowId) around Uuid and implement Display/Deref.
 - Use `Arc` for shared queues/tasks and clone it instead of borrowing.
 
 ### Error Handling

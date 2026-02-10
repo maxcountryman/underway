@@ -19,9 +19,9 @@
 //!
 //! # Running workers
 //!
-//! Oftentimes you'll define [a job](crate::job) and use its methods to run a
-//! worker. However, workers can be manually constructed and only require a
-//! queue and task:
+//! Oftentimes you'll define [a workflow](crate::workflow) and use its methods
+//! to run a worker. However, workers can be manually constructed and only
+//! require a queue and task:
 //!
 //! ```rust,no_run
 //! # use tokio::runtime::Runtime;

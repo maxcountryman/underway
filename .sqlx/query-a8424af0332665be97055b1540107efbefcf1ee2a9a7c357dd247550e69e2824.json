@@ -1,0 +1,68 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            with next_call as (\n                select id\n                from underway.activity_call\n                where state = 'pending'::underway.activity_call_state\n                  and available_at <= now()\n                order by created_at, id\n                limit 1\n                for update skip locked\n            ),\n            claimed as (\n                update underway.activity_call c\n                set state = 'in_progress'::underway.activity_call_state,\n                    updated_at = now(),\n                    started_at = coalesce(c.started_at, now())\n                from next_call\n                where c.id = next_call.id\n                returning\n                    c.id,\n                    c.task_queue_name,\n                    c.workflow_id,\n                    c.step_index,\n                    c.call_key,\n                    c.activity,\n                    c.input,\n                    c.attempt_count\n            ),\n            attempt as (\n                insert into underway.activity_call_attempt (\n                    activity_call_id,\n                    attempt_number,\n                    state\n                )\n                select\n                    claimed.id,\n                    claimed.attempt_count + 1,\n                    'in_progress'::underway.activity_call_state\n                from claimed\n                returning\n                    activity_call_id,\n                    attempt_number\n            )\n            select\n                claimed.id,\n                claimed.task_queue_name,\n                claimed.workflow_id,\n                claimed.step_index,\n                claimed.call_key,\n                claimed.activity,\n                claimed.input,\n                claimed.attempt_count,\n                attempt.attempt_number\n            from claimed\n            inner join attempt\n              on attempt.activity_call_id = claimed.id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "task_queue_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "workflow_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "step_index",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "call_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "activity",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "input",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 7,
+        "name": "attempt_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 8,
+        "name": "attempt_number",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "a8424af0332665be97055b1540107efbefcf1ee2a9a7c357dd247550e69e2824"
+}

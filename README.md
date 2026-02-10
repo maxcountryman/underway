@@ -20,7 +20,7 @@
 
 ## 🎨 Overview
 
-**Underway** provides durable background jobs over Postgres. Jobs are composed of a sequence of one or more steps. Each step takes the output of the previous step as its input. These simple workflows provide a powerful interface to common deferred work use cases.
+**Underway** provides durable background workflows over Postgres. Workflows are composed of a sequence of one or more steps. Each step takes the output of the previous step as its input. These simple workflows provide a powerful interface to common deferred work use cases.
 
 Key Features:
 
@@ -33,14 +33,14 @@ Key Features:
 - **Automatic Retries** Configurable retry strategies ensure tasks are
   reliably completed, even after transient failures.
 - **Cron-Like Scheduling** Schedule recurring tasks with cron-like
-  expressions for automated, time-based job execution.
+  expressions for automated, time-based workflow execution.
 - **Scalable and Flexible** Easily scales from a single worker to many,
-  enabling seamless background job processing with minimal setup.
+  enabling seamless background workflow processing with minimal setup.
 
 ## 🤸 Usage
 
 Underway is suitable for many different use cases, ranging from simple
-single-step jobs to more sophisticated multi-step jobs, where dependencies
+single-step workflows to more sophisticated multi-step workflows, where dependencies
 are built up between steps.
 
 ## Welcome emails
@@ -49,7 +49,7 @@ A common use case is deferring work that can be processed later. For
 instance, during user registration, we might want to send a welcome email to
 new users. Rather than handling this within the registration process (e.g.,
 form validation, database insertion), we can offload it to run "out-of-band"
-using Underway. By defining a job for sending the welcome email, Underway
+using Underway. By defining a workflow for sending the welcome email, Underway
 ensures it gets processed in the background, without slowing down the user
 registration flow.
 
@@ -58,9 +58,9 @@ use std::env;
 
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use underway::{Job, To};
+use underway::{Workflow, To};
 
-// This is the input we'll provide to the job when we enqueue it.
+// This is the input we'll provide to the workflow when we enqueue it.
 #[derive(Deserialize, Serialize)]
 struct WelcomeEmail {
     user_id: i32,
@@ -77,8 +77,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Run migrations.
     underway::run_migrations(&pool).await?;
 
-    // Build the job.
-    let job = Job::builder()
+    // Build the workflow.
+    let workflow = Workflow::builder()
         .step(
             |_cx,
              WelcomeEmail {
@@ -97,16 +97,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .await?;
 
-    // Here we enqueue a new job to be processed later.
-    job.enqueue(&WelcomeEmail {
+    // Here we enqueue a new workflow to be processed later.
+    workflow.enqueue(&WelcomeEmail {
         user_id: 42,
         email: "ferris@example.com".to_string(),
         name: "Ferris".to_string(),
     })
     .await?;
 
-    // Start processing enqueued jobs.
-    job.start().await??;
+    // Start processing enqueued workflows.
+    let runtime_handle = workflow.runtime().start();
+    runtime_handle.shutdown().await?;
 
     Ok(())
 }
@@ -115,9 +116,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## Order receipts
 
 Another common use case is defining dependencies between discrete steps of a
-job. For instance, we might generate PDF receipts for orders and then email
+workflow. For instance, we might generate PDF receipts for orders and then email
 these to customers. With Underway, each step is handled separately, making
-it easy to create a job that first generates the PDF and, once
+it easy to create a workflow that first generates the PDF and, once
 completed, proceeds to send the email.
 
 This separation provides significant value: if the email sending service
@@ -129,7 +130,7 @@ use std::env;
 
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use underway::{Job, To};
+use underway::{Workflow, To};
 
 #[derive(Deserialize, Serialize)]
 struct GenerateReceipt {
@@ -152,8 +153,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Run migrations.
     underway::run_migrations(&pool).await?;
 
-    // Build the job.
-    let job = Job::builder()
+    // Build the workflow.
+    let workflow = Workflow::builder()
         .step(|_cx, GenerateReceipt { order_id }| async move {
             // Use the order ID to build a receipt PDF...
             let receipt_key = format!("receipts_bucket/{order_id}-receipt.pdf");
@@ -172,11 +173,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .await?;
 
-    // Enqueue the job for the given order.
-    job.enqueue(&GenerateReceipt { order_id: 42 }).await?;
+    // Enqueue the workflow for the given order.
+    workflow.enqueue(&GenerateReceipt { order_id: 42 }).await?;
 
-    // Start processing enqueued jobs.
-    job.start().await??;
+    // Start processing enqueued workflows.
+    let runtime_handle = workflow.runtime().start();
+    runtime_handle.shutdown().await?;
 
     Ok(())
 }
@@ -188,7 +190,7 @@ not repeating the expensive step of generating the PDF.
 
 ## Daily reports
 
-Jobs may also be run on a schedule. This makes them useful for situations
+Workflows may also be run on a schedule. This makes them useful for situations
 where we want to do things on a regular cadence, such as creating a daily
 business report.
 
@@ -197,7 +199,7 @@ use std::env;
 
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use underway::{Job, To};
+use underway::{Workflow, To};
 
 #[derive(Deserialize, Serialize)]
 struct DailyReport;
@@ -211,8 +213,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Run migrations.
     underway::run_migrations(&pool).await?;
 
-    // Build the job.
-    let job = Job::builder()
+    // Build the workflow.
+    let workflow = Workflow::builder()
         .step(|_cx, _| async move {
             // Here we would generate and store the report.
             To::done()
@@ -224,10 +226,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Set a daily schedule with the given input.
     let daily = "@daily[America/Los_Angeles]".parse()?;
-    job.schedule(&daily, &DailyReport).await?;
+    workflow.schedule(&daily, &DailyReport).await?;
 
-    // Start processing enqueued jobs.
-    job.start().await??;
+    // Start processing enqueued workflows.
+    let runtime_handle = workflow.runtime().start();
+    runtime_handle.shutdown().await?;
 
     Ok(())
 }
