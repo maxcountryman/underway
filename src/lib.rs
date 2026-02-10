@@ -375,7 +375,6 @@
 //! tasks, and when found, try to invoke the task's execute routine.
 //!
 //! See [`worker`] for more details about workers.
-//!
 #![warn(clippy::all, nonstandard_style, future_incompatible, missing_docs)]
 #![forbid(unsafe_code)]
 
