@@ -1790,6 +1790,11 @@ where
     fn priority_for(&self, input: &Self::Input) -> i32 {
         self.step_task_config(input.step_index).priority
     }
+
+    fn scheduled_input(&self, mut input: Self::Input) -> Self::Input {
+        input.workflow_id = WorkflowId::new();
+        input
+    }
 }
 
 impl<I, S> Clone for Workflow<I, S>
@@ -2443,6 +2448,56 @@ mod tests {
                 .parse()
                 .expect("A valid zoned scheduled should be provided")
         );
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn scheduled_dispatch_regenerates_workflow_id(pool: PgPool) -> sqlx::Result<(), Error> {
+        #[derive(Serialize, Deserialize)]
+        struct Input {
+            message: String,
+        }
+
+        let queue = Queue::builder()
+            .name("scheduled_dispatch_regenerates_workflow_id")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let workflow: Workflow<Input, ()> = Workflow::builder()
+            .step(|_cx, Input { message }| async move {
+                println!("Executing workflow with message: {message}");
+                To::done()
+            })
+            .queue(queue.clone())
+            .build();
+
+        let daily = "@daily[UTC]".parse().expect("Schedule should parse");
+        let input = Input {
+            message: "Hello, world!".to_string(),
+        };
+        workflow.schedule(&daily, &input).await?;
+
+        let (_, scheduled_input_one) = queue
+            .task_schedule(&pool)
+            .await?
+            .expect("Schedule should be set");
+        let (_, scheduled_input_two) = queue
+            .task_schedule(&pool)
+            .await?
+            .expect("Schedule should be set");
+
+        let dispatch_one =
+            <Workflow<Input, ()> as Task>::scheduled_input(&workflow, scheduled_input_one);
+        let dispatch_two =
+            <Workflow<Input, ()> as Task>::scheduled_input(&workflow, scheduled_input_two);
+
+        assert_eq!(dispatch_one.step_index, 0);
+        assert_eq!(dispatch_two.step_index, 0);
+        assert_eq!(dispatch_one.step_input, serde_json::to_value(&input)?);
+        assert_eq!(dispatch_two.step_input, serde_json::to_value(&input)?);
+        assert_ne!(dispatch_one.workflow_id, dispatch_two.workflow_id);
 
         Ok(())
     }
