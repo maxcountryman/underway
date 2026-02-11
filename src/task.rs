@@ -615,16 +615,6 @@ pub trait Task: Send + 'static {
     fn priority_for(&self, _input: &Self::Input) -> i32 {
         self.priority()
     }
-
-    /// Returns the input that should be enqueued for a scheduled dispatch.
-    ///
-    /// By default this returns the provided input unchanged.
-    ///
-    /// Tasks may override this to adjust per-dispatch fields when running from
-    /// a schedule. For example, workflows can regenerate per-run identifiers.
-    fn scheduled_input(&self, input: Self::Input) -> Self::Input {
-        input
-    }
 }
 
 /// Represents the possible states a task can be in.

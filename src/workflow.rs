@@ -709,7 +709,7 @@ use builder::Initial;
 pub use context::Context;
 use context::{ActivityCallBuffer, ActivityCallRecord, CallSequenceState, ContextParts};
 use jiff::Span;
-use sealed::WorkflowState;
+use sealed::{WorkflowScheduleTemplate, WorkflowState};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgConnection, PgExecutor, Postgres, Transaction};
 pub use step::To;
@@ -769,9 +769,16 @@ mod sealed {
     use super::WorkflowId;
 
     #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    pub struct WorkflowScheduleTemplate {
+        pub step_index: usize,
+        pub step_input: serde_json::Value,
+    } // TODO: Versioning?
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
     pub struct WorkflowState {
         pub step_index: usize,
         pub step_input: serde_json::Value,
+        #[serde(default = "WorkflowId::new")]
         pub(crate) workflow_id: WorkflowId,
     } // TODO: Versioning?
 }
@@ -1373,9 +1380,10 @@ where
     where
         E: PgExecutor<'a>,
     {
-        let workflow_input = self.first_workflow_input(input)?;
+        let workflow_input = self.first_workflow_schedule_template(input)?;
+        let workflow_input = serde_json::to_value(workflow_input)?;
         self.queue
-            .schedule(executor, zoned_schedule, &workflow_input)
+            .schedule_value(executor, zoned_schedule, workflow_input)
             .await?;
 
         Ok(())
@@ -1546,6 +1554,15 @@ where
             step_input,
             step_index,
             workflow_id,
+        })
+    }
+
+    fn first_workflow_schedule_template(&self, input: &I) -> Result<WorkflowScheduleTemplate> {
+        let step_input = serde_json::to_value(input)?;
+        let step_index = 0;
+        Ok(WorkflowScheduleTemplate {
+            step_input,
+            step_index,
         })
     }
 }
@@ -1789,11 +1806,6 @@ where
 
     fn priority_for(&self, input: &Self::Input) -> i32 {
         self.step_task_config(input.step_index).priority
-    }
-
-    fn scheduled_input(&self, mut input: Self::Input) -> Self::Input {
-        input.workflow_id = WorkflowId::new();
-        input
     }
 }
 
@@ -2488,16 +2500,35 @@ mod tests {
             .await?
             .expect("Schedule should be set");
 
-        let dispatch_one =
-            <Workflow<Input, ()> as Task>::scheduled_input(&workflow, scheduled_input_one);
-        let dispatch_two =
-            <Workflow<Input, ()> as Task>::scheduled_input(&workflow, scheduled_input_two);
+        assert_eq!(scheduled_input_one.step_index, 0);
+        assert_eq!(scheduled_input_two.step_index, 0);
+        assert_eq!(
+            scheduled_input_one.step_input,
+            serde_json::to_value(&input)?
+        );
+        assert_eq!(
+            scheduled_input_two.step_input,
+            serde_json::to_value(&input)?
+        );
+        assert_ne!(
+            scheduled_input_one.workflow_id,
+            scheduled_input_two.workflow_id
+        );
 
-        assert_eq!(dispatch_one.step_index, 0);
-        assert_eq!(dispatch_two.step_index, 0);
-        assert_eq!(dispatch_one.step_input, serde_json::to_value(&input)?);
-        assert_eq!(dispatch_two.step_input, serde_json::to_value(&input)?);
-        assert_ne!(dispatch_one.workflow_id, dispatch_two.workflow_id);
+        let stored_input = sqlx::query_scalar!(
+            r#"
+            select input
+            from underway.task_schedule
+            where task_queue_name = $1
+            "#,
+            queue.name.as_str(),
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert!(stored_input
+            .as_object()
+            .is_some_and(|value| !value.contains_key("workflow_id")));
 
         Ok(())
     }

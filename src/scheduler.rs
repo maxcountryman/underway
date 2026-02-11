@@ -419,8 +419,6 @@ impl<T: Task> Scheduler<T> {
             return Ok(());
         };
 
-        let input = self.task.scheduled_input(input);
-
         let task_id = self
             .queue
             .enqueue(&self.queue.pool, &self.task, &input)
