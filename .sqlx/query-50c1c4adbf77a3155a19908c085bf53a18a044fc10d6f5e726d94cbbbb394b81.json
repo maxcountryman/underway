@@ -1,0 +1,46 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            update underway.task\n            set state = $2,\n                updated_at = now(),\n                completed_at = now()\n            where id = $1\n              and task_queue_name = $3\n              and state = $5\n              and $4 = (\n                  select max(attempt_number)\n                  from underway.task_attempt\n                  where task_id = $1\n                    and task_queue_name = $3\n              )\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        {
+          "Custom": {
+            "name": "underway.task_state",
+            "kind": {
+              "Enum": [
+                "pending",
+                "in_progress",
+                "waiting",
+                "succeeded",
+                "cancelled",
+                "failed"
+              ]
+            }
+          }
+        },
+        "Text",
+        "Int4",
+        {
+          "Custom": {
+            "name": "underway.task_state",
+            "kind": {
+              "Enum": [
+                "pending",
+                "in_progress",
+                "waiting",
+                "succeeded",
+                "cancelled",
+                "failed"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "50c1c4adbf77a3155a19908c085bf53a18a044fc10d6f5e726d94cbbbb394b81"
+}

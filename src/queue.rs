@@ -1441,6 +1441,7 @@ impl InProgressTask {
             where task_id = $1
               and task_queue_name = $2
               and attempt_number = $4
+              and state = $5
               and attempt_number = (
                   select attempt_number
                   from underway.task_attempt
@@ -1453,7 +1454,8 @@ impl InProgressTask {
             self.id as TaskId,
             self.queue_name,
             TaskState::Succeeded as TaskState,
-            self.attempt_number
+            self.attempt_number,
+            TaskState::InProgress as TaskState,
         )
         .execute(&mut *conn)
         .await?;
@@ -1471,6 +1473,7 @@ impl InProgressTask {
                 completed_at = now()
             where id = $1
               and task_queue_name = $3
+              and state = $5
               and $4 = (
                   select max(attempt_number)
                   from underway.task_attempt
@@ -1481,7 +1484,8 @@ impl InProgressTask {
             self.id as TaskId,
             TaskState::Succeeded as TaskState,
             self.queue_name,
-            self.attempt_number
+            self.attempt_number,
+            TaskState::InProgress as TaskState,
         )
         .execute(&mut *conn)
         .await?;
@@ -4084,6 +4088,80 @@ mod tests {
             "stale_exhausted_task_moves_to_dlq_dlq"
         );
         assert_eq!(task_row.state, TaskState::Failed);
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn stale_terminalization_fences_late_mark_succeeded(
+        pool: PgPool,
+    ) -> sqlx::Result<(), Error> {
+        struct SingleAttemptTask;
+
+        impl Task for SingleAttemptTask {
+            type Input = serde_json::Value;
+            type Output = ();
+
+            async fn execute(
+                &self,
+                _: Transaction<'_, Postgres>,
+                _: Self::Input,
+            ) -> TaskResult<Self::Output> {
+                Ok(())
+            }
+
+            fn retry_policy(&self) -> RetryPolicy {
+                RetryPolicy::builder().max_attempts(1).build()
+            }
+        }
+
+        let queue = Queue::builder()
+            .name("stale_terminalization_fences_late_mark_succeeded")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let task_id = queue.enqueue(&pool, &SingleAttemptTask, &json!({})).await?;
+
+        let in_progress_task = queue.dequeue().await?.expect("A task should be dequeued");
+
+        sqlx::query!(
+            r#"
+            update underway.task
+            set last_heartbeat_at = now() - interval '2 hours'
+            where id = $1
+              and task_queue_name = $2
+            "#,
+            task_id as TaskId,
+            queue.name.as_str(),
+        )
+        .execute(&pool)
+        .await?;
+
+        assert!(
+            queue.dequeue().await?.is_none(),
+            "Stale exhausted task should be terminalized before dequeue"
+        );
+
+        let mut conn = pool.acquire().await?;
+        let stale_result = in_progress_task.mark_succeeded(&mut conn).await;
+
+        assert!(matches!(stale_result, Err(Error::TaskNotFound(_))));
+
+        let task_state = sqlx::query_scalar!(
+            r#"
+            select state as "state: TaskState"
+            from underway.task
+            where id = $1
+              and task_queue_name = $2
+            "#,
+            task_id as TaskId,
+            queue.name.as_str(),
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(task_state, TaskState::Failed);
 
         Ok(())
     }
