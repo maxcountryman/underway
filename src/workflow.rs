@@ -40,8 +40,8 @@
 //! Notice that the first argument to our function is [a context
 //! binding](crate::workflow::Context). This provides access to fields like
 //! [`state`](crate::workflow::Context::state) and
-//! [`workflow_id`](crate::workflow::Context::workflow_id), as well as workflow
-//! helpers like [`call`](crate::workflow::Context::call) and
+//! [`workflow_run_id`](crate::workflow::Context::workflow_run_id), as well as
+//! workflow helpers like [`call`](crate::workflow::Context::call) and
 //! [`emit`](crate::workflow::Context::emit).
 //! Activity calls are type-checked against handlers registered on
 //! [`workflow::Builder::activity`](crate::workflow::Builder::activity).
@@ -766,7 +766,7 @@ type WorkflowQueue<T, S> = Queue<Workflow<T, S>>;
 mod sealed {
     use serde::{Deserialize, Serialize};
 
-    use super::WorkflowId;
+    use super::WorkflowRunId;
 
     #[derive(Debug, Serialize, Deserialize, PartialEq)]
     pub struct WorkflowScheduleTemplate {
@@ -778,28 +778,28 @@ mod sealed {
     pub struct WorkflowState {
         pub step_index: usize,
         pub step_input: serde_json::Value,
-        #[serde(default = "WorkflowId::new")]
-        pub(crate) workflow_id: WorkflowId,
+        #[serde(default = "WorkflowRunId::new", alias = "workflow_id")]
+        pub(crate) workflow_run_id: WorkflowRunId,
     } // TODO: Versioning?
 }
 
-/// Unique identifier of a workflow.
+/// Unique identifier of a workflow run.
 ///
 /// Wraps a UUID which is generated via a ULID.
 ///
 /// Each enqueue of a workflow receives its own ID. IDs are embedded in the
 /// input of tasks on the queue. This means that each task related to a workflow
-/// will have the same workflow ID.
+/// run will have the same workflow run ID.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
-pub struct WorkflowId(Uuid);
+pub struct WorkflowRunId(Uuid);
 
-impl WorkflowId {
+impl WorkflowRunId {
     fn new() -> Self {
         Self(Ulid::new().into())
     }
 }
 
-impl Deref for WorkflowId {
+impl Deref for WorkflowRunId {
     type Target = Uuid;
 
     fn deref(&self) -> &Self::Target {
@@ -811,7 +811,7 @@ impl Deref for WorkflowId {
 ///
 /// This handle allows for manipulating the state of the workflow in the queue.
 pub struct EnqueuedWorkflow<T: Task> {
-    id: WorkflowId,
+    run_id: WorkflowRunId,
     queue: Arc<Queue<T>>,
 }
 
@@ -828,7 +828,7 @@ impl<T: Task> EnqueuedWorkflow<T> {
     /// # Errors
     ///
     /// This will return an error if the database operation fails and if the
-    /// workflow ID cannot be found.
+    /// workflow run ID cannot be found.
     ///
     /// # Example
     ///
@@ -874,11 +874,11 @@ impl<T: Task> EnqueuedWorkflow<T> {
               concurrency_key,
               0 as "attempt_number!"
             from underway.task
-            where input->>'workflow_id' = $1
+            where coalesce(input->>'workflow_run_id', input->>'workflow_id') = $1
               and state = $2
             for update skip locked
             "#,
-            self.id.to_string(),
+            self.run_id.to_string(),
             TaskState::Pending as TaskState
         )
         .fetch_all(&mut *tx)
@@ -1036,7 +1036,7 @@ where
     /// application may already be using in a given context.
     ///
     /// **Note:** If you pass a transactional executor and the transaction is
-    /// rolled back, the returned workflow ID will not correspond to any
+    /// rolled back, the returned workflow run ID will not correspond to any
     /// persisted task.
     ///
     /// # Errors
@@ -1095,7 +1095,7 @@ where
     /// application may already be using in a given context.
     ///
     /// **Note:** If you pass a transactional executor and the transaction is
-    /// rolled back, the returned workflow IDs will not correspond to any
+    /// rolled back, the returned workflow run IDs will not correspond to any
     /// persisted tasks.
     ///
     /// # Errors
@@ -1160,7 +1160,7 @@ where
         let enqueued = workflow_inputs
             .into_iter()
             .map(|workflow_input| EnqueuedWorkflow {
-                id: workflow_input.workflow_id,
+                run_id: workflow_input.workflow_run_id,
                 queue: self.queue.clone(),
             })
             .collect();
@@ -1219,7 +1219,7 @@ where
     /// application may already be using in a given context.
     ///
     /// **Note:** If you pass a transactional executor and the transaction is
-    /// rolled back, the returned workflow ID will not correspond to any
+    /// rolled back, the returned workflow run ID will not correspond to any
     /// persisted task.
     ///
     /// # Errors
@@ -1281,7 +1281,7 @@ where
             .await?;
 
         let enqueue = EnqueuedWorkflow {
-            id: workflow_input.workflow_id,
+            run_id: workflow_input.workflow_run_id,
             queue: self.queue.clone(),
         };
 
@@ -1549,11 +1549,11 @@ where
     fn first_workflow_input(&self, input: &I) -> Result<WorkflowState> {
         let step_input = serde_json::to_value(input)?;
         let step_index = 0;
-        let workflow_id = WorkflowId::new();
+        let workflow_run_id = WorkflowRunId::new();
         Ok(WorkflowState {
             step_input,
             step_index,
-            workflow_id,
+            workflow_run_id,
         })
     }
 
@@ -1582,7 +1582,7 @@ where
     async fn fetch_activity_calls(
         &self,
         conn: &mut PgConnection,
-        workflow_id: WorkflowId,
+        workflow_run_id: WorkflowRunId,
         step_index: usize,
     ) -> TaskResult<Vec<ActivityCallRecord>> {
         sqlx::query_as!(
@@ -1597,11 +1597,11 @@ where
                 state as "state: CallState"
             from underway.activity_call
             where task_queue_name = $1
-              and workflow_id = $2
+              and workflow_run_id = $2
               and step_index = $3
             "#,
             self.queue.name,
-            *workflow_id,
+            *workflow_run_id,
             step_index as i32,
         )
         .fetch_all(&mut *conn)
@@ -1612,7 +1612,7 @@ where
     async fn persist_activity_call_commands(
         &self,
         conn: &mut PgConnection,
-        workflow_id: WorkflowId,
+        workflow_run_id: WorkflowRunId,
         step_index: usize,
         activity_call_buffer: &Arc<Mutex<ActivityCallBuffer>>,
     ) -> TaskResult<()> {
@@ -1629,18 +1629,18 @@ where
                 insert into underway.activity_call (
                     id,
                     task_queue_name,
-                    workflow_id,
+                    workflow_run_id,
                     step_index,
                     call_key,
                     activity,
                     input,
                     state
                 ) values ($1, $2, $3, $4, $5, $6, $7, 'pending'::underway.activity_call_state)
-                on conflict (task_queue_name, workflow_id, step_index, call_key) do nothing
+                on conflict (task_queue_name, workflow_run_id, step_index, call_key) do nothing
                 "#,
                 Uuid::new_v4(),
                 self.queue.name,
-                *workflow_id,
+                *workflow_run_id,
                 step_index as i32,
                 command.call_key,
                 command.activity,
@@ -1666,7 +1666,7 @@ where
     #[instrument(
         skip_all,
         fields(
-            workflow.id = %input.workflow_id.as_hyphenated(),
+            workflow.run_id = %input.workflow_run_id.as_hyphenated(),
             step = input.step_index + 1,
             steps = self.steps.len()
         ),
@@ -1680,7 +1680,7 @@ where
         let WorkflowState {
             step_index,
             step_input,
-            workflow_id,
+            workflow_run_id,
         } = input;
 
         if step_index >= self.steps.len() {
@@ -1689,7 +1689,7 @@ where
 
         let step = &self.steps[step_index].executor;
         let activity_call_buffer = Arc::new(Mutex::new(ActivityCallBuffer::new(
-            self.fetch_activity_calls(&mut tx, workflow_id, step_index)
+            self.fetch_activity_calls(&mut tx, workflow_run_id, step_index)
                 .await?,
         )));
         let call_sequence_state = Arc::new(Mutex::new(CallSequenceState::default()));
@@ -1697,7 +1697,7 @@ where
         let cx = ContextParts {
             state: self.state.clone(),
             step_index,
-            workflow_id,
+            workflow_run_id,
             step_count: self.steps.len(),
             queue_name: self.queue.name.clone(),
             activity_call_buffer: Arc::clone(&activity_call_buffer),
@@ -1712,7 +1712,7 @@ where
         if matches!(step_result.as_ref(), Ok(_) | Err(TaskError::Suspended(_))) {
             self.persist_activity_call_commands(
                 &mut tx,
-                workflow_id,
+                workflow_run_id,
                 step_index,
                 &activity_call_buffer,
             )
@@ -1737,7 +1737,7 @@ where
             let next_workflow_input = WorkflowState {
                 step_input: next_input,
                 step_index: next_index,
-                workflow_id,
+                workflow_run_id,
             };
 
             self.queue
@@ -1831,6 +1831,7 @@ mod tests {
 
     use jiff::ToSpan;
     use serde::{Deserialize, Serialize};
+    use serde_json::json;
     use sqlx::{postgres::types::PgInterval, PgPool};
 
     use super::*;
@@ -2175,11 +2176,11 @@ mod tests {
         let enqueued = workflow.enqueue_many(&inputs).await?;
         assert_eq!(enqueued.len(), 2);
 
-        let mut workflow_ids: Vec<String> = enqueued
+        let mut workflow_run_ids: Vec<String> = enqueued
             .iter()
-            .map(|handle| handle.id.to_string())
+            .map(|handle| handle.run_id.to_string())
             .collect();
-        workflow_ids.sort();
+        workflow_run_ids.sort();
 
         let pending_tasks = sqlx::query!(
             r#"
@@ -2194,16 +2195,16 @@ mod tests {
         .fetch_all(&pool)
         .await?;
 
-        let mut pending_workflow_ids = Vec::new();
+        let mut pending_workflow_run_ids = Vec::new();
         for task in pending_tasks {
             let workflow_state: WorkflowState = serde_json::from_value(task.input)?;
             assert_eq!(workflow_state.step_index, 0);
-            pending_workflow_ids.push(workflow_state.workflow_id.to_string());
+            pending_workflow_run_ids.push(workflow_state.workflow_run_id.to_string());
         }
 
-        pending_workflow_ids.sort();
+        pending_workflow_run_ids.sort();
 
-        assert_eq!(pending_workflow_ids, workflow_ids);
+        assert_eq!(pending_workflow_run_ids, workflow_run_ids);
 
         Ok(())
     }
@@ -2465,14 +2466,16 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn scheduled_dispatch_regenerates_workflow_id(pool: PgPool) -> sqlx::Result<(), Error> {
+    async fn scheduled_dispatch_regenerates_workflow_run_id(
+        pool: PgPool,
+    ) -> sqlx::Result<(), Error> {
         #[derive(Serialize, Deserialize)]
         struct Input {
             message: String,
         }
 
         let queue = Queue::builder()
-            .name("scheduled_dispatch_regenerates_workflow_id")
+            .name("scheduled_dispatch_regenerates_workflow_run_id")
             .pool(pool.clone())
             .build()
             .await?;
@@ -2511,8 +2514,8 @@ mod tests {
             serde_json::to_value(&input)?
         );
         assert_ne!(
-            scheduled_input_one.workflow_id,
-            scheduled_input_two.workflow_id
+            scheduled_input_one.workflow_run_id,
+            scheduled_input_two.workflow_run_id
         );
 
         let stored_input = sqlx::query_scalar!(
@@ -2526,9 +2529,9 @@ mod tests {
         .fetch_one(&pool)
         .await?;
 
-        assert!(stored_input
-            .as_object()
-            .is_some_and(|value| !value.contains_key("workflow_id")));
+        assert!(stored_input.as_object().is_some_and(|value| {
+            !value.contains_key("workflow_run_id") && !value.contains_key("workflow_id")
+        }));
 
         Ok(())
     }
@@ -2555,6 +2558,21 @@ mod tests {
         assert!(task_id.is_some());
 
         Ok(())
+    }
+
+    #[test]
+    fn workflow_state_deserializes_legacy_workflow_id() {
+        let workflow_run_id = WorkflowRunId::new();
+        let legacy = json!({
+            "step_index": 0,
+            "step_input": {"message": "hello"},
+            "workflow_id": workflow_run_id,
+        });
+
+        let decoded: WorkflowState =
+            serde_json::from_value(legacy).expect("Legacy workflow_id should deserialize");
+
+        assert_eq!(decoded.workflow_run_id, workflow_run_id);
     }
 
     #[sqlx::test]
@@ -2588,10 +2606,10 @@ mod tests {
             select state as "state: TaskState"
             from underway.task
             where task_queue_name = $1
-              and (input->>'workflow_id')::uuid = $2
+              and (coalesce(input->>'workflow_run_id', input->>'workflow_id'))::uuid = $2
             "#,
             workflow.queue.name,
-            *enqueued.id,
+            *enqueued.run_id,
         )
         .fetch_one(&pool)
         .await?;
@@ -2603,12 +2621,12 @@ mod tests {
             select state as "state: CallState"
             from underway.activity_call
             where task_queue_name = $1
-              and workflow_id = $2
+              and workflow_run_id = $2
               and step_index = $3
               and call_key = $4
             "#,
             workflow.queue.name,
-            *enqueued.id,
+            *enqueued.run_id,
             0_i32,
             "echo-main",
         )
@@ -2651,10 +2669,10 @@ mod tests {
             select count(*)::int as "count!"
             from underway.activity_call
             where task_queue_name = $1
-              and workflow_id = $2
+              and workflow_run_id = $2
             "#,
             workflow.queue.name,
-            *enqueued.id,
+            *enqueued.run_id,
         )
         .fetch_one(&pool)
         .await?;
@@ -2695,10 +2713,10 @@ mod tests {
             select count(*)::int as "count!"
             from underway.activity_call
             where task_queue_name = $1
-              and workflow_id = $2
+              and workflow_run_id = $2
             "#,
             workflow.queue.name,
-            *enqueued.id,
+            *enqueued.run_id,
         )
         .fetch_one(&pool)
         .await?;
@@ -2743,10 +2761,10 @@ mod tests {
             select state as "state: TaskState"
             from underway.task
             where task_queue_name = $1
-              and (input->>'workflow_id')::uuid = $2
+              and (coalesce(input->>'workflow_run_id', input->>'workflow_id'))::uuid = $2
             "#,
             workflow.queue.name,
-            *enqueued.id,
+            *enqueued.run_id,
         )
         .fetch_one(&pool)
         .await?;
@@ -2758,10 +2776,10 @@ mod tests {
             select count(*)::int as "count!"
             from underway.activity_call
             where task_queue_name = $1
-              and workflow_id = $2
+              and workflow_run_id = $2
             "#,
             workflow.queue.name,
-            *enqueued.id,
+            *enqueued.run_id,
         )
         .fetch_one(&pool)
         .await?;
@@ -2882,13 +2900,13 @@ mod tests {
         };
 
         assert_eq!(
-            enqueued_workflow.id,
+            enqueued_workflow.run_id,
             dequeued_task
                 .input
-                .get("workflow_id")
+                .get("workflow_run_id")
                 .cloned()
                 .map(serde_json::from_value)
-                .expect("Failed to deserialize 'workflow_id'")?
+                .expect("Failed to deserialize 'workflow_run_id'")?
         );
         assert_eq!(dequeued_task.retry_policy.max_attempts, 1);
 
@@ -3033,13 +3051,13 @@ mod tests {
         };
 
         assert_eq!(
-            enqueued_workflow.id,
+            enqueued_workflow.run_id,
             dequeued_task
                 .input
-                .get("workflow_id")
+                .get("workflow_run_id")
                 .cloned()
                 .map(serde_json::from_value)
-                .expect("Failed to deserialize 'workflow_id'")?
+                .expect("Failed to deserialize 'workflow_run_id'")?
         );
 
         let workflow_state: WorkflowState = serde_json::from_value(dequeued_task.input).unwrap();
@@ -3047,7 +3065,7 @@ mod tests {
             WorkflowState {
                 step_index: 0,
                 step_input: serde_json::to_value(input).unwrap(),
-                workflow_id: workflow_state.workflow_id
+                workflow_run_id: workflow_state.workflow_run_id
             },
             workflow_state
         );
@@ -3079,7 +3097,7 @@ mod tests {
             WorkflowState {
                 step_index: 1,
                 step_input: serde_json::to_value(step2_input).unwrap(),
-                workflow_id: workflow_state.workflow_id
+                workflow_run_id: workflow_state.workflow_run_id
             },
             workflow_state
         );
@@ -3218,9 +3236,9 @@ mod tests {
             r#"
             select state as "state: TaskState"
             from underway.task
-            where input->>'workflow_id' = $1
+            where coalesce(input->>'workflow_run_id', input->>'workflow_id') = $1
             "#,
-            enqueued_workflow.id.to_string()
+            enqueued_workflow.run_id.to_string()
         )
         .fetch_one(&pool)
         .await?;

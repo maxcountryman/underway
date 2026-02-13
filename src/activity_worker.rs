@@ -119,7 +119,7 @@ pub(crate) struct ActivityWorker {
 struct ClaimedCall {
     id: Uuid,
     task_queue_name: String,
-    workflow_id: Uuid,
+    workflow_run_id: Uuid,
     step_index: i32,
     call_key: String,
     activity: String,
@@ -308,7 +308,7 @@ impl ActivityWorker {
                 returning
                     c.id,
                     c.task_queue_name,
-                    c.workflow_id,
+                    c.workflow_run_id,
                     c.step_index,
                     c.call_key,
                     c.activity,
@@ -340,7 +340,7 @@ impl ActivityWorker {
             select
                 claimed.id,
                 claimed.task_queue_name,
-                claimed.workflow_id,
+                claimed.workflow_run_id,
                 claimed.step_index,
                 claimed.call_key,
                 claimed.activity,
@@ -550,11 +550,11 @@ impl ActivityWorker {
                 updated_at = now()
             where task_queue_name = $1
               and state = 'waiting'::underway.task_state
-              and (input->>'workflow_id')::uuid = $2
+              and (coalesce(input->>'workflow_run_id', input->>'workflow_id'))::uuid = $2
               and (input->>'step_index')::integer = $3
             "#,
             call.task_queue_name,
-            call.workflow_id,
+            call.workflow_run_id,
             call.step_index,
         )
         .execute(&mut **tx)
