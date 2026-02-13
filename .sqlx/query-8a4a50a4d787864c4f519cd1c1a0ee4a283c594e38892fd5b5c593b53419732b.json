@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            with moved_task as (\n                update underway.task\n                set task_queue_name = $2\n                where id = $1\n                  and task_queue_name = $3\n                returning id\n            ),\n            moved_attempts as (\n                update underway.task_attempt\n                set task_queue_name = $2\n                where task_id = $1\n                  and task_queue_name = $3\n            )\n            select exists(select 1 from moved_task) as \"moved!\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "moved!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "8a4a50a4d787864c4f519cd1c1a0ee4a283c594e38892fd5b5c593b53419732b"
+}

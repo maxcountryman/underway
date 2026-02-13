@@ -870,6 +870,59 @@ impl<T: Task> Queue<T> {
         Ok(task_ids)
     }
 
+    async fn fail_stale_exhausted_tasks(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> Result<Vec<TaskId>> {
+        let failed_task_ids = sqlx::query_scalar!(
+            r#"
+            with stale_exhausted as (
+                select t.id
+                from underway.task t
+                where t.task_queue_name = $1
+                  and t.state = $2
+                  and t.last_heartbeat_at < now() - t.heartbeat
+                  and (t.retry_policy).max_attempts <= (
+                      select count(*)
+                      from underway.task_attempt ta
+                      where ta.task_queue_name = $1
+                        and ta.task_id = t.id
+                  )
+                for update skip locked
+            ),
+            finalized_attempts as (
+                update underway.task_attempt ta
+                set state = $3,
+                    updated_at = now(),
+                    completed_at = now(),
+                    error_message = coalesce(
+                        ta.error_message,
+                        'Task heartbeat became stale and retry policy was exhausted.'
+                    )
+                from stale_exhausted se
+                where ta.task_queue_name = $1
+                  and ta.task_id = se.id
+                  and ta.state = $2
+            )
+            update underway.task t
+            set state = $3,
+                updated_at = now(),
+                completed_at = now()
+            from stale_exhausted se
+            where t.task_queue_name = $1
+              and t.id = se.id
+            returning t.id as "id: TaskId"
+            "#,
+            self.name.as_str(),
+            TaskState::InProgress as TaskState,
+            TaskState::Failed as TaskState,
+        )
+        .fetch_all(&mut **tx)
+        .await?;
+
+        Ok(failed_task_ids)
+    }
+
     /// Dequeues the next available task.
     ///
     /// This method uses the `FOR UPDATE SKIP LOCKED` clause to ensure efficient
@@ -960,6 +1013,13 @@ impl<T: Task> Queue<T> {
         // Transaction scoped to finding the next task and setting its state to
         // "in-progress".
         let mut tx = self.pool.begin().await?;
+
+        let failed_task_ids = self.fail_stale_exhausted_tasks(&mut tx).await?;
+        if let Some(dlq_name) = &self.dlq_name {
+            for task_id in failed_task_ids {
+                self.move_task_to_dlq(&mut *tx, task_id, dlq_name).await?;
+            }
+        }
 
         let in_progress_task = sqlx::query_as!(
             InProgressTask,
@@ -1315,19 +1375,31 @@ impl<T: Task> Queue<T> {
     where
         E: PgExecutor<'a>,
     {
-        let result = sqlx::query!(
+        let moved = sqlx::query_scalar!(
             r#"
-            update underway.task
-            set task_queue_name = $2
-            where id = $1
+            with moved_task as (
+                update underway.task
+                set task_queue_name = $2
+                where id = $1
+                  and task_queue_name = $3
+                returning id
+            ),
+            moved_attempts as (
+                update underway.task_attempt
+                set task_queue_name = $2
+                where task_id = $1
+                  and task_queue_name = $3
+            )
+            select exists(select 1 from moved_task) as "moved!"
             "#,
             task_id as TaskId,
-            dlq_name
+            dlq_name,
+            self.name.as_str()
         )
-        .execute(executor)
+        .fetch_one(executor)
         .await?;
 
-        if result.rows_affected() == 0 {
+        if !moved {
             return Err(Error::TaskNotFound(task_id));
         }
 
@@ -1369,6 +1441,7 @@ impl InProgressTask {
             where task_id = $1
               and task_queue_name = $2
               and attempt_number = $4
+              and state = $5
               and attempt_number = (
                   select attempt_number
                   from underway.task_attempt
@@ -1381,7 +1454,8 @@ impl InProgressTask {
             self.id as TaskId,
             self.queue_name,
             TaskState::Succeeded as TaskState,
-            self.attempt_number
+            self.attempt_number,
+            TaskState::InProgress as TaskState,
         )
         .execute(&mut *conn)
         .await?;
@@ -1399,6 +1473,7 @@ impl InProgressTask {
                 completed_at = now()
             where id = $1
               and task_queue_name = $3
+              and state = $5
               and $4 = (
                   select max(attempt_number)
                   from underway.task_attempt
@@ -1409,7 +1484,8 @@ impl InProgressTask {
             self.id as TaskId,
             TaskState::Succeeded as TaskState,
             self.queue_name,
-            self.attempt_number
+            self.attempt_number,
+            TaskState::InProgress as TaskState,
         )
         .execute(&mut *conn)
         .await?;
@@ -3292,6 +3368,11 @@ mod tests {
         // Enqueue a task
         let task_id = queue.enqueue(&pool, &task, &input).await?;
 
+        // Create an attempt row and fail it.
+        let mut conn = pool.acquire().await?;
+        let in_progress_task = queue.dequeue().await?.expect("A task should be dequeued");
+        in_progress_task.mark_failed(&mut conn).await?;
+
         // Move the task to DLQ
         queue.move_task_to_dlq(&pool, task_id, "test_dlq").await?;
 
@@ -3307,6 +3388,22 @@ mod tests {
 
         assert!(task_row.is_some());
         assert_eq!(task_row.unwrap().task_queue_name, "test_dlq");
+
+        // Attempt rows should move as well.
+        let attempt_queue_name = sqlx::query_scalar!(
+            r#"
+            select task_queue_name
+            from underway.task_attempt
+            where task_id = $1
+            order by attempt_number desc
+            limit 1
+            "#,
+            task_id as TaskId,
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(attempt_queue_name, "test_dlq");
 
         Ok(())
     }
@@ -3846,6 +3943,225 @@ mod tests {
         .await?;
 
         assert_eq!(attempt_rows.len(), 1);
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn stale_exhausted_task_is_terminalized(pool: PgPool) -> sqlx::Result<(), Error> {
+        struct SingleAttemptTask;
+
+        impl Task for SingleAttemptTask {
+            type Input = serde_json::Value;
+            type Output = ();
+
+            async fn execute(
+                &self,
+                _: Transaction<'_, Postgres>,
+                _: Self::Input,
+            ) -> TaskResult<Self::Output> {
+                Ok(())
+            }
+
+            fn retry_policy(&self) -> RetryPolicy {
+                RetryPolicy::builder().max_attempts(1).build()
+            }
+        }
+
+        let queue = Queue::builder()
+            .name("stale_exhausted_task_is_terminalized")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let task_id = queue.enqueue(&pool, &SingleAttemptTask, &json!({})).await?;
+
+        assert!(
+            queue.dequeue().await?.is_some(),
+            "A task should be dequeued"
+        );
+
+        sqlx::query!(
+            r#"
+            update underway.task
+            set last_heartbeat_at = now() - interval '2 hours'
+            where id = $1
+              and task_queue_name = $2
+            "#,
+            task_id as TaskId,
+            queue.name.as_str(),
+        )
+        .execute(&pool)
+        .await?;
+
+        assert!(
+            queue.dequeue().await?.is_none(),
+            "Stale exhausted task should not be reclaimed for execution"
+        );
+
+        let task_state = sqlx::query_scalar!(
+            r#"
+            select state as "state: TaskState"
+            from underway.task
+            where id = $1
+              and task_queue_name = $2
+            "#,
+            task_id as TaskId,
+            queue.name.as_str(),
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(task_state, TaskState::Failed);
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn stale_exhausted_task_moves_to_dlq(pool: PgPool) -> sqlx::Result<(), Error> {
+        struct SingleAttemptTask;
+
+        impl Task for SingleAttemptTask {
+            type Input = serde_json::Value;
+            type Output = ();
+
+            async fn execute(
+                &self,
+                _: Transaction<'_, Postgres>,
+                _: Self::Input,
+            ) -> TaskResult<Self::Output> {
+                Ok(())
+            }
+
+            fn retry_policy(&self) -> RetryPolicy {
+                RetryPolicy::builder().max_attempts(1).build()
+            }
+        }
+
+        let queue = Queue::builder()
+            .name("stale_exhausted_task_moves_to_dlq")
+            .dead_letter_queue("stale_exhausted_task_moves_to_dlq_dlq")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let task_id = queue.enqueue(&pool, &SingleAttemptTask, &json!({})).await?;
+
+        assert!(
+            queue.dequeue().await?.is_some(),
+            "A task should be dequeued"
+        );
+
+        sqlx::query!(
+            r#"
+            update underway.task
+            set last_heartbeat_at = now() - interval '2 hours'
+            where id = $1
+              and task_queue_name = $2
+            "#,
+            task_id as TaskId,
+            queue.name.as_str(),
+        )
+        .execute(&pool)
+        .await?;
+
+        assert!(
+            queue.dequeue().await?.is_none(),
+            "Stale exhausted task should be terminalized, not executed"
+        );
+
+        let task_row = sqlx::query!(
+            r#"
+            select
+              task_queue_name,
+              state as "state: TaskState"
+            from underway.task
+            where id = $1
+            "#,
+            task_id as TaskId,
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(
+            task_row.task_queue_name,
+            "stale_exhausted_task_moves_to_dlq_dlq"
+        );
+        assert_eq!(task_row.state, TaskState::Failed);
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn stale_terminalization_fences_late_mark_succeeded(
+        pool: PgPool,
+    ) -> sqlx::Result<(), Error> {
+        struct SingleAttemptTask;
+
+        impl Task for SingleAttemptTask {
+            type Input = serde_json::Value;
+            type Output = ();
+
+            async fn execute(
+                &self,
+                _: Transaction<'_, Postgres>,
+                _: Self::Input,
+            ) -> TaskResult<Self::Output> {
+                Ok(())
+            }
+
+            fn retry_policy(&self) -> RetryPolicy {
+                RetryPolicy::builder().max_attempts(1).build()
+            }
+        }
+
+        let queue = Queue::builder()
+            .name("stale_terminalization_fences_late_mark_succeeded")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let task_id = queue.enqueue(&pool, &SingleAttemptTask, &json!({})).await?;
+
+        let in_progress_task = queue.dequeue().await?.expect("A task should be dequeued");
+
+        sqlx::query!(
+            r#"
+            update underway.task
+            set last_heartbeat_at = now() - interval '2 hours'
+            where id = $1
+              and task_queue_name = $2
+            "#,
+            task_id as TaskId,
+            queue.name.as_str(),
+        )
+        .execute(&pool)
+        .await?;
+
+        assert!(
+            queue.dequeue().await?.is_none(),
+            "Stale exhausted task should be terminalized before dequeue"
+        );
+
+        let mut conn = pool.acquire().await?;
+        let stale_result = in_progress_task.mark_succeeded(&mut conn).await;
+
+        assert!(matches!(stale_result, Err(Error::TaskNotFound(_))));
+
+        let task_state = sqlx::query_scalar!(
+            r#"
+            select state as "state: TaskState"
+            from underway.task
+            where id = $1
+              and task_queue_name = $2
+            "#,
+            task_id as TaskId,
+            queue.name.as_str(),
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(task_state, TaskState::Failed);
 
         Ok(())
     }
