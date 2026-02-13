@@ -6,7 +6,7 @@ use std::{
 
 use super::{
     registration::{Contains, NoActivities},
-    WorkflowId,
+    WorkflowRunId,
 };
 use crate::{
     activity::{self, Activity, CallState},
@@ -35,8 +35,8 @@ pub struct Context<S, Set = NoActivities> {
     /// The number of steps in this workflow definition.
     pub step_count: usize,
 
-    /// This `WorkflowId`.
-    pub workflow_id: WorkflowId,
+    /// This `WorkflowRunId`.
+    pub workflow_run_id: WorkflowRunId,
 
     /// Queue name.
     ///
@@ -52,7 +52,7 @@ pub(super) struct ContextParts<S> {
     pub(super) state: S,
     pub(super) step_index: usize,
     pub(super) step_count: usize,
-    pub(super) workflow_id: WorkflowId,
+    pub(super) workflow_run_id: WorkflowRunId,
     pub(super) queue_name: String,
     pub(super) activity_call_buffer: Arc<Mutex<ActivityCallBuffer>>,
     pub(super) call_sequence_state: Arc<Mutex<CallSequenceState>>,
@@ -152,7 +152,7 @@ impl<S, Set> Context<S, Set> {
             state,
             step_index,
             step_count,
-            workflow_id,
+            workflow_run_id,
             queue_name,
             activity_call_buffer,
             call_sequence_state,
@@ -162,7 +162,7 @@ impl<S, Set> Context<S, Set> {
             state,
             step_index,
             step_count,
-            workflow_id,
+            workflow_run_id,
             queue_name,
             activity_call_buffer,
             call_sequence_state,
