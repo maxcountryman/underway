@@ -709,7 +709,7 @@ use builder::Initial;
 pub use context::Context;
 use context::{ActivityCallBuffer, ActivityCallRecord, CallSequenceState, ContextParts};
 use jiff::Span;
-use sealed::WorkflowState;
+use sealed::{WorkflowScheduleTemplate, WorkflowState};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgConnection, PgExecutor, Postgres, Transaction};
 pub use step::To;
@@ -769,9 +769,16 @@ mod sealed {
     use super::WorkflowId;
 
     #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    pub struct WorkflowScheduleTemplate {
+        pub step_index: usize,
+        pub step_input: serde_json::Value,
+    } // TODO: Versioning?
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
     pub struct WorkflowState {
         pub step_index: usize,
         pub step_input: serde_json::Value,
+        #[serde(default = "WorkflowId::new")]
         pub(crate) workflow_id: WorkflowId,
     } // TODO: Versioning?
 }
@@ -1373,9 +1380,10 @@ where
     where
         E: PgExecutor<'a>,
     {
-        let workflow_input = self.first_workflow_input(input)?;
+        let workflow_input = self.first_workflow_schedule_template(input)?;
+        let workflow_input = serde_json::to_value(workflow_input)?;
         self.queue
-            .schedule(executor, zoned_schedule, &workflow_input)
+            .schedule_value(executor, zoned_schedule, workflow_input)
             .await?;
 
         Ok(())
@@ -1546,6 +1554,15 @@ where
             step_input,
             step_index,
             workflow_id,
+        })
+    }
+
+    fn first_workflow_schedule_template(&self, input: &I) -> Result<WorkflowScheduleTemplate> {
+        let step_input = serde_json::to_value(input)?;
+        let step_index = 0;
+        Ok(WorkflowScheduleTemplate {
+            step_input,
+            step_index,
         })
     }
 }
@@ -2443,6 +2460,75 @@ mod tests {
                 .parse()
                 .expect("A valid zoned scheduled should be provided")
         );
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn scheduled_dispatch_regenerates_workflow_id(pool: PgPool) -> sqlx::Result<(), Error> {
+        #[derive(Serialize, Deserialize)]
+        struct Input {
+            message: String,
+        }
+
+        let queue = Queue::builder()
+            .name("scheduled_dispatch_regenerates_workflow_id")
+            .pool(pool.clone())
+            .build()
+            .await?;
+
+        let workflow: Workflow<Input, ()> = Workflow::builder()
+            .step(|_cx, Input { message }| async move {
+                println!("Executing workflow with message: {message}");
+                To::done()
+            })
+            .queue(queue.clone())
+            .build();
+
+        let daily = "@daily[UTC]".parse().expect("Schedule should parse");
+        let input = Input {
+            message: "Hello, world!".to_string(),
+        };
+        workflow.schedule(&daily, &input).await?;
+
+        let (_, scheduled_input_one) = queue
+            .task_schedule(&pool)
+            .await?
+            .expect("Schedule should be set");
+        let (_, scheduled_input_two) = queue
+            .task_schedule(&pool)
+            .await?
+            .expect("Schedule should be set");
+
+        assert_eq!(scheduled_input_one.step_index, 0);
+        assert_eq!(scheduled_input_two.step_index, 0);
+        assert_eq!(
+            scheduled_input_one.step_input,
+            serde_json::to_value(&input)?
+        );
+        assert_eq!(
+            scheduled_input_two.step_input,
+            serde_json::to_value(&input)?
+        );
+        assert_ne!(
+            scheduled_input_one.workflow_id,
+            scheduled_input_two.workflow_id
+        );
+
+        let stored_input = sqlx::query_scalar!(
+            r#"
+            select input
+            from underway.task_schedule
+            where task_queue_name = $1
+            "#,
+            queue.name.as_str(),
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert!(stored_input
+            .as_object()
+            .is_some_and(|value| !value.contains_key("workflow_id")));
 
         Ok(())
     }

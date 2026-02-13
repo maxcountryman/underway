@@ -1222,6 +1222,24 @@ impl<T: Task> Queue<T> {
     {
         let input_value = serde_json::to_value(input)?;
 
+        self.schedule_value(executor, zoned_schedule, input_value)
+            .await
+    }
+
+    #[instrument(
+        skip(self, executor, zoned_schedule, input_value),
+        fields(queue.name = self.name),
+        err
+    )]
+    pub(crate) async fn schedule_value<'a, E>(
+        &self,
+        executor: E,
+        zoned_schedule: &ZonedSchedule,
+        input_value: serde_json::Value,
+    ) -> Result
+    where
+        E: PgExecutor<'a>,
+    {
         sqlx::query!(
             r#"
             insert into underway.task_schedule (

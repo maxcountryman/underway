@@ -359,7 +359,7 @@ impl<T: Task> Scheduler<T> {
                 return Ok(());
             };
 
-            let Some((zoned_schedule, input)) = self.queue.task_schedule(&self.queue.pool).await?
+            let Some((zoned_schedule, _)) = self.queue.task_schedule(&self.queue.pool).await?
             else {
                 // No schedule configured, so we'll exit.
                 return Ok(());
@@ -399,7 +399,7 @@ impl<T: Task> Scheduler<T> {
                     }
 
                     _ = wait_until(&next) => {
-                        self.process_next_schedule(&input).await?
+                        self.process_next_schedule().await?
                     }
                 }
             }
@@ -414,10 +414,14 @@ impl<T: Task> Scheduler<T> {
     }
 
     #[instrument(skip_all, fields(task.id = tracing::field::Empty), err)]
-    async fn process_next_schedule(&self, input: &T::Input) -> Result {
+    async fn process_next_schedule(&self) -> Result {
+        let Some((_, input)) = self.queue.task_schedule(&self.queue.pool).await? else {
+            return Ok(());
+        };
+
         let task_id = self
             .queue
-            .enqueue(&self.queue.pool, &self.task, input)
+            .enqueue(&self.queue.pool, &self.task, &input)
             .await?;
 
         tracing::Span::current().record("task.id", task_id.as_hyphenated().to_string());
