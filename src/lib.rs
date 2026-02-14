@@ -122,7 +122,7 @@
 //! let workflow = Workflow::builder()
 //!     .activity(ResolveEmail)
 //!     .step(|mut cx, Input { user_id }| async move {
-//!         let _email: String = cx.call::<ResolveEmail, _>("resolve", &user_id).await?;
+//!         let _email: String = cx.call::<ResolveEmail, _>(&user_id).await?;
 //!         To::done()
 //!     })
 //!     .name("resolve-email")
@@ -247,8 +247,8 @@
 //!     .activity(LookupEmail { pool: pool.clone() })
 //!     .activity(TrackSignupMetric)
 //!     .step(|mut cx, Signup { user_id }| async move {
-//!         let email: String = cx.call::<LookupEmail, _>("lookup", &user_id).await?;
-//!         cx.emit::<TrackSignupMetric, _>("track", &email).await?;
+//!         let email: String = cx.call::<LookupEmail, _>(&user_id).await?;
+//!         cx.emit::<TrackSignupMetric, _>(&email).await?;
 //!         To::done()
 //!     })
 //!     .name("signup-side-effects")

@@ -148,8 +148,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .activity(LookupEmail { pool: pool.clone() })
         .activity(TrackSignupMetric)
         .step(|mut cx, Signup { user_id }| async move {
-            let email: String = cx.call::<LookupEmail, _>("lookup", &user_id).await?;
-            cx.emit::<TrackSignupMetric, _>("track", &email).await?;
+            let email: String = cx.call::<LookupEmail, _>(&user_id).await?;
+            cx.emit::<TrackSignupMetric, _>(&email).await?;
             To::done()
         })
         .name("signup-side-effects")

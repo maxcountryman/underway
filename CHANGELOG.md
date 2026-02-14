@@ -2,6 +2,7 @@
 
 - Breaking: Remove `workflow::Context::tx`; step contexts no longer expose a worker transaction directly
 - Breaking: Workflow activities are now registered on `Workflow::builder()` before steps
+- Breaking: Remove manual keys from `workflow::Context::call` and `workflow::Context::emit`; activity operation identity is now derived from workflow run ID, step index, and per-step operation order
 - Add: `Runtime` high-level orchestration API sourced from builder-registered activities
 - Breaking: Remove `Workflow::run` and `Workflow::start`; use `workflow.runtime().run()` / `workflow.runtime().start()`
 - Breaking: Remove `Workflow::worker` and `Workflow::scheduler`; use `workflow.runtime().worker()` / `workflow.runtime().scheduler()`

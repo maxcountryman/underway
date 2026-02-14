@@ -267,7 +267,7 @@
 //! A `call` does **not** require user polling loops. When a call has not
 //! completed yet, it suspends the current step. The worker marks the task as
 //! waiting, and once the activity completes the step is replayed and the same
-//! call key resolves to the persisted result.
+//! operation resolves to the persisted result.
 //!
 //! ```rust
 //! use serde::{Deserialize, Serialize};
@@ -314,21 +314,22 @@
 //!     .activity(WriteAuditLog)
 //!     .step(|mut cx, Step1 { user_id }| async move {
 //!         // Fire-and-forget effect intent.
-//!         cx.emit::<WriteAuditLog, _>("audit", &user_id).await?;
+//!         cx.emit::<WriteAuditLog, _>(&user_id).await?;
 //!
 //!         // Suspends/resumes durably until completion.
-//!         let profile_id: i64 = cx.call::<CreateProfile, _>("profile", &user_id).await?;
+//!         let profile_id: i64 = cx.call::<CreateProfile, _>(&user_id).await?;
 //!         To::next(Step2 { profile_id })
 //!     })
 //!     .step(|_cx, Step2 { profile_id: _ }| async move { To::done() });
 //! ```
 //!
-//! Call keys should be stable and deterministic for a given step execution.
-//! Reusing a key with a different activity name or input is treated as
-//! non-deterministic and fails execution.
+//! Activity operation identity is derived from workflow run ID, step index, and
+//! deterministic operation order within the step. Reordering operations in
+//! in-flight workflow runs is non-deterministic and fails execution.
 //!
-//! Because [`Context::call`] requires mutable context, issuing multiple
-//! unresolved calls in parallel fails to compile. Issue calls sequentially as
+//! Because [`Context::call`] and [`Context::emit`] require mutable context,
+//! activity operations are issued sequentially within a step. Multiple
+//! unresolved calls in parallel are not supported; issue calls as
 //! `call(...).await?`.
 //!
 //! If a workflow needs direct transaction-level database semantics, implement
@@ -2585,7 +2586,7 @@ mod tests {
         let workflow = Workflow::builder()
             .activity(EchoActivity)
             .step(|mut cx, Input { message }| async move {
-                let _: String = cx.call::<EchoActivity, _>("echo-main", &message).await?;
+                let _: String = cx.call::<EchoActivity, _>(&message).await?;
                 To::done()
             })
             .name("call_suspends_and_persists_activity_intent")
@@ -2628,7 +2629,7 @@ mod tests {
             workflow.queue.name,
             *enqueued.run_id,
             0_i32,
-            "echo-main",
+            format!("activity:{}:0:0", enqueued.run_id.as_hyphenated()),
         )
         .fetch_one(&pool)
         .await?;
@@ -2647,8 +2648,8 @@ mod tests {
 
         let workflow = Workflow::builder()
             .activity(EmailActivity)
-            .step(|cx, Input { message }| async move {
-                cx.emit::<EmailActivity, _>("notify", &message).await?;
+            .step(|mut cx, Input { message }| async move {
+                cx.emit::<EmailActivity, _>(&message).await?;
                 Err(TaskError::Retryable("retry me".to_string()))
             })
             .name("emit_not_persisted_on_retryable_failure")
@@ -2691,8 +2692,8 @@ mod tests {
 
         let workflow = Workflow::builder()
             .activity(EmailActivity)
-            .step(|cx, Input { message }| async move {
-                cx.emit::<EmailActivity, _>("notify", &message).await?;
+            .step(|mut cx, Input { message }| async move {
+                cx.emit::<EmailActivity, _>(&message).await?;
                 To::done()
             })
             .name("emit_persisted_on_success")
@@ -2736,10 +2737,10 @@ mod tests {
         let workflow = Workflow::builder()
             .activity(EchoActivity)
             .step(|mut cx, Input { message }| async move {
-                let first = cx.call::<EchoActivity, _>("call-1", &message).await;
+                let first = cx.call::<EchoActivity, _>(&message).await;
                 assert!(matches!(first, Err(TaskError::Suspended(_))));
 
-                let _ = cx.call::<EchoActivity, _>("call-2", &message).await?;
+                let _ = cx.call::<EchoActivity, _>(&message).await?;
 
                 To::done()
             })

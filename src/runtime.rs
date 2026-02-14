@@ -50,7 +50,7 @@
 //!     let workflow = Workflow::builder()
 //!         .activity(LookupEmail)
 //!         .step(|mut cx, FetchUser { user_id }| async move {
-//!             let email: String = cx.call::<LookupEmail, _>("lookup", &user_id).await?;
+//!             let email: String = cx.call::<LookupEmail, _>(&user_id).await?;
 //!             println!("Got email {email}");
 //!             To::done()
 //!         })
@@ -338,7 +338,7 @@ mod tests {
         let workflow = Workflow::builder()
             .activity(EchoActivity)
             .step(|mut cx, Step1 { message }| async move {
-                let echoed: String = cx.call::<EchoActivity, _>("echo-main", &message).await?;
+                let echoed: String = cx.call::<EchoActivity, _>(&message).await?;
                 To::next(Step2 { echoed })
             })
             .step(move |_cx, Step2 { echoed }| {
@@ -377,6 +377,21 @@ mod tests {
 
         assert_eq!(outputs.lock().await.as_slice(), ["echo:hello"]);
 
+        let call_key = sqlx::query_scalar::<_, String>(
+            r#"
+            select call_key
+            from underway.activity_call
+            where task_queue_name = $1
+              and activity = $2
+            order by created_at
+            limit 1
+            "#,
+        )
+        .bind(runtime.workflow().queue().name.as_str())
+        .bind(EchoActivity::NAME)
+        .fetch_one(&pool)
+        .await?;
+
         let attempt_state = sqlx::query_scalar!(
             r#"
             select a.state as "state: CallState"
@@ -389,7 +404,7 @@ mod tests {
             limit 1
             "#,
             runtime.workflow().queue().name,
-            "echo-main",
+            call_key,
         )
         .fetch_one(&pool)
         .await?;
@@ -410,7 +425,7 @@ mod tests {
         let workflow = Workflow::builder()
             .activity(EchoActivity)
             .step(|mut cx, MessageInput { message }| async move {
-                let _: String = cx.call::<EchoActivity, _>("shared-call", &message).await?;
+                let _: String = cx.call::<EchoActivity, _>(&message).await?;
                 To::done()
             })
             .name(queue_name)
@@ -427,6 +442,21 @@ mod tests {
         let workflow_worker = workflow.runtime().worker();
         let _ = workflow_worker.process_next_task().await?;
 
+        let call_key = sqlx::query_scalar::<_, String>(
+            r#"
+            select call_key
+            from underway.activity_call
+            where task_queue_name = $1
+              and activity = $2
+            order by created_at
+            limit 1
+            "#,
+        )
+        .bind(queue_name)
+        .bind(EchoActivity::NAME)
+        .fetch_one(&pool)
+        .await?;
+
         let call_state = sqlx::query_scalar!(
             r#"
             select state as "state: CallState"
@@ -435,7 +465,7 @@ mod tests {
               and call_key = $2
             "#,
             queue_name,
-            "shared-call",
+            call_key.as_str(),
         )
         .fetch_one(&pool)
         .await?;
@@ -461,7 +491,7 @@ mod tests {
               and call_key = $2
             "#,
             queue_name,
-            "shared-call",
+            call_key.as_str(),
         )
         .fetch_one(&pool)
         .await?;
@@ -481,7 +511,7 @@ mod tests {
         let workflow = Workflow::builder()
             .activity(EchoActivity)
             .step(|mut cx, Step1 { message }| async move {
-                let echoed: String = cx.call::<EchoActivity, _>("echo-main", &message).await?;
+                let echoed: String = cx.call::<EchoActivity, _>(&message).await?;
                 To::next(Step2 { echoed })
             })
             .step(move |_cx, Step2 { echoed }| {
@@ -505,6 +535,21 @@ mod tests {
         let workflow_worker = workflow.runtime().worker();
         let _ = workflow_worker.process_next_task().await?;
 
+        let call_key = sqlx::query_scalar::<_, String>(
+            r#"
+            select call_key
+            from underway.activity_call
+            where task_queue_name = $1
+              and activity = $2
+            order by created_at
+            limit 1
+            "#,
+        )
+        .bind(workflow.queue().name.as_str())
+        .bind(EchoActivity::NAME)
+        .fetch_one(&pool)
+        .await?;
+
         let call_id = sqlx::query_scalar!(
             r#"
             select id
@@ -514,7 +559,7 @@ mod tests {
             limit 1
             "#,
             workflow.queue().name,
-            "echo-main",
+            call_key,
         )
         .fetch_one(&pool)
         .await?;
