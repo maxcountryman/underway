@@ -17,7 +17,7 @@
 //! ```rust,no_run
 //! use serde::{Deserialize, Serialize};
 //! use sqlx::PgPool;
-//! use underway::{Activity, ActivityError, Transition, Workflow};
+//! use underway::{Activity, ActivityError, InvokeActivity, Transition, Workflow};
 //!
 //! #[derive(Deserialize, Serialize)]
 //! struct FetchUser {
@@ -50,7 +50,7 @@
 //!     let workflow = Workflow::builder()
 //!         .activity(LookupEmail)
 //!         .step(|mut cx, FetchUser { user_id }| async move {
-//!             let email: String = cx.call::<LookupEmail, _>(&user_id).await?;
+//!             let email: String = LookupEmail::call(&mut cx, &user_id).await?;
 //!             println!("Got email {email}");
 //!             Transition::complete()
 //!         })
@@ -284,6 +284,7 @@ mod tests {
     use super::Runtime;
     use crate::{
         activity::{Activity, CallState, Result as ActivityResult},
+        workflow::InvokeActivity,
         Transition, Workflow,
     };
 
@@ -338,7 +339,7 @@ mod tests {
         let workflow = Workflow::builder()
             .activity(EchoActivity)
             .step(|mut cx, Step1 { message }| async move {
-                let echoed: String = cx.call::<EchoActivity, _>(&message).await?;
+                let echoed: String = EchoActivity::call(&mut cx, &message).await?;
                 Transition::next(Step2 { echoed })
             })
             .step(move |_cx, Step2 { echoed }| {
@@ -425,7 +426,7 @@ mod tests {
         let workflow = Workflow::builder()
             .activity(EchoActivity)
             .step(|mut cx, MessageInput { message }| async move {
-                let _: String = cx.call::<EchoActivity, _>(&message).await?;
+                let _: String = EchoActivity::call(&mut cx, &message).await?;
                 Transition::complete()
             })
             .name(queue_name)
@@ -511,7 +512,7 @@ mod tests {
         let workflow = Workflow::builder()
             .activity(EchoActivity)
             .step(|mut cx, Step1 { message }| async move {
-                let echoed: String = cx.call::<EchoActivity, _>(&message).await?;
+                let echoed: String = EchoActivity::call(&mut cx, &message).await?;
                 Transition::next(Step2 { echoed })
             })
             .step(move |_cx, Step2 { echoed }| {
