@@ -18,9 +18,9 @@
 //!   layer; queue coordination and task claiming happen in PostgreSQL.
 //! - **Model Business Flows in Typed Rust** Build multi-step workflows with
 //!   compile-time checked step inputs, outputs, and transitions.
-//! - **Make Side Effects Durable and Replay-Safe** `Context::call` and
-//!   `Context::emit` persist side-effect intent, and registered activities are
-//!   compile-time checked.
+//! - **Make Side Effects Durable and Replay-Safe** `InvokeActivity::call` and
+//!   `InvokeActivity::emit` persist side-effect intent, and registered
+//!   activities are compile-time checked.
 //! - **Operate with Production Controls** Transactional `*_using` APIs,
 //!   retries, cron scheduling, heartbeats, and fencing support reliable
 //!   high-concurrency execution.
@@ -74,8 +74,7 @@
 //!
 //! For durable side effects beyond plain step chaining, workflows can invoke
 //! activities through
-//! [`workflow::Context::call`](crate::workflow::Context::call)
-//! and [`workflow::Context::emit`](crate::workflow::Context::emit).
+//! [`workflow::InvokeActivity`](crate::workflow::InvokeActivity).
 //!
 //! - `call` is request/response and may suspend a step until the activity
 //!   completes.
@@ -88,7 +87,7 @@
 //! ```rust,no_run
 //! use serde::{Deserialize, Serialize};
 //! use sqlx::PgPool;
-//! use underway::{Activity, ActivityError, Transition, Workflow};
+//! use underway::{Activity, ActivityError, InvokeActivity, Transition, Workflow};
 //!
 //! #[derive(Deserialize, Serialize)]
 //! struct Input {
@@ -123,7 +122,7 @@
 //! let workflow = Workflow::builder()
 //!     .activity(ResolveEmail)
 //!     .step(|mut cx, Input { user_id }| async move {
-//!         let _email: String = cx.call::<ResolveEmail, _>(&user_id).await?;
+//!         let _email: String = ResolveEmail::call(&mut cx, &user_id).await?;
 //!         Transition::complete()
 //!     })
 //!     .name("resolve-email")
@@ -193,7 +192,7 @@
 //! ```rust,no_run
 //! use serde::{Deserialize, Serialize};
 //! use sqlx::PgPool;
-//! use underway::{Activity, ActivityError, Transition, Workflow};
+//! use underway::{Activity, ActivityError, InvokeActivity, Transition, Workflow};
 //!
 //! #[derive(Clone)]
 //! struct LookupEmail {
@@ -248,8 +247,8 @@
 //!     .activity(LookupEmail { pool: pool.clone() })
 //!     .activity(TrackSignupMetric)
 //!     .step(|mut cx, Signup { user_id }| async move {
-//!         let email: String = cx.call::<LookupEmail, _>(&user_id).await?;
-//!         cx.emit::<TrackSignupMetric, _>(&email).await?;
+//!         let email: String = LookupEmail::call(&mut cx, &user_id).await?;
+//!         TrackSignupMetric::emit(&mut cx, &email).await?;
 //!         Transition::complete()
 //!     })
 //!     .name("signup-side-effects")
@@ -358,8 +357,8 @@
 //! ## Activities
 //!
 //! Activities are durable side-effect handlers invoked from workflow steps
-//! through [`workflow::Context::call`](crate::workflow::Context::call) and
-//! [`workflow::Context::emit`](crate::workflow::Context::emit).
+//! through [`workflow::InvokeActivity::call`](crate::workflow::InvokeActivity::call)
+//! and [`workflow::InvokeActivity::emit`](crate::workflow::InvokeActivity::emit).
 //!
 //! See [`activity`] for more details about activity handlers and errors.
 //!
@@ -388,7 +387,7 @@ pub use crate::{
     scheduler::{Scheduler, ZonedSchedule},
     task::{Task, ToTaskResult},
     worker::Worker,
-    workflow::{Transition, Workflow},
+    workflow::{InvokeActivity, Transition, Workflow},
 };
 
 pub mod activity;

@@ -2,12 +2,12 @@
 
 - Breaking: Remove `workflow::Context::tx`; step contexts no longer expose a worker transaction directly
 - Breaking: Workflow activities are now registered on `Workflow::builder()` before steps
-- Breaking: Remove manual keys from `workflow::Context::call` and `workflow::Context::emit`; activity operation identity is now derived from workflow run ID, step index, and per-step operation order
+- Breaking: Remove manual activity keys; operation identity is now derived from workflow run ID, step index, and per-step operation order
 - Add: `Runtime` high-level orchestration API sourced from builder-registered activities
 - Breaking: Remove `Workflow::run` and `Workflow::start`; use `workflow.runtime().run()` / `workflow.runtime().start()`
 - Breaking: Remove `Workflow::worker` and `Workflow::scheduler`; use `workflow.runtime().worker()` / `workflow.runtime().scheduler()`
 - Add: `Activity` trait and standard activity error envelope
-- Add: Durable typed `Context::call::<A, _>` and `Context::emit::<A, _>` primitives with compile-time registration checks
+- Add: Durable typed `workflow::InvokeActivity` helpers (`A::call` / `A::emit`) with compile-time registration checks
 - Add: `waiting` task state to support workflow suspension while activity calls complete
 - Breaking: Rename `enqueue_multi` to `enqueue_many` and return task IDs for batch enqueue
 - Perf: Optimize `enqueue_many` for uniform-config batches

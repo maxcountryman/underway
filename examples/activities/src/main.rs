@@ -6,7 +6,7 @@ use tokio::{
     sync::Mutex,
     time::{sleep, timeout},
 };
-use underway::{Activity, ActivityError, Transition, Workflow};
+use underway::{Activity, ActivityError, InvokeActivity, Transition, Workflow};
 
 #[derive(Clone)]
 struct LookupEmail {
@@ -20,11 +20,12 @@ impl Activity for LookupEmail {
     type Output = String;
 
     async fn execute(&self, user_id: Self::Input) -> underway::activity::Result<Self::Output> {
-        let email = sqlx::query_scalar::<_, String>("select concat('user-', $1::text, '@example.com')")
-            .bind(user_id)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|err| ActivityError::retryable("db_query_failed", err.to_string()))?;
+        let email =
+            sqlx::query_scalar::<_, String>("select concat('user-', $1::text, '@example.com')")
+                .bind(user_id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|err| ActivityError::retryable("db_query_failed", err.to_string()))?;
 
         Ok(email)
     }
@@ -71,8 +72,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let resolved_emails = cx.state.resolved_emails.clone();
 
             async move {
-                let email: String = cx.call::<LookupEmail, _>(&user_id).await?;
-                cx.emit::<TrackSignupMetric, _>(&email).await?;
+                let email: String = LookupEmail::call(&mut cx, &user_id).await?;
+                TrackSignupMetric::emit(&mut cx, &email).await?;
                 resolved_emails.lock().await.push(email);
                 Transition::complete()
             }

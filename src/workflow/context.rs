@@ -182,7 +182,7 @@ impl<S, Set> Context<S, Set> {
     ///
     /// This method takes `&mut self` so emit/call operation ordering remains
     /// deterministic within a step.
-    pub async fn emit<A, Idx>(&mut self, input: &A::Input) -> TaskResult<()>
+    pub(crate) async fn emit_indexed<A, Idx>(&mut self, input: &A::Input) -> TaskResult<()>
     where
         A: Activity,
         Set: Contains<A, Idx>,
@@ -207,7 +207,7 @@ impl<S, Set> Context<S, Set> {
     ///
     /// This method takes `&mut self`, which enforces sequential activity
     /// operation issuance within a step at compile time.
-    pub async fn call<A, Idx>(&mut self, input: &A::Input) -> TaskResult<A::Output>
+    pub(crate) async fn call_indexed<A, Idx>(&mut self, input: &A::Input) -> TaskResult<A::Output>
     where
         A: Activity,
         Set: Contains<A, Idx>,
@@ -314,5 +314,48 @@ impl<S, Set> Context<S, Set> {
         }
 
         Ok(())
+    }
+}
+
+/// Activity invocation helpers implemented on activity contracts.
+///
+/// This trait provides ergonomic invocation methods while preserving
+/// compile-time checks that the activity was registered on the workflow
+/// builder.
+#[allow(async_fn_in_trait)]
+pub trait InvokeActivity: Activity + Sized {
+    /// Emits a durable fire-and-forget activity call.
+    async fn emit<S, Set, Idx>(cx: &mut Context<S, Set>, input: &Self::Input) -> TaskResult<()>
+    where
+        Set: Contains<Self, Idx>;
+
+    /// Calls an activity and waits for its durable result.
+    async fn call<S, Set, Idx>(
+        cx: &mut Context<S, Set>,
+        input: &Self::Input,
+    ) -> TaskResult<Self::Output>
+    where
+        Set: Contains<Self, Idx>;
+}
+
+impl<A> InvokeActivity for A
+where
+    A: Activity,
+{
+    async fn emit<S, Set, Idx>(cx: &mut Context<S, Set>, input: &Self::Input) -> TaskResult<()>
+    where
+        Set: Contains<Self, Idx>,
+    {
+        cx.emit_indexed::<Self, Idx>(input).await
+    }
+
+    async fn call<S, Set, Idx>(
+        cx: &mut Context<S, Set>,
+        input: &Self::Input,
+    ) -> TaskResult<Self::Output>
+    where
+        Set: Contains<Self, Idx>,
+    {
+        cx.call_indexed::<Self, Idx>(input).await
     }
 }

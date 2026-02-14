@@ -41,9 +41,9 @@
 //! Notice that the first argument to our function is [a context
 //! binding](crate::workflow::Context). This provides access to fields like
 //! [`state`](crate::workflow::Context::state) and
-//! [`workflow_run_id`](crate::workflow::Context::workflow_run_id), as well as
-//! workflow helpers like [`call`](crate::workflow::Context::call) and
-//! [`emit`](crate::workflow::Context::emit).
+//! [`workflow_run_id`](crate::workflow::Context::workflow_run_id).
+//! Durable activity invocation helpers are provided on activity contracts via
+//! [`workflow::InvokeActivity`](crate::workflow::InvokeActivity).
 //! Activity calls are type-checked against handlers registered on
 //! [`workflow::Builder::activity`](crate::workflow::Builder::activity).
 //!
@@ -259,9 +259,11 @@
 //! Workflow steps do not expose a raw database transaction directly.
 //! Use durable activity helpers for side effects instead.
 //!
-//! Instead, durable side effects are modeled with workflow helpers:
-//! - [`Context::emit`] for fire-and-forget intents, and
-//! - [`Context::call`] for request/response effects.
+//! Instead, durable side effects are modeled with activity invocation helpers:
+//! - [`workflow::InvokeActivity::emit`](crate::workflow::InvokeActivity::emit)
+//!   for fire-and-forget intents, and
+//! - [`workflow::InvokeActivity::call`](crate::workflow::InvokeActivity::call)
+//!   for request/response effects.
 //!
 //! Activities must be registered on the workflow builder before any step that
 //! calls or emits them. Missing registrations fail at compile time.
@@ -273,7 +275,7 @@
 //!
 //! ```rust
 //! use serde::{Deserialize, Serialize};
-//! use underway::{Activity, Transition, Workflow};
+//! use underway::{Activity, InvokeActivity, Transition, Workflow};
 //!
 //! #[derive(Serialize, Deserialize)]
 //! struct Step1 {
@@ -316,10 +318,10 @@
 //!     .activity(WriteAuditLog)
 //!     .step(|mut cx, Step1 { user_id }| async move {
 //!         // Fire-and-forget effect intent.
-//!         cx.emit::<WriteAuditLog, _>(&user_id).await?;
+//!         WriteAuditLog::emit(&mut cx, &user_id).await?;
 //!
 //!         // Suspends/resumes durably until completion.
-//!         let profile_id: i64 = cx.call::<CreateProfile, _>(&user_id).await?;
+//!         let profile_id: i64 = CreateProfile::call(&mut cx, &user_id).await?;
 //!         Transition::next(Step2 { profile_id })
 //!     })
 //!     .step(|_cx, Step2 { profile_id: _ }| async move { Transition::complete() });
@@ -329,10 +331,10 @@
 //! deterministic operation order within the step. Reordering operations in
 //! in-flight workflow runs is non-deterministic and fails execution.
 //!
-//! Because [`Context::call`] and [`Context::emit`] require mutable context,
+//! Because activity invocation helpers require mutable context,
 //! activity operations are issued sequentially within a step. Multiple
 //! unresolved calls in parallel are not supported; issue calls as
-//! `call(...).await?`.
+//! `MyActivity::call(&mut cx, ...).await?`.
 //!
 //! If a workflow needs direct transaction-level database semantics, implement
 //! [`Task`] directly and use its `execute` method, which receives
@@ -710,8 +712,8 @@ use std::{
 
 pub use builder::Builder;
 use builder::Initial;
-pub use context::Context;
 use context::{ActivityCallBuffer, ActivityCallRecord, CallSequenceState, ContextParts};
+pub use context::{Context, InvokeActivity};
 use jiff::Span;
 use sealed::{WorkflowScheduleTemplate, WorkflowState};
 use serde::{Deserialize, Serialize};
@@ -2591,7 +2593,7 @@ mod tests {
         let workflow = Workflow::builder()
             .activity(EchoActivity)
             .step(|mut cx, Input { message }| async move {
-                let _: String = cx.call::<EchoActivity, _>(&message).await?;
+                let _: String = EchoActivity::call(&mut cx, &message).await?;
                 Transition::complete()
             })
             .name("call_suspends_and_persists_activity_intent")
@@ -2654,7 +2656,7 @@ mod tests {
         let workflow = Workflow::builder()
             .activity(EmailActivity)
             .step(|mut cx, Input { message }| async move {
-                cx.emit::<EmailActivity, _>(&message).await?;
+                EmailActivity::emit(&mut cx, &message).await?;
                 Err(TaskError::Retryable("retry me".to_string()))
             })
             .name("emit_not_persisted_on_retryable_failure")
@@ -2698,7 +2700,7 @@ mod tests {
         let workflow = Workflow::builder()
             .activity(EmailActivity)
             .step(|mut cx, Input { message }| async move {
-                cx.emit::<EmailActivity, _>(&message).await?;
+                EmailActivity::emit(&mut cx, &message).await?;
                 Transition::complete()
             })
             .name("emit_persisted_on_success")
@@ -2742,10 +2744,10 @@ mod tests {
         let workflow = Workflow::builder()
             .activity(EchoActivity)
             .step(|mut cx, Input { message }| async move {
-                let first = cx.call::<EchoActivity, _>(&message).await;
+                let first = EchoActivity::call(&mut cx, &message).await;
                 assert!(matches!(first, Err(TaskError::Suspended(_))));
 
-                let _ = cx.call::<EchoActivity, _>(&message).await?;
+                let _ = EchoActivity::call(&mut cx, &message).await?;
 
                 Transition::complete()
             })
