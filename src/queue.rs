@@ -898,7 +898,7 @@ impl<T: Task> Queue<T> {
                     completed_at = now(),
                     error_message = coalesce(
                         ta.error_message,
-                        'Task heartbeat became stale and retry policy was exhausted.'
+                        'Task lease expired and retry policy was exhausted.'
                     )
                 from stale_exhausted se
                 where ta.task_queue_name = $1
@@ -1074,77 +1074,58 @@ impl<T: Task> Queue<T> {
                   id
                 limit 1
                 for update skip locked
-            )
-            update underway.task t
-            set state = $3,
-                run_at = now(),
-                last_attempt_at = now(),
-                last_heartbeat_at = now(),
-                attempt_count = t.attempt_count + 1,
-                current_attempt = t.attempt_count + 1,
-                lease_expires_at = now() + t.heartbeat
-            from available_task
-            where t.task_queue_name = $1
-              and t.id = available_task.id
-            returning
-                t.id as "id: TaskId",
-                t.task_queue_name as "queue_name",
-                t.input,
-                t.timeout,
-                t.heartbeat,
-                t.retry_policy as "retry_policy: RetryPolicy",
-                t.concurrency_key,
-                t.current_attempt as "attempt_number!"
-            "#,
-            self.name,
-            TaskState::Pending as TaskState,
-            TaskState::InProgress as TaskState,
-        )
-        .fetch_optional(&mut **tx)
-        .await?;
-
-        let in_progress_task = if let Some(in_progress_task) = in_progress_task {
-            let task_id = in_progress_task.id;
-            tracing::Span::current().record("task.id", task_id.as_hyphenated().to_string());
-
-            // Update previous in-progress task attempts to mark them as failed.
-            // If this claim is reclaiming stale work, close the previous in-progress
-            // attempt.
-            if in_progress_task.attempt_number > 1 {
-                sqlx::query!(
-                    r#"
-                    update underway.task_attempt
-                    set state = $3,
-                        updated_at = now(),
-                        completed_at = now(),
-                        error_message = coalesce(
-                            error_message,
-                            'Task lease expired and was reclaimed by another worker.'
-                        )
-                    where task_id = $1
-                      and task_queue_name = $2
-                      and attempt_number = $4
-                      and state = $5
-                    "#,
-                    task_id as TaskId,
-                    self.name,
-                    TaskState::Failed as TaskState,
-                    in_progress_task.attempt_number - 1,
-                    TaskState::InProgress as TaskState,
-                )
-                .execute(&mut **tx)
-                .await?;
-            }
-
-            sqlx::query!(
-                r#"
+            ),
+            claimed as (
+                update underway.task t
+                set state = $3,
+                    run_at = now(),
+                    last_attempt_at = now(),
+                    last_heartbeat_at = now(),
+                    attempt_count = t.attempt_count + 1,
+                    current_attempt = t.attempt_count + 1,
+                    lease_expires_at = now() + t.heartbeat
+                from available_task
+                where t.task_queue_name = $1
+                  and t.id = available_task.id
+                returning
+                    t.id,
+                    t.task_queue_name,
+                    t.input,
+                    t.timeout,
+                    t.heartbeat,
+                    t.retry_policy,
+                    t.concurrency_key,
+                    t.current_attempt
+            ),
+            finalized_previous_attempt as (
+                update underway.task_attempt ta
+                set state = $4,
+                    updated_at = now(),
+                    completed_at = now(),
+                    error_message = coalesce(
+                        ta.error_message,
+                        'Task lease expired and was reclaimed by another worker.'
+                    )
+                from claimed c
+                where c.current_attempt > 1
+                  and ta.task_id = c.id
+                  and ta.task_queue_name = c.task_queue_name
+                  and ta.attempt_number = c.current_attempt - 1
+                  and ta.state = $3
+            ),
+            upsert_current_attempt as (
                 insert into underway.task_attempt (
                     task_id,
                     task_queue_name,
                     state,
                     attempt_number
                 )
-                values ($1, $2, $3, $4)
+                select
+                    c.id,
+                    c.task_queue_name,
+                    $3,
+                    c.current_attempt
+                from claimed c
                 on conflict (task_queue_name, task_id, attempt_number)
                 do update
                 set state = excluded.state,
@@ -1152,19 +1133,29 @@ impl<T: Task> Queue<T> {
                     started_at = now(),
                     updated_at = now(),
                     completed_at = null
-                "#,
-                task_id as TaskId,
-                self.name,
-                TaskState::InProgress as TaskState,
-                in_progress_task.attempt_number,
             )
-            .execute(&mut **tx)
-            .await?;
+            select
+                c.id as "id: TaskId",
+                c.task_queue_name as "queue_name",
+                c.input,
+                c.timeout,
+                c.heartbeat,
+                c.retry_policy as "retry_policy: RetryPolicy",
+                c.concurrency_key,
+                c.current_attempt as "attempt_number!"
+            from claimed c
+            "#,
+            self.name,
+            TaskState::Pending as TaskState,
+            TaskState::InProgress as TaskState,
+            TaskState::Failed as TaskState,
+        )
+        .fetch_optional(&mut **tx)
+        .await?;
 
-            Some(in_progress_task)
-        } else {
-            None
-        };
+        if let Some(task) = &in_progress_task {
+            tracing::Span::current().record("task.id", task.id.as_hyphenated().to_string());
+        }
 
         Ok(in_progress_task)
     }
@@ -2189,24 +2180,6 @@ pub(crate) fn shutdown_channel() -> &'static str {
     SHUTDOWN_CHANNEL.get_or_init(|| format!("underway_shutdown_{}", Uuid::new_v4()))
 }
 
-/// Helper function to connect a PostgreSQL listener with retry logic.
-///
-/// This function attempts to establish a connection to a PostgreSQL listener
-/// and subscribe to the specified channel. If the connection or subscription
-/// fails, it will log the error and return None, allowing the caller to
-/// handle the retry logic (including backoff delays).
-///
-/// Returns `Some(listener)` on success, or `None` if connection/subscription
-/// fails.
-pub(crate) async fn try_connect_listener(
-    pool: &PgPool,
-    channel: &str,
-) -> std::result::Result<sqlx::postgres::PgListener, sqlx::Error> {
-    let mut listener = sqlx::postgres::PgListener::connect_with(pool).await?;
-    listener.listen(channel).await?;
-    Ok(listener)
-}
-
 /// Retry an operation with exponential backoff.
 ///
 /// This function encapsulates the retry logic with exponential backoff,
@@ -2249,40 +2222,6 @@ where
             }
         }
     }
-}
-
-/// Connect multiple PostgreSQL listeners with retry logic.
-///
-/// This function attempts to establish connections to multiple PostgreSQL
-/// listeners with exponential backoff retry logic. All listeners must connect
-/// successfully or the entire operation will be retried.
-///
-/// # Arguments
-///
-/// * `pool` - The PostgreSQL connection pool
-/// * `channels` - Slice of channel names to listen on
-/// * `backoff_policy` - The retry policy defining backoff behavior
-///
-/// # Returns
-///
-/// A vector of connected listeners in the same order as the input channels.
-pub(crate) async fn connect_listeners_with_retry(
-    pool: &PgPool,
-    channels: &[&str],
-    backoff_policy: &RetryPolicy,
-) -> std::result::Result<Vec<sqlx::postgres::PgListener>, Error> {
-    retry_with_backoff(
-        backoff_policy,
-        |_| async {
-            let mut listeners = Vec::new();
-            for channel in channels {
-                listeners.push(try_connect_listener(pool, channel).await?);
-            }
-            Ok(listeners)
-        },
-        "connect PostgreSQL listeners",
-    )
-    .await
 }
 
 /// Connect a single PostgreSQL listener subscribed to multiple channels.

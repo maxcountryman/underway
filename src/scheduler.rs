@@ -9,7 +9,7 @@ use tracing::instrument;
 
 use crate::{
     queue::{
-        connect_listeners_with_retry, shutdown_channel, try_acquire_advisory_lock,
+        connect_listener_with_retry, shutdown_channel, try_acquire_advisory_lock,
         Error as QueueError,
     },
     task::{RetryCount, RetryPolicy},
@@ -361,11 +361,9 @@ impl<T: Task> Scheduler<T> {
 
             // Set up a listener for shutdown notifications
             let chan = shutdown_channel();
-            let mut listeners =
-                connect_listeners_with_retry(&self.queue.pool, &[chan], &self.reconnect_backoff)
+            let mut shutdown_listener =
+                connect_listener_with_retry(&self.queue.pool, &[chan], &self.reconnect_backoff)
                     .await?;
-
-            let mut shutdown_listener = listeners.remove(0);
 
             tracing::info!("Scheduler PostgreSQL listener connected successfully");
             retry_count = 1;

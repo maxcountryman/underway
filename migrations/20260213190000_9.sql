@@ -6,7 +6,6 @@ alter table underway.task
     add column if not exists run_at timestamp with time zone not null default now(),
     add column if not exists attempt_count integer not null default 0,
     add column if not exists current_attempt integer not null default 0,
-    add column if not exists lease_token uuid,
     add column if not exists lease_expires_at timestamp with time zone;
 
 -- Populate run_at from existing delay semantics.
@@ -50,7 +49,6 @@ where state = 'in_progress'::underway.task_state;
 alter table underway.activity_call
     add column if not exists timeout_ms integer not null default 900000,
     add column if not exists max_attempts integer not null default 5,
-    add column if not exists lease_token uuid,
     add column if not exists lease_expires_at timestamp with time zone;
 
 update underway.activity_call

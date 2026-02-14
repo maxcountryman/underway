@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::{
     activity::{self, Activity},
-    queue::connect_listeners_with_retry,
+    queue::connect_listener_with_retry,
     task::RetryPolicy,
 };
 
@@ -165,14 +165,12 @@ impl ActivityWorker {
         let mut polling_interval = tokio::time::interval(period.try_into()?);
 
         'reconnect: loop {
-            let mut listeners = connect_listeners_with_retry(
+            let mut activity_change_listener = connect_listener_with_retry(
                 &self.pool,
                 &["activity_call_change"],
                 &RetryPolicy::default(),
             )
             .await?;
-
-            let mut activity_change_listener = listeners.remove(0);
 
             tracing::info!("Activity call listener connected successfully");
 
@@ -215,7 +213,7 @@ impl ActivityWorker {
     }
 
     async fn process_next_call(&self) -> Result<Option<Uuid>> {
-        let activities = self.activity_claim_specs()?;
+        let activities = self.activity_claim_specs();
 
         let mut tx = self.pool.begin().await?;
         let call = self.claim_next_call(&mut tx, &activities).await?;
@@ -335,8 +333,7 @@ impl ActivityWorker {
                       updated_at = now(),
                       completed_at = null
                 returning
-                    activity_call_id,
-                    attempt_number
+                    activity_call_id
             )
             select
                 claimed.id,
@@ -347,7 +344,7 @@ impl ActivityWorker {
                 claimed.activity,
                 claimed.input,
                 claimed.attempt_count,
-                attempt.attempt_number
+                claimed.attempt_count as "attempt_number!"
             from claimed
             inner join attempt
               on attempt.activity_call_id = claimed.id
@@ -362,12 +359,12 @@ impl ActivityWorker {
         Ok(call)
     }
 
-    fn activity_claim_specs(&self) -> Result<Vec<String>> {
+    fn activity_claim_specs(&self) -> Vec<String> {
         let mut activities = self.registry.handlers.keys().cloned().collect::<Vec<_>>();
 
         activities.sort();
 
-        Ok(activities)
+        activities
     }
 
     async fn mark_succeeded(&self, call: &ClaimedCall, output: Value) -> Result {
@@ -537,7 +534,6 @@ impl ActivityWorker {
             r#"
             update underway.task
             set state = 'pending'::underway.task_state,
-                delay = interval '0',
                 run_at = now(),
                 lease_expires_at = null,
                 updated_at = now()
