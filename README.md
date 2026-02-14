@@ -32,9 +32,9 @@ Key Features:
   queue coordination and task claiming happen in PostgreSQL.
 - **Model Business Flows in Typed Rust** Build multi-step workflows with
   compile-time checked step inputs, outputs, and transitions.
-- **Make Side Effects Durable and Replay-Safe** `Context::call` and
-  `Context::emit` persist side-effect intent, and registered activities are
-  compile-time checked.
+- **Make Side Effects Durable and Replay-Safe** `InvokeActivity::call` and
+  `InvokeActivity::emit` persist side-effect intent, and registered activities
+  are compile-time checked.
 - **Operate with Production Controls** Transactional `*_using` APIs, retries,
   cron scheduling, heartbeats, and fencing support reliable high-concurrency
   execution.
@@ -96,7 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```rust
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use underway::{Activity, ActivityError, Transition, Workflow};
+use underway::{Activity, ActivityError, InvokeActivity, Transition, Workflow};
 
 #[derive(Clone)]
 struct LookupEmail {
@@ -148,8 +148,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .activity(LookupEmail { pool: pool.clone() })
         .activity(TrackSignupMetric)
         .step(|mut cx, Signup { user_id }| async move {
-            let email: String = cx.call::<LookupEmail, _>(&user_id).await?;
-            cx.emit::<TrackSignupMetric, _>(&email).await?;
+            let email: String = LookupEmail::call(&mut cx, &user_id).await?;
+            TrackSignupMetric::emit(&mut cx, &email).await?;
             Transition::complete()
         })
         .name("signup-side-effects")
