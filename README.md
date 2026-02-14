@@ -52,7 +52,7 @@ Underway supports a few common patterns out of the box:
 ```rust
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use underway::{To, Workflow};
+use underway::{Transition, Workflow};
 
 #[derive(Deserialize, Serialize)]
 struct ResizeImage {
@@ -72,11 +72,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let workflow = Workflow::builder()
         .step(|_cx, ResizeImage { asset_id }| async move {
             let object_key = format!("images/{asset_id}.webp");
-            To::next(PublishImage { object_key })
+            Transition::next(PublishImage { object_key })
         })
         .step(|_cx, PublishImage { object_key }| async move {
             println!("Publishing {object_key}");
-            To::done()
+            Transition::complete()
         })
         .name("image-pipeline")
         .pool(pool)
@@ -96,7 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```rust
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use underway::{Activity, ActivityError, To, Workflow};
+use underway::{Activity, ActivityError, Transition, Workflow};
 
 #[derive(Clone)]
 struct LookupEmail {
@@ -150,7 +150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .step(|mut cx, Signup { user_id }| async move {
             let email: String = cx.call::<LookupEmail, _>(&user_id).await?;
             cx.emit::<TrackSignupMetric, _>(&email).await?;
-            To::done()
+            Transition::complete()
         })
         .name("signup-side-effects")
         .pool(pool)
@@ -168,7 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```rust
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use underway::{To, Workflow};
+use underway::{Transition, Workflow};
 
 #[derive(Deserialize, Serialize)]
 struct TenantCleanup {
@@ -183,7 +183,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let workflow = Workflow::builder()
         .step(|_cx, TenantCleanup { tenant_id }| async move {
             println!("Running cleanup for tenant {tenant_id}");
-            To::done()
+            Transition::complete()
         })
         .name("tenant-cleanup")
         .pool(pool.clone())

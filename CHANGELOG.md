@@ -17,6 +17,7 @@
 - Fix: Workflow step configuration now uses the step index from input to avoid cross-run drift
 - Add: Workflow steps can configure task timeouts, TTLs, delays, heartbeats, concurrency keys, and priorities
 - Add: Workflow batch enqueue helpers (`enqueue_many`, `enqueue_many_using`)
+- Breaking: Rename workflow step transition type `To` to `Transition`, including helper constructors `done` -> `complete` and `delay_for` -> `after`
 
 # 0.2.0
 

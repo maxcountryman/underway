@@ -17,7 +17,7 @@
 //! ```rust,no_run
 //! use serde::{Deserialize, Serialize};
 //! use sqlx::PgPool;
-//! use underway::{Activity, ActivityError, To, Workflow};
+//! use underway::{Activity, ActivityError, Transition, Workflow};
 //!
 //! #[derive(Deserialize, Serialize)]
 //! struct FetchUser {
@@ -52,7 +52,7 @@
 //!         .step(|mut cx, FetchUser { user_id }| async move {
 //!             let email: String = cx.call::<LookupEmail, _>(&user_id).await?;
 //!             println!("Got email {email}");
-//!             To::done()
+//!             Transition::complete()
 //!         })
 //!         .name("lookup-email-workflow")
 //!         .pool(pool)
@@ -284,7 +284,7 @@ mod tests {
     use super::Runtime;
     use crate::{
         activity::{Activity, CallState, Result as ActivityResult},
-        To, Workflow,
+        Transition, Workflow,
     };
 
     struct EchoActivity;
@@ -339,13 +339,13 @@ mod tests {
             .activity(EchoActivity)
             .step(|mut cx, Step1 { message }| async move {
                 let echoed: String = cx.call::<EchoActivity, _>(&message).await?;
-                To::next(Step2 { echoed })
+                Transition::next(Step2 { echoed })
             })
             .step(move |_cx, Step2 { echoed }| {
                 let outputs_step = outputs_step.clone();
                 async move {
                     outputs_step.lock().await.push(echoed);
-                    To::done()
+                    Transition::complete()
                 }
             })
             .name("runtime_call_suspends_then_resumes")
@@ -426,7 +426,7 @@ mod tests {
             .activity(EchoActivity)
             .step(|mut cx, MessageInput { message }| async move {
                 let _: String = cx.call::<EchoActivity, _>(&message).await?;
-                To::done()
+                Transition::complete()
             })
             .name(queue_name)
             .pool(pool.clone())
@@ -473,7 +473,7 @@ mod tests {
 
         let unrelated_workflow = Workflow::builder()
             .activity(ReverseActivity)
-            .step(|_cx, _: MessageInput| async move { To::done() })
+            .step(|_cx, _: MessageInput| async move { Transition::complete() })
             .name(queue_name)
             .pool(pool.clone())
             .build()
@@ -512,13 +512,13 @@ mod tests {
             .activity(EchoActivity)
             .step(|mut cx, Step1 { message }| async move {
                 let echoed: String = cx.call::<EchoActivity, _>(&message).await?;
-                To::next(Step2 { echoed })
+                Transition::next(Step2 { echoed })
             })
             .step(move |_cx, Step2 { echoed }| {
                 let outputs_step = outputs_step.clone();
                 async move {
                     outputs_step.lock().await.push(echoed);
-                    To::done()
+                    Transition::complete()
                 }
             })
             .name("runtime_reclaims_stale_in_progress_activity_calls")

@@ -6,7 +6,7 @@ use tokio::{
     sync::Mutex,
     time::{sleep, timeout},
 };
-use underway::{Activity, ActivityError, To, Workflow};
+use underway::{Activity, ActivityError, Transition, Workflow};
 
 #[derive(Clone)]
 struct LookupEmail {
@@ -74,7 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let email: String = cx.call::<LookupEmail, _>(&user_id).await?;
                 cx.emit::<TrackSignupMetric, _>(&email).await?;
                 resolved_emails.lock().await.push(email);
-                To::done()
+                Transition::complete()
             }
         })
         .name("example-activities-workflow")

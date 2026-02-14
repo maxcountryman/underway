@@ -171,13 +171,13 @@ pub enum Error {
 ///
 ///```rust
 /// use tokio::net;
-/// use underway::{To, ToTaskResult, Workflow};
+/// use underway::{ToTaskResult, Transition, Workflow};
 ///
 /// Workflow::<(), ()>::builder().step(|_, _| async {
 ///     // If we can't resolve DNS the issue may be transient and recoverable.
 ///     net::lookup_host("example.com:80").await.retryable()?;
 ///
-///     To::done()
+///     Transition::complete()
 /// });
 /// ```
 ///
@@ -186,13 +186,13 @@ pub enum Error {
 /// ```rust
 /// use std::env;
 ///
-/// use underway::{To, ToTaskResult, Workflow};
+/// use underway::{ToTaskResult, Transition, Workflow};
 ///
 /// Workflow::<(), ()>::builder().step(|_, _| async {
 ///     // If the API_KEY environment variable isn't set we can't recover.
 ///     let api_key = env::var("API_KEY").fatal()?;
 ///
-///     To::done()
+///     Transition::complete()
 /// });
 /// ```
 pub trait ToTaskResult<T> {
