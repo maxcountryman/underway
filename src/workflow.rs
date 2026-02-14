@@ -702,6 +702,7 @@ use std::{
     marker::PhantomData,
     ops::Deref,
     sync::{Arc, Mutex},
+    time::Duration as StdDuration,
 };
 
 pub use builder::Builder;
@@ -778,7 +779,7 @@ mod sealed {
     pub struct WorkflowState {
         pub step_index: usize,
         pub step_input: serde_json::Value,
-        #[serde(default = "WorkflowRunId::new", alias = "workflow_id")]
+        #[serde(default = "WorkflowRunId::new")]
         pub(crate) workflow_run_id: WorkflowRunId,
     } // TODO: Versioning?
 }
@@ -874,7 +875,7 @@ impl<T: Task> EnqueuedWorkflow<T> {
               concurrency_key,
               0 as "attempt_number!"
             from underway.task
-            where coalesce(input->>'workflow_run_id', input->>'workflow_id') = $1
+            where input->>'workflow_run_id' = $1
               and state = $2
             for update skip locked
             "#,
@@ -1624,6 +1625,20 @@ where
         };
 
         for command in commands {
+            let Some((retry_policy, timeout)) =
+                self.activity_registry.call_policy(&command.activity)
+            else {
+                return Err(TaskError::Fatal(format!(
+                    "No activity policy registered for `{}`.",
+                    command.activity
+                )));
+            };
+
+            let timeout_ms = StdDuration::try_from(timeout)
+                .map_err(|err| TaskError::Fatal(err.to_string()))?
+                .as_millis()
+                .min(i32::MAX as u128) as i32;
+
             sqlx::query!(
                 r#"
                 insert into underway.activity_call (
@@ -1634,8 +1649,10 @@ where
                     call_key,
                     activity,
                     input,
+                    timeout_ms,
+                    max_attempts,
                     state
-                ) values ($1, $2, $3, $4, $5, $6, $7, 'pending'::underway.activity_call_state)
+                ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending'::underway.activity_call_state)
                 on conflict (task_queue_name, workflow_run_id, step_index, call_key) do nothing
                 "#,
                 Uuid::new_v4(),
@@ -1645,6 +1662,8 @@ where
                 command.call_key,
                 command.activity,
                 command.input,
+                timeout_ms,
+                retry_policy.max_attempts,
             )
             .execute(&mut *conn)
             .await
@@ -1831,7 +1850,6 @@ mod tests {
 
     use jiff::ToSpan;
     use serde::{Deserialize, Serialize};
-    use serde_json::json;
     use sqlx::{postgres::types::PgInterval, PgPool};
 
     use super::*;
@@ -2560,21 +2578,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn workflow_state_deserializes_legacy_workflow_id() {
-        let workflow_run_id = WorkflowRunId::new();
-        let legacy = json!({
-            "step_index": 0,
-            "step_input": {"message": "hello"},
-            "workflow_id": workflow_run_id,
-        });
-
-        let decoded: WorkflowState =
-            serde_json::from_value(legacy).expect("Legacy workflow_id should deserialize");
-
-        assert_eq!(decoded.workflow_run_id, workflow_run_id);
-    }
-
     #[sqlx::test]
     async fn call_suspends_and_persists_activity_intent(pool: PgPool) -> sqlx::Result<(), Error> {
         #[derive(Serialize, Deserialize)]
@@ -2606,7 +2609,7 @@ mod tests {
             select state as "state: TaskState"
             from underway.task
             where task_queue_name = $1
-              and (coalesce(input->>'workflow_run_id', input->>'workflow_id'))::uuid = $2
+              and (input->>'workflow_run_id')::uuid = $2
             "#,
             workflow.queue.name,
             *enqueued.run_id,
@@ -2761,7 +2764,7 @@ mod tests {
             select state as "state: TaskState"
             from underway.task
             where task_queue_name = $1
-              and (coalesce(input->>'workflow_run_id', input->>'workflow_id'))::uuid = $2
+              and (input->>'workflow_run_id')::uuid = $2
             "#,
             workflow.queue.name,
             *enqueued.run_id,
@@ -3236,7 +3239,7 @@ mod tests {
             r#"
             select state as "state: TaskState"
             from underway.task
-            where coalesce(input->>'workflow_run_id', input->>'workflow_id') = $1
+            where input->>'workflow_run_id' = $1
             "#,
             enqueued_workflow.run_id.to_string()
         )

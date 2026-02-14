@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            update underway.task_attempt\n            set state = $3,\n                updated_at = now(),\n                completed_at = now()\n            where task_id = $1\n              and task_queue_name = $2\n              and attempt_number = $4\n              and state = $5\n              and attempt_number = (\n                  select attempt_number\n                  from underway.task_attempt\n                  where task_id = $1\n                    and task_queue_name = $2\n                  order by attempt_number desc\n                  limit 1\n              )\n            ",
+  "query": "\n            update underway.task_attempt\n            set state = $3,\n                updated_at = now(),\n                completed_at = now()\n            where task_id = $1\n              and task_queue_name = $2\n              and attempt_number = $4\n              and state = $5\n            ",
   "describe": {
     "columns": [],
     "parameters": {
@@ -42,5 +42,5 @@
     },
     "nullable": []
   },
-  "hash": "a24ce7317fe155db3da761600b8b1c53cdf008306b6b0f29720ac24a7e95cb6e"
+  "hash": "e797ef83dc350d25af16f1eac46c4352cb6bd2b8d8a18c32427e823069fe1a3c"
 }

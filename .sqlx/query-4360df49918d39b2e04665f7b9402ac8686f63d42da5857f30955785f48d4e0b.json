@@ -1,0 +1,51 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                insert into underway.task (\n                  id,\n                  task_queue_name,\n                  input,\n                  timeout,\n                  heartbeat,\n                  ttl,\n                  delay,\n                  run_at,\n                  retry_policy,\n                  concurrency_key,\n                  priority\n                )\n                select\n                  t.id,\n                  $1 as task_queue_name,\n                  t.input,\n                  $2 as timeout,\n                  $3 as heartbeat,\n                  $4 as ttl,\n                  t.delay,\n                  now() + t.delay,\n                  $5 as retry_policy,\n                  $6 as concurrency_key,\n                  $7 as priority\n                from unnest(\n                  $8::uuid[],\n                  $9::jsonb[],\n                  $10::interval[]\n                ) as t(id, input, delay)\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Interval",
+        "Interval",
+        "Interval",
+        {
+          "Custom": {
+            "name": "underway.task_retry_policy",
+            "kind": {
+              "Composite": [
+                [
+                  "max_attempts",
+                  "Int4"
+                ],
+                [
+                  "initial_interval_ms",
+                  "Int4"
+                ],
+                [
+                  "max_interval_ms",
+                  "Int4"
+                ],
+                [
+                  "backoff_coefficient",
+                  "Float8"
+                ],
+                [
+                  "jitter_factor",
+                  "Float8"
+                ]
+              ]
+            }
+          }
+        },
+        "Text",
+        "Int4",
+        "UuidArray",
+        "JsonbArray",
+        "IntervalArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4360df49918d39b2e04665f7b9402ac8686f63d42da5857f30955785f48d4e0b"
+}

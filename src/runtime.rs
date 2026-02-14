@@ -523,8 +523,10 @@ mod tests {
             r#"
             update underway.activity_call
             set state = 'in_progress'::underway.activity_call_state,
+                attempt_count = 1,
                 started_at = now() - interval '2 hours',
-                updated_at = now() - interval '2 hours'
+                updated_at = now() - interval '2 hours',
+                lease_expires_at = now() - interval '2 hours'
             where id = $1
             "#,
             call_id,

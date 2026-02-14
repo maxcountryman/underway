@@ -138,7 +138,7 @@ use tracing::instrument;
 
 use crate::{
     queue::{
-        connect_listeners_with_retry, shutdown_channel, Error as QueueError, InProgressTask, Queue,
+        connect_listener_with_retry, shutdown_channel, Error as QueueError, InProgressTask, Queue,
     },
     task::{Error as TaskError, RetryCount, RetryPolicy, Task, TaskId},
 };
@@ -584,15 +584,12 @@ impl<T: Task + Sync> Worker<T> {
         // Outer loop: handle reconnection logic
         'reconnect: loop {
             // Connect to PostgreSQL listeners with retry logic
-            let mut listeners = connect_listeners_with_retry(
+            let mut listener = connect_listener_with_retry(
                 &self.queue.pool,
                 &[chan, "task_change"],
                 &self.reconnect_backoff,
             )
             .await?;
-
-            let mut shutdown_listener = listeners.remove(0);
-            let mut task_change_listener = listeners.remove(0);
 
             tracing::info!("PostgreSQL listeners connected successfully");
 
@@ -608,31 +605,28 @@ impl<T: Task + Sync> Worker<T> {
                         reap_completed(&mut processing_tasks);
                     }
 
-                    notify_shutdown = shutdown_listener.recv() => {
-                        match notify_shutdown {
-                            Ok(_) => {
-                                self.shutdown_token.cancel();
-                            },
-                            Err(err) => {
-                                tracing::warn!(%err, "Shutdown listener connection lost, reconnecting");
-                                continue 'reconnect;
-                            }
-                        }
-                    }
-
                     _ = self.shutdown_token.cancelled() => {
                         self.handle_shutdown(&mut processing_tasks).await?;
                         return Ok(());
                     }
 
-                    // Listen for new pending tasks
-                    notify_task_change = task_change_listener.recv() => {
-                        match notify_task_change {
-                            Ok(task_change) => {
-                                self.handle_task_change(task_change, concurrency_limit.clone(), &mut processing_tasks).await?;
+                    notification = listener.recv() => {
+                        match notification {
+                            Ok(notification) => {
+                                match notification.channel() {
+                                    channel if channel == chan => {
+                                        self.shutdown_token.cancel();
+                                    }
+                                    "task_change" => {
+                                        self.handle_task_change(notification, concurrency_limit.clone(), &mut processing_tasks).await?;
+                                    }
+                                    channel => {
+                                        tracing::trace!(%channel, "Ignoring notification on unexpected channel");
+                                    }
+                                }
                             },
                             Err(err) => {
-                                tracing::warn!(%err, "Task change listener connection lost, reconnecting");
+                                tracing::warn!(%err, "Listener connection lost, reconnecting");
                                 continue 'reconnect;
                             }
                         }
@@ -813,7 +807,9 @@ impl<T: Task + Sync> Worker<T> {
         err
     )]
     pub async fn process_next_task(&self) -> Result<Option<TaskId>> {
-        let Some(in_progress_task) = self.queue.dequeue().await? else {
+        let mut conn = self.queue.pool.acquire().await?;
+
+        let Some(in_progress_task) = self.queue.dequeue_from_conn(&mut conn).await? else {
             return Ok(None);
         };
 
@@ -821,7 +817,7 @@ impl<T: Task + Sync> Worker<T> {
         tracing::Span::current().record("task.id", task_id.as_hyphenated().to_string());
 
         // Transaction scoped to the task execution.
-        let mut tx = self.queue.pool.begin().await?;
+        let mut tx = conn.begin().await?;
 
         // Acquire an advisory lock on either the concurrency key or the task ID.
         if !in_progress_task.try_acquire_lock(&mut tx).await? {
@@ -914,7 +910,7 @@ impl<T: Task + Sync> Worker<T> {
 
         in_progress_task.record_failure(conn, error).await?;
 
-        let retry_count = in_progress_task.retry_count(&mut *conn).await?;
+        let retry_count = in_progress_task.attempt_number;
         if retry_count < retry_policy.max_attempts {
             self.schedule_task_retry(conn, in_progress_task, retry_count, retry_policy)
                 .await?;
@@ -937,8 +933,7 @@ impl<T: Task + Sync> Worker<T> {
         let error = &TaskError::TimedOut(timeout.try_into()?);
         in_progress_task.record_failure(&mut *conn, error).await?;
 
-        // Poll count after updating task failure.
-        let retry_count = in_progress_task.retry_count(&mut *conn).await?;
+        let retry_count = in_progress_task.attempt_number;
         if retry_count < retry_policy.max_attempts {
             self.schedule_task_retry(conn, in_progress_task, retry_count, retry_policy)
                 .await?;
@@ -1191,7 +1186,8 @@ mod tests {
         sqlx::query!(
             r#"
             update underway.task
-            set last_heartbeat_at = now() - interval '1 hour'
+            set last_heartbeat_at = now() - interval '1 hour',
+                lease_expires_at = now() - interval '1 hour'
             where id = $1
               and task_queue_name = $2
             "#,

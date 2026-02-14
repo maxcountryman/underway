@@ -1,46 +1,61 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            update underway.task\n            set state = $2,\n                updated_at = now(),\n                completed_at = now()\n            where id = $1\n              and task_queue_name = $4\n              and state < $3\n              and (\n                  $5 = 0\n                  or $5 = (\n                      select max(attempt_number)\n                      from underway.task_attempt\n                      where task_id = $1\n                        and task_queue_name = $4\n                  )\n              )\n            ",
+  "query": "\n            update underway.task_attempt\n            set state = $3,\n                updated_at = now(),\n                completed_at = now()\n            where task_id = $1\n              and task_queue_name = $2\n              and attempt_number = $4\n              and state in ($5, $6)\n            ",
   "describe": {
     "columns": [],
     "parameters": {
       "Left": [
         "Uuid",
-        {
-          "Custom": {
-            "name": "underway.task_state",
-            "kind": {
-              "Enum": [
-                "pending",
-                "in_progress",
-                "waiting",
-                "succeeded",
-                "cancelled",
-                "failed"
-              ]
-            }
-          }
-        },
-        {
-          "Custom": {
-            "name": "underway.task_state",
-            "kind": {
-              "Enum": [
-                "pending",
-                "in_progress",
-                "waiting",
-                "succeeded",
-                "cancelled",
-                "failed"
-              ]
-            }
-          }
-        },
         "Text",
-        "Int4"
+        {
+          "Custom": {
+            "name": "underway.task_state",
+            "kind": {
+              "Enum": [
+                "pending",
+                "in_progress",
+                "waiting",
+                "succeeded",
+                "cancelled",
+                "failed"
+              ]
+            }
+          }
+        },
+        "Int4",
+        {
+          "Custom": {
+            "name": "underway.task_state",
+            "kind": {
+              "Enum": [
+                "pending",
+                "in_progress",
+                "waiting",
+                "succeeded",
+                "cancelled",
+                "failed"
+              ]
+            }
+          }
+        },
+        {
+          "Custom": {
+            "name": "underway.task_state",
+            "kind": {
+              "Enum": [
+                "pending",
+                "in_progress",
+                "waiting",
+                "succeeded",
+                "cancelled",
+                "failed"
+              ]
+            }
+          }
+        }
       ]
     },
     "nullable": []
   },
-  "hash": "c7b2fe56c0a4614bcc78cef6c943f155bc710171895f2ec44ae06cd889f2dae5"
+  "hash": "4002e347ea3fc7e7887aec5fc87997237ef31fc80f686156ccd28003e8ace556"
 }

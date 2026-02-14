@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::{
     activity::{self, Activity},
-    queue::connect_listeners_with_retry,
+    queue::connect_listener_with_retry,
     task::RetryPolicy,
 };
 
@@ -105,6 +105,12 @@ impl ActivityRegistry {
     pub(crate) fn is_empty(&self) -> bool {
         self.handlers.is_empty()
     }
+
+    pub(crate) fn call_policy(&self, activity: &str) -> Option<(RetryPolicy, Span)> {
+        self.handlers
+            .get(activity)
+            .map(|handler| (handler.retry_policy(), handler.timeout()))
+    }
 }
 
 #[derive(Clone)]
@@ -159,14 +165,12 @@ impl ActivityWorker {
         let mut polling_interval = tokio::time::interval(period.try_into()?);
 
         'reconnect: loop {
-            let mut listeners = connect_listeners_with_retry(
+            let mut activity_change_listener = connect_listener_with_retry(
                 &self.pool,
                 &["activity_call_change"],
                 &RetryPolicy::default(),
             )
             .await?;
-
-            let mut activity_change_listener = listeners.remove(0);
 
             tracing::info!("Activity call listener connected successfully");
 
@@ -209,12 +213,10 @@ impl ActivityWorker {
     }
 
     async fn process_next_call(&self) -> Result<Option<Uuid>> {
-        let (activities, timeout_millis) = self.activity_claim_specs()?;
+        let activities = self.activity_claim_specs();
 
         let mut tx = self.pool.begin().await?;
-        let call = self
-            .claim_next_call(&mut tx, &activities, &timeout_millis)
-            .await?;
+        let call = self.claim_next_call(&mut tx, &activities).await?;
         tx.commit().await?;
 
         let Some(call) = call else {
@@ -267,21 +269,16 @@ impl ActivityWorker {
         &self,
         tx: &mut Transaction<'_, Postgres>,
         activities: &[String],
-        timeout_millis: &[i64],
     ) -> Result<Option<ClaimedCall>> {
         let call = sqlx::query_as!(
             ClaimedCall,
             r#"
-            with handler as (
-                select *
-                from unnest($1::text[], $2::bigint[]) as h(activity, timeout_ms)
-            ),
+            with
             next_call as (
                 select c.id
                 from underway.activity_call c
-                inner join handler h
-                  on h.activity = c.activity
-                where c.task_queue_name = $3
+                where c.task_queue_name = $1
+                  and c.activity = any($2::text[])
                   and (
                     (
                         c.state = 'pending'::underway.activity_call_state
@@ -289,20 +286,22 @@ impl ActivityWorker {
                     )
                     or (
                         c.state = 'in_progress'::underway.activity_call_state
-                        and coalesce(c.started_at, c.updated_at, c.created_at)
-                              + ((h.timeout_ms + $4) * interval '1 millisecond')
-                            <= now()
+                        and c.lease_expires_at is not null
+                        and c.lease_expires_at <= now()
                     )
                   )
-                order by c.created_at, c.id
+                order by c.available_at, c.created_at, c.id
                 limit 1
                 for update skip locked
             ),
             claimed as (
                 update underway.activity_call c
                 set state = 'in_progress'::underway.activity_call_state,
+                    attempt_count = c.attempt_count + 1,
                     updated_at = now(),
-                    started_at = now()
+                    started_at = now(),
+                    lease_expires_at =
+                        now() + ((c.timeout_ms::bigint + $3) * interval '1 millisecond')
                 from next_call
                 where c.id = next_call.id
                 returning
@@ -323,7 +322,7 @@ impl ActivityWorker {
                 )
                 select
                     claimed.id,
-                    claimed.attempt_count + 1,
+                    claimed.attempt_count,
                     'in_progress'::underway.activity_call_state
                 from claimed
                 on conflict (activity_call_id, attempt_number)
@@ -334,8 +333,7 @@ impl ActivityWorker {
                       updated_at = now(),
                       completed_at = null
                 returning
-                    activity_call_id,
-                    attempt_number
+                    activity_call_id
             )
             select
                 claimed.id,
@@ -346,14 +344,13 @@ impl ActivityWorker {
                 claimed.activity,
                 claimed.input,
                 claimed.attempt_count,
-                attempt.attempt_number
+                claimed.attempt_count as "attempt_number!"
             from claimed
             inner join attempt
               on attempt.activity_call_id = claimed.id
             "#,
-            activities as _,
-            timeout_millis as _,
             self.queue_name,
+            activities as _,
             IN_PROGRESS_RECLAIM_GRACE_MS,
         )
         .fetch_optional(&mut **tx)
@@ -362,32 +359,15 @@ impl ActivityWorker {
         Ok(call)
     }
 
-    fn activity_claim_specs(&self) -> Result<(Vec<String>, Vec<i64>)> {
-        let mut handlers = self
-            .registry
-            .handlers
-            .iter()
-            .map(|(activity, handler)| {
-                let timeout: Duration = handler.timeout().try_into()?;
-                let timeout_millis = timeout.as_millis().min(i64::MAX as u128) as i64;
-                Ok((activity.clone(), timeout_millis))
-            })
-            .collect::<Result<Vec<_>>>()?;
+    fn activity_claim_specs(&self) -> Vec<String> {
+        let mut activities = self.registry.handlers.keys().cloned().collect::<Vec<_>>();
 
-        handlers.sort_by(|left, right| left.0.cmp(&right.0));
+        activities.sort();
 
-        let mut activities = Vec::with_capacity(handlers.len());
-        let mut timeout_millis = Vec::with_capacity(handlers.len());
-        for (activity, timeout_ms) in handlers {
-            activities.push(activity);
-            timeout_millis.push(timeout_ms);
-        }
-
-        Ok((activities, timeout_millis))
+        activities
     }
 
     async fn mark_succeeded(&self, call: &ClaimedCall, output: Value) -> Result {
-        let attempt_count = call.attempt_count + 1;
         let mut tx = self.pool.begin().await?;
 
         sqlx::query!(
@@ -397,12 +377,15 @@ impl ActivityWorker {
                 output = $2,
                 attempt_count = $3,
                 updated_at = now(),
-                completed_at = now()
+                completed_at = now(),
+                lease_expires_at = null
             where id = $1
+              and state = 'in_progress'::underway.activity_call_state
+              and attempt_count = $3
             "#,
             call.id,
             output,
-            attempt_count,
+            call.attempt_count,
         )
         .execute(&mut *tx)
         .await?;
@@ -435,7 +418,7 @@ impl ActivityWorker {
         retry_policy: RetryPolicy,
         error: activity::Error,
     ) -> Result {
-        let retry_count = call.attempt_count + 1;
+        let retry_count = call.attempt_count;
         let error_value = serde_json::to_value(&error)?;
         let mut tx = self.pool.begin().await?;
 
@@ -450,8 +433,11 @@ impl ActivityWorker {
                     error = $2,
                     attempt_count = $3,
                     available_at = now() + $4,
-                    updated_at = now()
+                    updated_at = now(),
+                    lease_expires_at = null
                 where id = $1
+                  and state = 'in_progress'::underway.activity_call_state
+                  and attempt_count = $3
                 "#,
                 call.id,
                 error_value,
@@ -495,7 +481,6 @@ impl ActivityWorker {
         call: &ClaimedCall,
         error: activity::Error,
     ) -> Result {
-        let retry_count = call.attempt_count + 1;
         let error_value = serde_json::to_value(error)?;
 
         sqlx::query!(
@@ -505,12 +490,15 @@ impl ActivityWorker {
                 error = $2,
                 attempt_count = $3,
                 updated_at = now(),
-                completed_at = now()
+                completed_at = now(),
+                lease_expires_at = null
             where id = $1
+              and state = 'in_progress'::underway.activity_call_state
+              and attempt_count = $3
             "#,
             call.id,
             error_value,
-            retry_count,
+            call.attempt_count,
         )
         .execute(&mut **tx)
         .await?;
@@ -546,11 +534,12 @@ impl ActivityWorker {
             r#"
             update underway.task
             set state = 'pending'::underway.task_state,
-                delay = interval '0',
+                run_at = now(),
+                lease_expires_at = null,
                 updated_at = now()
             where task_queue_name = $1
               and state = 'waiting'::underway.task_state
-              and (coalesce(input->>'workflow_run_id', input->>'workflow_id'))::uuid = $2
+              and (input->>'workflow_run_id')::uuid = $2
               and (input->>'step_index')::integer = $3
             "#,
             call.task_queue_name,

@@ -1,0 +1,137 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            with available_task as (\n                select id\n                from underway.task\n              where task_queue_name = $1\n                and (\n                    (\n                        state = $2\n                        and run_at <= now()\n                    )\n                    or (\n                        state = $3\n                        and lease_expires_at is not null\n                        and lease_expires_at <= now()\n                        and attempt_count < (retry_policy).max_attempts\n                    )\n                )\n                order by\n                  priority desc,\n                  run_at,\n                  created_at,\n                  id\n                limit 1\n                for update skip locked\n            ),\n            claimed as (\n                update underway.task t\n                set state = $3,\n                    run_at = now(),\n                    last_attempt_at = now(),\n                    last_heartbeat_at = now(),\n                    attempt_count = t.attempt_count + 1,\n                    current_attempt = t.attempt_count + 1,\n                    lease_expires_at = now() + t.heartbeat\n                from available_task\n                where t.task_queue_name = $1\n                  and t.id = available_task.id\n                returning\n                    t.id,\n                    t.task_queue_name,\n                    t.input,\n                    t.timeout,\n                    t.heartbeat,\n                    t.retry_policy,\n                    t.concurrency_key,\n                    t.current_attempt\n            ),\n            finalized_previous_attempt as (\n                update underway.task_attempt ta\n                set state = $4,\n                    updated_at = now(),\n                    completed_at = now(),\n                    error_message = coalesce(\n                        ta.error_message,\n                        'Task lease expired and was reclaimed by another worker.'\n                    )\n                from claimed c\n                where c.current_attempt > 1\n                  and ta.task_id = c.id\n                  and ta.task_queue_name = c.task_queue_name\n                  and ta.attempt_number = c.current_attempt - 1\n                  and ta.state = $3\n            ),\n            upsert_current_attempt as (\n                insert into underway.task_attempt (\n                    task_id,\n                    task_queue_name,\n                    state,\n                    attempt_number\n                )\n                select\n                    c.id,\n                    c.task_queue_name,\n                    $3,\n                    c.current_attempt\n                from claimed c\n                on conflict (task_queue_name, task_id, attempt_number)\n                do update\n                set state = excluded.state,\n                    error_message = null,\n                    started_at = now(),\n                    updated_at = now(),\n                    completed_at = null\n            )\n            select\n                c.id as \"id: TaskId\",\n                c.task_queue_name as \"queue_name\",\n                c.input,\n                c.timeout,\n                c.heartbeat,\n                c.retry_policy as \"retry_policy: RetryPolicy\",\n                c.concurrency_key,\n                c.current_attempt as \"attempt_number!\"\n            from claimed c\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: TaskId",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "queue_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "input",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 3,
+        "name": "timeout",
+        "type_info": "Interval"
+      },
+      {
+        "ordinal": 4,
+        "name": "heartbeat",
+        "type_info": "Interval"
+      },
+      {
+        "ordinal": 5,
+        "name": "retry_policy: RetryPolicy",
+        "type_info": {
+          "Custom": {
+            "name": "underway.task_retry_policy",
+            "kind": {
+              "Composite": [
+                [
+                  "max_attempts",
+                  "Int4"
+                ],
+                [
+                  "initial_interval_ms",
+                  "Int4"
+                ],
+                [
+                  "max_interval_ms",
+                  "Int4"
+                ],
+                [
+                  "backoff_coefficient",
+                  "Float8"
+                ],
+                [
+                  "jitter_factor",
+                  "Float8"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "concurrency_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "attempt_number!",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        {
+          "Custom": {
+            "name": "underway.task_state",
+            "kind": {
+              "Enum": [
+                "pending",
+                "in_progress",
+                "waiting",
+                "succeeded",
+                "cancelled",
+                "failed"
+              ]
+            }
+          }
+        },
+        {
+          "Custom": {
+            "name": "underway.task_state",
+            "kind": {
+              "Enum": [
+                "pending",
+                "in_progress",
+                "waiting",
+                "succeeded",
+                "cancelled",
+                "failed"
+              ]
+            }
+          }
+        },
+        {
+          "Custom": {
+            "name": "underway.task_state",
+            "kind": {
+              "Enum": [
+                "pending",
+                "in_progress",
+                "waiting",
+                "succeeded",
+                "cancelled",
+                "failed"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "0a5ee33f783d00d58f170946ec1457300a2840e02bbd70b1f61d7558c82037d6"
+}

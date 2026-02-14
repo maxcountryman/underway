@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            insert into underway.task (\n              id,\n              task_queue_name,\n              input,\n              timeout,\n              heartbeat,\n              ttl,\n              delay,\n              retry_policy,\n              concurrency_key,\n              priority\n            ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)\n            ",
+  "query": "\n            insert into underway.task (\n              id,\n              task_queue_name,\n              input,\n              timeout,\n              heartbeat,\n              ttl,\n              delay,\n              run_at,\n              retry_policy,\n              concurrency_key,\n              priority\n            ) values ($1, $2, $3, $4, $5, $6, $7, now() + $7, $8, $9, $10)\n            ",
   "describe": {
     "columns": [],
     "parameters": {
@@ -47,5 +47,5 @@
     },
     "nullable": []
   },
-  "hash": "dae0ef841b214a8f0d3981f27aa490d09dd5db2962112316ae892a59fc7f152c"
+  "hash": "db3d217d949d2f9cf64d13b08d291cd8566d0bfb3d621ecaf5b85eed52a9cc1f"
 }

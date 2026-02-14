@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                update underway.activity_call\n                set state = 'pending'::underway.activity_call_state,\n                    error = $2,\n                    attempt_count = $3,\n                    available_at = now() + $4,\n                    updated_at = now(),\n                    lease_expires_at = null\n                where id = $1\n                  and state = 'in_progress'::underway.activity_call_state\n                  and attempt_count = $3\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Jsonb",
+        "Int4",
+        "Interval"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e4aebee407786c0c1400838cee9ba7129027330823b52d0ad5dc7d9280c4642e"
+}

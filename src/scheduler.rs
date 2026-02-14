@@ -3,13 +3,13 @@ use std::{result::Result as StdResult, str::FromStr, sync::Arc, time::Duration a
 use jiff::{tz::TimeZone, Zoned};
 use jiff_cron::{Schedule, ScheduleIterator};
 use sqlx::postgres::PgAdvisoryLock;
-use tokio::time::{sleep, Instant};
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
 use crate::{
     queue::{
-        connect_listeners_with_retry, shutdown_channel, try_acquire_advisory_lock,
+        connect_listener_with_retry, shutdown_channel, try_acquire_advisory_lock,
         Error as QueueError,
     },
     task::{RetryCount, RetryPolicy},
@@ -359,27 +359,40 @@ impl<T: Task> Scheduler<T> {
                 return Ok(());
             };
 
-            let Some((zoned_schedule, _)) = self.queue.task_schedule(&self.queue.pool).await?
-            else {
-                // No schedule configured, so we'll exit.
-                return Ok(());
-            };
-
             // Set up a listener for shutdown notifications
             let chan = shutdown_channel();
-            let mut listeners =
-                connect_listeners_with_retry(&self.queue.pool, &[chan], &self.reconnect_backoff)
+            let mut shutdown_listener =
+                connect_listener_with_retry(&self.queue.pool, &[chan], &self.reconnect_backoff)
                     .await?;
-
-            let mut shutdown_listener = listeners.remove(0);
 
             tracing::info!("Scheduler PostgreSQL listener connected successfully");
             retry_count = 1;
 
-            // TODO: Handle updates to schedules?
+            let schedule_refresh = StdDuration::from_secs(5);
 
-            for next in zoned_schedule.iter() {
+            loop {
+                let Some((zoned_schedule, _)) = self.queue.task_schedule(&self.queue.pool).await?
+                else {
+                    // No schedule configured, so we'll exit.
+                    return Ok(());
+                };
+
+                let Some(next) = zoned_schedule.iter().next() else {
+                    tokio::time::sleep(schedule_refresh).await;
+                    continue;
+                };
+
                 tracing::debug!(?next, "Waiting until next scheduled task enqueue");
+
+                let tz = next.time_zone();
+                let now = Zoned::now().with_time_zone(tz.to_owned());
+                let until_next = next.duration_until(&now).unsigned_abs();
+                let should_dispatch = until_next <= schedule_refresh;
+                let wait_for = if should_dispatch {
+                    until_next
+                } else {
+                    schedule_refresh
+                };
 
                 tokio::select! {
                     notify_shutdown = shutdown_listener.recv() => {
@@ -398,8 +411,10 @@ impl<T: Task> Scheduler<T> {
                         break;
                     }
 
-                    _ = wait_until(&next) => {
-                        self.process_next_schedule().await?
+                    _ = tokio::time::sleep(wait_for) => {
+                        if should_dispatch {
+                            self.process_next_schedule().await?;
+                        }
                     }
                 }
             }
@@ -434,6 +449,7 @@ fn queue_scheduler_lock(queue_name: &str) -> PgAdvisoryLock {
     PgAdvisoryLock::new(format!("{queue_name}-scheduler"))
 }
 
+#[cfg(test)]
 async fn wait_until(next: &Zoned) {
     let tz = next.time_zone();
     loop {
@@ -447,7 +463,7 @@ async fn wait_until(next: &Zoned) {
             break;
         }
 
-        tokio::time::sleep_until(Instant::now() + until_next).await;
+        tokio::time::sleep_until(tokio::time::Instant::now() + until_next).await;
     }
 }
 
