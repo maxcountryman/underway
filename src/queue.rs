@@ -556,10 +556,11 @@ impl<T: Task> Queue<T> {
               heartbeat,
               ttl,
               delay,
+              run_at,
               retry_policy,
               concurrency_key,
               priority
-            ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            ) values ($1, $2, $3, $4, $5, $6, $7, now() + $7, $8, $9, $10)
             "#,
             id as TaskId,
             self.name,
@@ -723,6 +724,7 @@ impl<T: Task> Queue<T> {
                   heartbeat,
                   ttl,
                   delay,
+                  run_at,
                   retry_policy,
                   concurrency_key,
                   priority
@@ -735,6 +737,7 @@ impl<T: Task> Queue<T> {
                   $3 as heartbeat,
                   $4 as ttl,
                   t.delay,
+                  now() + t.delay,
                   $5 as retry_policy,
                   $6 as concurrency_key,
                   $7 as priority
@@ -792,6 +795,7 @@ impl<T: Task> Queue<T> {
                   heartbeat,
                   ttl,
                   delay,
+                  run_at,
                   retry_policy,
                   concurrency_key,
                   priority
@@ -804,6 +808,7 @@ impl<T: Task> Queue<T> {
                   t.heartbeat,
                   t.ttl,
                   t.delay,
+                  now() + t.delay,
                   (
                     t.retry_max_attempts,
                     t.retry_initial_interval_ms,
@@ -877,17 +882,13 @@ impl<T: Task> Queue<T> {
         let failed_task_ids = sqlx::query_scalar!(
             r#"
             with stale_exhausted as (
-                select t.id
+                select t.id, t.current_attempt
                 from underway.task t
                 where t.task_queue_name = $1
                   and t.state = $2
-                  and t.last_heartbeat_at < now() - t.heartbeat
-                  and (t.retry_policy).max_attempts <= (
-                      select count(*)
-                      from underway.task_attempt ta
-                      where ta.task_queue_name = $1
-                        and ta.task_id = t.id
-                  )
+                  and t.lease_expires_at is not null
+                  and t.lease_expires_at <= now()
+                  and t.attempt_count >= (t.retry_policy).max_attempts
                 for update skip locked
             ),
             finalized_attempts as (
@@ -902,12 +903,14 @@ impl<T: Task> Queue<T> {
                 from stale_exhausted se
                 where ta.task_queue_name = $1
                   and ta.task_id = se.id
+                  and ta.attempt_number = se.current_attempt
                   and ta.state = $2
             )
             update underway.task t
             set state = $3,
                 updated_at = now(),
-                completed_at = now()
+                completed_at = now(),
+                lease_expires_at = null
             from stale_exhausted se
             where t.task_queue_name = $1
               and t.id = se.id
@@ -1014,10 +1017,34 @@ impl<T: Task> Queue<T> {
         // "in-progress".
         let mut tx = self.pool.begin().await?;
 
-        let failed_task_ids = self.fail_stale_exhausted_tasks(&mut tx).await?;
+        let in_progress_task = self.dequeue_in_tx(&mut tx).await?;
+
+        tx.commit().await?;
+
+        Ok(in_progress_task)
+    }
+
+    pub(crate) async fn dequeue_from_conn(
+        &self,
+        conn: &mut PgConnection,
+    ) -> Result<Option<InProgressTask>> {
+        let mut tx = conn.begin().await?;
+
+        let in_progress_task = self.dequeue_in_tx(&mut tx).await?;
+
+        tx.commit().await?;
+
+        Ok(in_progress_task)
+    }
+
+    async fn dequeue_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> Result<Option<InProgressTask>> {
+        let failed_task_ids = self.fail_stale_exhausted_tasks(tx).await?;
         if let Some(dlq_name) = &self.dlq_name {
             for task_id in failed_task_ids {
-                self.move_task_to_dlq(&mut *tx, task_id, dlq_name).await?;
+                self.move_task_to_dlq(&mut **tx, task_id, dlq_name).await?;
             }
         }
 
@@ -1029,28 +1056,20 @@ impl<T: Task> Queue<T> {
                 from underway.task
               where task_queue_name = $1
                 and (
-                    -- Find pending tasks...
                     (
                         state = $2
-                        and coalesce(last_attempt_at, created_at) + delay <= now()
+                        and run_at <= now()
                     )
-                    -- ...Or look for stalled tasks.
                     or (
                         state = $3
-                        -- Has heartbeat stalled?
-                        and last_heartbeat_at < now() - heartbeat
-                        -- Are there remaining retries?
-                        and (retry_policy).max_attempts > (
-                            select count(*)
-                            from underway.task_attempt
-                            where task_queue_name = $1
-                              and task_id = id
-                        )
-                        and created_at + delay <= now()
+                        and lease_expires_at is not null
+                        and lease_expires_at <= now()
+                        and attempt_count < (retry_policy).max_attempts
                     )
                 )
                 order by
                   priority desc,
+                  run_at,
                   created_at,
                   id
                 limit 1
@@ -1058,8 +1077,12 @@ impl<T: Task> Queue<T> {
             )
             update underway.task t
             set state = $3,
+                run_at = now(),
                 last_attempt_at = now(),
-                last_heartbeat_at = now()
+                last_heartbeat_at = now(),
+                attempt_count = t.attempt_count + 1,
+                current_attempt = t.attempt_count + 1,
+                lease_expires_at = now() + t.heartbeat
             from available_task
             where t.task_queue_name = $1
               and t.id = available_task.id
@@ -1071,77 +1094,77 @@ impl<T: Task> Queue<T> {
                 t.heartbeat,
                 t.retry_policy as "retry_policy: RetryPolicy",
                 t.concurrency_key,
-                0 as "attempt_number!"
+                t.current_attempt as "attempt_number!"
             "#,
             self.name,
             TaskState::Pending as TaskState,
             TaskState::InProgress as TaskState,
         )
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?;
 
-        let in_progress_task = if let Some(mut in_progress_task) = in_progress_task {
+        let in_progress_task = if let Some(in_progress_task) = in_progress_task {
             let task_id = in_progress_task.id;
             tracing::Span::current().record("task.id", task_id.as_hyphenated().to_string());
 
             // Update previous in-progress task attempts to mark them as failed.
-            //
-            // This ensures that if a stuck task was selected, we also update its attempt
-            // row.
-            sqlx::query!(
-                r#"
-                update underway.task_attempt
-                set state = $3
-                where task_id = $1
-                  and task_queue_name = $2
-                  and state = $4
-                "#,
-                task_id as TaskId,
-                self.name,
-                TaskState::Failed as TaskState,
-                TaskState::InProgress as TaskState
-            )
-            .execute(&mut *tx)
-            .await?;
-
-            // Insert a new task attempt row
-            let attempt_number = sqlx::query_scalar!(
-                r#"
-                with next_attempt as (
-                    select coalesce(max(attempt_number) + 1, 1) as attempt_number
-                    from underway.task_attempt
+            // If this claim is reclaiming stale work, close the previous in-progress
+            // attempt.
+            if in_progress_task.attempt_number > 1 {
+                sqlx::query!(
+                    r#"
+                    update underway.task_attempt
+                    set state = $3,
+                        updated_at = now(),
+                        completed_at = now(),
+                        error_message = coalesce(
+                            error_message,
+                            'Task lease expired and was reclaimed by another worker.'
+                        )
                     where task_id = $1
                       and task_queue_name = $2
+                      and attempt_number = $4
+                      and state = $5
+                    "#,
+                    task_id as TaskId,
+                    self.name,
+                    TaskState::Failed as TaskState,
+                    in_progress_task.attempt_number - 1,
+                    TaskState::InProgress as TaskState,
                 )
+                .execute(&mut **tx)
+                .await?;
+            }
+
+            sqlx::query!(
+                r#"
                 insert into underway.task_attempt (
                     task_id,
                     task_queue_name,
                     state,
                     attempt_number
                 )
-                values (
-                    $1,
-                    $2,
-                    $3,
-                    (select attempt_number from next_attempt)
-                )
-                returning attempt_number
+                values ($1, $2, $3, $4)
+                on conflict (task_queue_name, task_id, attempt_number)
+                do update
+                set state = excluded.state,
+                    error_message = null,
+                    started_at = now(),
+                    updated_at = now(),
+                    completed_at = null
                 "#,
                 task_id as TaskId,
                 self.name,
-                TaskState::InProgress as TaskState
+                TaskState::InProgress as TaskState,
+                in_progress_task.attempt_number,
             )
-            .fetch_one(&mut *tx)
+            .execute(&mut **tx)
             .await?;
-
-            in_progress_task.attempt_number = attempt_number;
 
             Some(in_progress_task)
         } else {
             None
         };
-
-        tx.commit().await?;
 
         Ok(in_progress_task)
     }
@@ -1460,14 +1483,6 @@ impl InProgressTask {
               and task_queue_name = $2
               and attempt_number = $4
               and state = $5
-              and attempt_number = (
-                  select attempt_number
-                  from underway.task_attempt
-                  where task_id = $1
-                    and task_queue_name = $2
-                  order by attempt_number desc
-                  limit 1
-              )
             "#,
             self.id as TaskId,
             self.queue_name,
@@ -1488,16 +1503,12 @@ impl InProgressTask {
             update underway.task
             set state = $2,
                 updated_at = now(),
-                completed_at = now()
+                completed_at = now(),
+                lease_expires_at = null
             where id = $1
               and task_queue_name = $3
               and state = $5
-              and $4 = (
-                  select max(attempt_number)
-                  from underway.task_attempt
-                  where task_id = $1
-                    and task_queue_name = $3
-              )
+              and current_attempt = $4
             "#,
             self.id as TaskId,
             TaskState::Succeeded as TaskState,
@@ -1525,19 +1536,13 @@ impl InProgressTask {
             where task_id = $1
               and task_queue_name = $2
               and attempt_number = $4
-              and attempt_number = (
-                  select attempt_number
-                  from underway.task_attempt
-                  where task_id = $1
-                    and task_queue_name = $2
-                  order by attempt_number desc
-                  limit 1
-              )
+              and state = $5
             "#,
             self.id as TaskId,
             self.queue_name,
             TaskState::Waiting as TaskState,
             self.attempt_number,
+            TaskState::InProgress as TaskState,
         )
         .execute(&mut *conn)
         .await?;
@@ -1551,20 +1556,18 @@ impl InProgressTask {
             r#"
             update underway.task
             set state = $2,
-                updated_at = now()
+                updated_at = now(),
+                lease_expires_at = null
             where id = $1
               and task_queue_name = $3
-              and $4 = (
-                  select max(attempt_number)
-                  from underway.task_attempt
-                  where task_id = $1
-                    and task_queue_name = $3
-              )
+              and state = $5
+              and current_attempt = $4
             "#,
             self.id as TaskId,
             TaskState::Waiting as TaskState,
             self.queue_name,
             self.attempt_number,
+            TaskState::InProgress as TaskState,
         )
         .execute(&mut *conn)
         .await?;
@@ -1606,18 +1609,14 @@ impl InProgressTask {
             update underway.task
             set state = $2,
                 updated_at = now(),
-                completed_at = now()
+                completed_at = now(),
+                lease_expires_at = null
             where id = $1
               and task_queue_name = $4
               and state < $3
               and (
                   $5 = 0
-                  or $5 = (
-                      select max(attempt_number)
-                      from underway.task_attempt
-                      where task_id = $1
-                        and task_queue_name = $4
-                  )
+                  or current_attempt = $5
               )
             "#,
             self.id as TaskId,
@@ -1651,19 +1650,14 @@ impl InProgressTask {
             where task_id = $1
               and task_queue_name = $2
               and attempt_number = $4
-              and attempt_number = (
-                  select attempt_number
-                  from underway.task_attempt
-                  where task_id = $1
-                    and task_queue_name = $2
-                  order by attempt_number desc
-                  limit 1
-              )
+              and state in ($5, $6)
             "#,
             self.id as TaskId,
             self.queue_name,
             TaskState::Failed as TaskState,
-            self.attempt_number
+            self.attempt_number,
+            TaskState::InProgress as TaskState,
+            TaskState::Failed as TaskState,
         )
         .execute(&mut *conn)
         .await?;
@@ -1677,22 +1671,21 @@ impl InProgressTask {
             update underway.task
             set state = $3,
                 delay = $2,
+                run_at = now() + $2,
                 last_attempt_at = now(),
-                updated_at = now()
+                updated_at = now(),
+                lease_expires_at = null
             where id = $1
               and task_queue_name = $4
-              and $5 = (
-                  select max(attempt_number)
-                  from underway.task_attempt
-                  where task_id = $1
-                    and task_queue_name = $4
-              )
+              and state = $6
+              and current_attempt = $5
             "#,
             self.id as TaskId,
             StdDuration::try_from(delay)? as _,
             TaskState::Pending as TaskState,
             self.queue_name,
-            self.attempt_number
+            self.attempt_number,
+            TaskState::InProgress as TaskState,
         )
         .execute(&mut *conn)
         .await?;
@@ -1718,20 +1711,14 @@ impl InProgressTask {
             where task_id = $1
               and task_queue_name = $2
               and attempt_number = $5
-              and attempt_number = (
-                  select attempt_number
-                  from underway.task_attempt
-                  where task_id = $1
-                    and task_queue_name = $2
-                  order by attempt_number desc
-                  limit 1
-              )
+              and state = $6
             "#,
             self.id as TaskId,
             self.queue_name,
             TaskState::Failed as TaskState,
             error.to_string(),
-            self.attempt_number
+            self.attempt_number,
+            TaskState::InProgress as TaskState,
         )
         .execute(&mut *conn)
         .await?;
@@ -1746,16 +1733,13 @@ impl InProgressTask {
             set updated_at = now()
             where id = $1
               and task_queue_name = $2
-              and $3 = (
-                  select max(attempt_number)
-                  from underway.task_attempt
-                  where task_id = $1
-                    and task_queue_name = $2
-              )
+              and state = $4
+              and current_attempt = $3
             "#,
             self.id as TaskId,
             self.queue_name,
-            self.attempt_number
+            self.attempt_number,
+            TaskState::InProgress as TaskState,
         )
         .execute(&mut *conn)
         .await?;
@@ -1778,19 +1762,14 @@ impl InProgressTask {
             where task_id = $1
               and task_queue_name = $2
               and attempt_number = $4
-              and attempt_number = (
-                  select attempt_number
-                  from underway.task_attempt
-                  where task_id = $1
-                    and task_queue_name = $2
-                  order by attempt_number desc
-                  limit 1
-              )
+              and state in ($5, $6)
             "#,
             self.id as TaskId,
             self.queue_name,
             TaskState::Failed as TaskState,
-            self.attempt_number
+            self.attempt_number,
+            TaskState::InProgress as TaskState,
+            TaskState::Failed as TaskState,
         )
         .execute(&mut *conn)
         .await?;
@@ -1805,20 +1784,18 @@ impl InProgressTask {
             update underway.task
             set state = $2,
                 updated_at = now(),
-                completed_at = now()
+                completed_at = now(),
+                lease_expires_at = null
             where id = $1
               and task_queue_name = $3
-              and $4 = (
-                  select max(attempt_number)
-                  from underway.task_attempt
-                  where task_id = $1
-                    and task_queue_name = $3
-              )
+              and state = $5
+              and current_attempt = $4
             "#,
             self.id as TaskId,
             TaskState::Failed as TaskState,
             self.queue_name,
-            self.attempt_number
+            self.attempt_number,
+            TaskState::InProgress as TaskState,
         )
         .execute(&mut *conn)
         .await?;
@@ -1830,6 +1807,7 @@ impl InProgressTask {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) async fn retry_count<'a, E>(&self, executor: E) -> Result<i32>
     where
         E: PgExecutor<'a>,
@@ -1858,17 +1836,12 @@ impl InProgressTask {
             r#"
             update underway.task
             set updated_at = now(),
-                last_heartbeat_at = now()
+                last_heartbeat_at = now(),
+                lease_expires_at = now() + heartbeat
             where id = $1
               and task_queue_name = $2
-              and exists (
-                  select 1
-                  from underway.task_attempt
-                  where task_id = $1
-                    and task_queue_name = $2
-                    and attempt_number = $3
-                    and state = $4
-              )
+              and current_attempt = $3
+              and state = $4
             "#,
             self.id as TaskId,
             self.queue_name,
@@ -2308,6 +2281,27 @@ pub(crate) async fn connect_listeners_with_retry(
             Ok(listeners)
         },
         "connect PostgreSQL listeners",
+    )
+    .await
+}
+
+/// Connect a single PostgreSQL listener subscribed to multiple channels.
+pub(crate) async fn connect_listener_with_retry(
+    pool: &PgPool,
+    channels: &[&str],
+    backoff_policy: &RetryPolicy,
+) -> std::result::Result<sqlx::postgres::PgListener, Error> {
+    retry_with_backoff(
+        backoff_policy,
+        |_| async {
+            let mut listener = sqlx::postgres::PgListener::connect_with(pool).await?;
+            for channel in channels {
+                listener.listen(channel).await?;
+            }
+
+            Ok(listener)
+        },
+        "connect PostgreSQL listener",
     )
     .await
 }
@@ -3203,7 +3197,8 @@ mod tests {
         sqlx::query!(
             r#"
             update underway.task
-            set last_attempt_at = now() - interval '2 hours'
+            set last_attempt_at = now() - interval '2 hours',
+                run_at = now() - interval '2 hours'
             where task_queue_name = $1 and id = $2
             "#,
             queue.name.as_str(),
@@ -3934,7 +3929,8 @@ mod tests {
         sqlx::query!(
             r#"
             update underway.task
-            set last_heartbeat_at = now() - interval '30 seconds'
+            set last_heartbeat_at = now() - interval '30 seconds',
+                lease_expires_at = now() - interval '30 seconds'
             where id = $1
             "#,
             task_id as TaskId
@@ -4002,7 +3998,8 @@ mod tests {
         sqlx::query!(
             r#"
             update underway.task
-            set last_heartbeat_at = now() - interval '2 hours'
+            set last_heartbeat_at = now() - interval '2 hours',
+                lease_expires_at = now() - interval '2 hours'
             where id = $1
               and task_queue_name = $2
             "#,
@@ -4073,7 +4070,8 @@ mod tests {
         sqlx::query!(
             r#"
             update underway.task
-            set last_heartbeat_at = now() - interval '2 hours'
+            set last_heartbeat_at = now() - interval '2 hours',
+                lease_expires_at = now() - interval '2 hours'
             where id = $1
               and task_queue_name = $2
             "#,
@@ -4146,7 +4144,8 @@ mod tests {
         sqlx::query!(
             r#"
             update underway.task
-            set last_heartbeat_at = now() - interval '2 hours'
+            set last_heartbeat_at = now() - interval '2 hours',
+                lease_expires_at = now() - interval '2 hours'
             where id = $1
               and task_queue_name = $2
             "#,
@@ -4225,7 +4224,8 @@ mod tests {
         sqlx::query!(
             r#"
             update underway.task
-            set last_heartbeat_at = now() - interval '1 minute'
+            set last_heartbeat_at = now() - interval '1 minute',
+                lease_expires_at = now() - interval '1 minute'
             where id = $1
               and task_queue_name = $2
             "#,

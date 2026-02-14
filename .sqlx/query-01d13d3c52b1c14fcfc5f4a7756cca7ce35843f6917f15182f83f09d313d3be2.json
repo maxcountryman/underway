@@ -1,0 +1,47 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            update underway.task\n            set state = $3,\n                delay = $2,\n                run_at = now() + $2,\n                last_attempt_at = now(),\n                updated_at = now(),\n                lease_expires_at = null\n            where id = $1\n              and task_queue_name = $4\n              and state = $6\n              and current_attempt = $5\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Interval",
+        {
+          "Custom": {
+            "name": "underway.task_state",
+            "kind": {
+              "Enum": [
+                "pending",
+                "in_progress",
+                "waiting",
+                "succeeded",
+                "cancelled",
+                "failed"
+              ]
+            }
+          }
+        },
+        "Text",
+        "Int4",
+        {
+          "Custom": {
+            "name": "underway.task_state",
+            "kind": {
+              "Enum": [
+                "pending",
+                "in_progress",
+                "waiting",
+                "succeeded",
+                "cancelled",
+                "failed"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "01d13d3c52b1c14fcfc5f4a7756cca7ce35843f6917f15182f83f09d313d3be2"
+}

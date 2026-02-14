@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            update underway.activity_call\n            set state = 'in_progress'::underway.activity_call_state,\n                attempt_count = 1,\n                started_at = now() - interval '2 hours',\n                updated_at = now() - interval '2 hours',\n                lease_expires_at = now() - interval '2 hours'\n            where id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "af36e436a72d76f594eb6811dfdbdad0105f398e422e6bf3f996ffed0ee382b1"
+}

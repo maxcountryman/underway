@@ -1,0 +1,31 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                insert into underway.task_attempt (\n                    task_id,\n                    task_queue_name,\n                    state,\n                    attempt_number\n                )\n                values ($1, $2, $3, $4)\n                on conflict (task_queue_name, task_id, attempt_number)\n                do update\n                set state = excluded.state,\n                    error_message = null,\n                    started_at = now(),\n                    updated_at = now(),\n                    completed_at = null\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        {
+          "Custom": {
+            "name": "underway.task_state",
+            "kind": {
+              "Enum": [
+                "pending",
+                "in_progress",
+                "waiting",
+                "succeeded",
+                "cancelled",
+                "failed"
+              ]
+            }
+          }
+        },
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "43d7b77fd4a2f58a9077caa8ada86b1d20617edfc65e99a09e27fbf70f8ece5e"
+}

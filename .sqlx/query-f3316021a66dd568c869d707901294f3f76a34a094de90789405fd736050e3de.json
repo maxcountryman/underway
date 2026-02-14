@@ -1,0 +1,107 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            select\n              id as \"id: TaskId\",\n              task_queue_name as \"queue_name\",\n              input,\n              retry_policy as \"retry_policy: RetryPolicy\",\n              timeout,\n              heartbeat,\n              concurrency_key,\n              0 as \"attempt_number!\"\n            from underway.task\n            where input->>'workflow_run_id' = $1\n              and state = $2\n            for update skip locked\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: TaskId",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "queue_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "input",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 3,
+        "name": "retry_policy: RetryPolicy",
+        "type_info": {
+          "Custom": {
+            "name": "underway.task_retry_policy",
+            "kind": {
+              "Composite": [
+                [
+                  "max_attempts",
+                  "Int4"
+                ],
+                [
+                  "initial_interval_ms",
+                  "Int4"
+                ],
+                [
+                  "max_interval_ms",
+                  "Int4"
+                ],
+                [
+                  "backoff_coefficient",
+                  "Float8"
+                ],
+                [
+                  "jitter_factor",
+                  "Float8"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "timeout",
+        "type_info": "Interval"
+      },
+      {
+        "ordinal": 5,
+        "name": "heartbeat",
+        "type_info": "Interval"
+      },
+      {
+        "ordinal": 6,
+        "name": "concurrency_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "attempt_number!",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        {
+          "Custom": {
+            "name": "underway.task_state",
+            "kind": {
+              "Enum": [
+                "pending",
+                "in_progress",
+                "waiting",
+                "succeeded",
+                "cancelled",
+                "failed"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      null
+    ]
+  },
+  "hash": "f3316021a66dd568c869d707901294f3f76a34a094de90789405fd736050e3de"
+}
