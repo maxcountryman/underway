@@ -573,8 +573,7 @@
 //!
 //! # Running workflows
 //!
-//! Workflows are run via [`runtime::Runtime`](crate::runtime::Runtime), which
-//! orchestrates workers,
+//! Workflows are run via [`Runtime`], which orchestrates workers,
 //! schedulers, and activity execution.
 //!
 //! ```rust,no_run
