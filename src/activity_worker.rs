@@ -1,4 +1,6 @@
-use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap, future::Future, marker::PhantomData, pin::Pin, sync::Arc, time::Duration,
+};
 
 use jiff::{Span, ToSpan};
 use serde_json::Value;
@@ -30,9 +32,12 @@ pub enum Error {
 
     #[error(transparent)]
     Jiff(#[from] jiff::Error),
+
+    #[error("Activity handler already bound for `{0}`")]
+    DuplicateBinding(String),
 }
 
-trait ActivityHandler: Send + Sync {
+trait ErasedActivityHandler: Send + Sync {
     fn name(&self) -> &'static str;
     fn retry_policy(&self) -> RetryPolicy;
     fn timeout(&self) -> Span;
@@ -42,11 +47,20 @@ trait ActivityHandler: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = activity::Result<Value>> + Send + 'a>>;
 }
 
-struct RegisteredActivity<A: Activity> {
-    inner: A,
+struct RegisteredActivity<A, H>
+where
+    A: Activity,
+    H: activity::ActivityHandler<A>,
+{
+    inner: H,
+    _activity: PhantomData<fn() -> A>,
 }
 
-impl<A: Activity> ActivityHandler for RegisteredActivity<A> {
+impl<A, H> ErasedActivityHandler for RegisteredActivity<A, H>
+where
+    A: Activity,
+    H: activity::ActivityHandler<A>,
+{
     fn name(&self) -> &'static str {
         A::NAME
     }
@@ -91,15 +105,32 @@ impl<A: Activity> ActivityHandler for RegisteredActivity<A> {
 
 #[derive(Clone, Default)]
 pub(crate) struct ActivityRegistry {
-    handlers: HashMap<String, Arc<dyn ActivityHandler>>,
+    handlers: HashMap<String, Arc<dyn ErasedActivityHandler>>,
 }
 
 impl ActivityRegistry {
-    pub(crate) fn register<A: Activity>(&mut self, activity: A) {
+    pub(crate) fn bind<A, H>(&mut self, handler: H) -> Result
+    where
+        A: Activity,
+        H: activity::ActivityHandler<A>,
+    {
+        if self.handlers.contains_key(A::NAME) {
+            return Err(Error::DuplicateBinding(A::NAME.to_string()));
+        }
+
         self.handlers.insert(
             A::NAME.to_string(),
-            Arc::new(RegisteredActivity { inner: activity }),
+            Arc::new(RegisteredActivity::<A, H> {
+                inner: handler,
+                _activity: PhantomData,
+            }),
         );
+
+        Ok(())
+    }
+
+    pub(crate) fn has_binding(&self, activity: &str) -> bool {
+        self.handlers.contains_key(activity)
     }
 
     pub(crate) fn is_empty(&self) -> bool {

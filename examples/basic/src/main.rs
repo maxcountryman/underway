@@ -56,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     workflow.enqueue(&ResizeImage { asset_id: 42 }).await?;
 
-    let runtime_handle = workflow.runtime().start();
+    let runtime_handle = workflow.runtime().start()?;
 
     timeout(Duration::from_secs(10), async {
         loop {

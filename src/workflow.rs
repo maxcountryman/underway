@@ -41,11 +41,11 @@
 //! Notice that the first argument to our function is [a context
 //! binding](crate::workflow::Context). This provides access to fields like
 //! [`state`](crate::workflow::Context::state) and
-//! [`workflow_run_id`](crate::workflow::Context::workflow_run_id), as well as
-//! workflow helpers like [`call`](crate::workflow::Context::call) and
-//! [`emit`](crate::workflow::Context::emit).
+//! [`workflow_run_id`](crate::workflow::Context::workflow_run_id).
+//! Durable activity invocation helpers are provided on activity contracts via
+//! [`workflow::InvokeActivity`](crate::workflow::InvokeActivity).
 //! Activity calls are type-checked against handlers registered on
-//! [`workflow::Builder::activity`](crate::workflow::Builder::activity).
+//! [`workflow::Builder::declare`](crate::workflow::Builder::declare).
 //!
 //! The second argument is a type we provide as input to the step. In our
 //! example it's the unit type. But if we were to specify another type it would
@@ -259,12 +259,14 @@
 //! Workflow steps do not expose a raw database transaction directly.
 //! Use durable activity helpers for side effects instead.
 //!
-//! Instead, durable side effects are modeled with workflow helpers:
-//! - [`Context::emit`] for fire-and-forget intents, and
-//! - [`Context::call`] for request/response effects.
+//! Instead, durable side effects are modeled with activity invocation helpers:
+//! - [`workflow::InvokeActivity::emit`](crate::workflow::InvokeActivity::emit)
+//!   for fire-and-forget intents, and
+//! - [`workflow::InvokeActivity::call`](crate::workflow::InvokeActivity::call)
+//!   for request/response effects.
 //!
-//! Activities must be registered on the workflow builder before any step that
-//! calls or emits them. Missing registrations fail at compile time.
+//! Activities must be declared on the workflow builder before any step that
+//! calls or emits them. Missing declarations fail at compile time.
 //!
 //! A `call` does **not** require user polling loops. When a call has not
 //! completed yet, it suspends the current step. The worker marks the task as
@@ -273,7 +275,11 @@
 //!
 //! ```rust
 //! use serde::{Deserialize, Serialize};
-//! use underway::{Activity, Transition, Workflow};
+//! use underway::{
+//!     activity::{Activity, ActivityHandler},
+//!     workflow::InvokeActivity,
+//!     Transition, Workflow,
+//! };
 //!
 //! #[derive(Serialize, Deserialize)]
 //! struct Step1 {
@@ -292,8 +298,12 @@
 //!
 //!     type Input = i64;
 //!     type Output = i64;
+//! }
 //!
-//!     async fn execute(&self, user_id: Self::Input) -> underway::activity::Result<Self::Output> {
+//! struct CreateProfileHandler;
+//!
+//! impl ActivityHandler<CreateProfile> for CreateProfileHandler {
+//!     async fn execute(&self, user_id: i64) -> underway::activity::Result<i64> {
 //!         Ok(user_id)
 //!     }
 //! }
@@ -305,21 +315,25 @@
 //!
 //!     type Input = i64;
 //!     type Output = ();
+//! }
 //!
-//!     async fn execute(&self, _user_id: Self::Input) -> underway::activity::Result<Self::Output> {
+//! struct WriteAuditLogHandler;
+//!
+//! impl ActivityHandler<WriteAuditLog> for WriteAuditLogHandler {
+//!     async fn execute(&self, _user_id: i64) -> underway::activity::Result<()> {
 //!         Ok(())
 //!     }
 //! }
 //!
 //! let workflow_builder = Workflow::<_, ()>::builder()
-//!     .activity(CreateProfile)
-//!     .activity(WriteAuditLog)
+//!     .declare::<CreateProfile>()
+//!     .declare::<WriteAuditLog>()
 //!     .step(|mut cx, Step1 { user_id }| async move {
 //!         // Fire-and-forget effect intent.
-//!         cx.emit::<WriteAuditLog, _>(&user_id).await?;
+//!         WriteAuditLog::emit(&mut cx, &user_id).await?;
 //!
 //!         // Suspends/resumes durably until completion.
-//!         let profile_id: i64 = cx.call::<CreateProfile, _>(&user_id).await?;
+//!         let profile_id: i64 = CreateProfile::call(&mut cx, &user_id).await?;
 //!         Transition::next(Step2 { profile_id })
 //!     })
 //!     .step(|_cx, Step2 { profile_id: _ }| async move { Transition::complete() });
@@ -329,10 +343,10 @@
 //! deterministic operation order within the step. Reordering operations in
 //! in-flight workflow runs is non-deterministic and fails execution.
 //!
-//! Because [`Context::call`] and [`Context::emit`] require mutable context,
+//! Because activity invocation helpers require mutable context,
 //! activity operations are issued sequentially within a step. Multiple
 //! unresolved calls in parallel are not supported; issue calls as
-//! `call(...).await?`.
+//! `MyActivity::call(&mut cx, ...).await?`.
 //!
 //! If a workflow needs direct transaction-level database semantics, implement
 //! [`Task`] directly and use its `execute` method, which receives
@@ -584,7 +598,7 @@
 //!     .await?;
 //!
 //! // This starts runtime workers in the background (non-blocking).
-//! let runtime_handle = workflow.runtime().start();
+//! let runtime_handle = workflow.runtime().start()?;
 //! runtime_handle.shutdown().await?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! # });
@@ -682,7 +696,7 @@
 //! let weekly = "@weekly[America/Los_Angeles]".parse()?;
 //! workflow.schedule(&weekly, &()).await?;
 //!
-//! let runtime_handle = workflow.runtime().start();
+//! let runtime_handle = workflow.runtime().start()?;
 //! runtime_handle.shutdown().await?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! # });
@@ -709,8 +723,8 @@ use std::{
 
 pub use builder::Builder;
 use builder::Initial;
-pub use context::Context;
 use context::{ActivityCallBuffer, ActivityCallRecord, CallSequenceState, ContextParts};
+pub use context::{Context, InvokeActivity};
 use jiff::Span;
 use sealed::{WorkflowScheduleTemplate, WorkflowState};
 use serde::{Deserialize, Serialize};
@@ -723,9 +737,8 @@ use uuid::Uuid;
 
 use crate::{
     activity::CallState,
-    activity_worker::ActivityRegistry,
     queue::{Error as QueueError, InProgressTask, Queue},
-    runtime::Runtime,
+    runtime::RuntimeBuilder,
     scheduler::{Error as SchedulerError, ZonedSchedule},
     task::{
         Error as TaskError, Result as TaskResult, RetryPolicy, State as TaskState, Task, TaskId,
@@ -909,7 +922,7 @@ where
     queue: Arc<WorkflowQueue<I, S>>,
     steps: Arc<Vec<StepConfig<S>>>,
     state: S,
-    activity_registry: ActivityRegistry,
+    declared_activities: Arc<Vec<String>>,
     _marker: PhantomData<fn() -> I>,
 }
 
@@ -1513,11 +1526,12 @@ where
         Arc::clone(&self.queue)
     }
 
-    pub(crate) fn activity_registry(&self) -> ActivityRegistry {
-        self.activity_registry.clone()
+    pub(crate) fn declared_activities(&self) -> Arc<Vec<String>> {
+        Arc::clone(&self.declared_activities)
     }
 
-    /// Creates a [`Runtime`] for this workflow.
+    /// Creates a [`RuntimeBuilder`](crate::runtime::RuntimeBuilder) for this
+    /// workflow.
     ///
     /// # Example
     ///
@@ -1545,8 +1559,8 @@ where
     /// # });
     /// # }
     /// ```
-    pub fn runtime(&self) -> Runtime<I, S> {
-        Runtime::new(self.clone())
+    pub fn runtime(&self) -> RuntimeBuilder<I, S> {
+        RuntimeBuilder::new(self.clone())
     }
 
     fn first_workflow_input(&self, input: &I) -> Result<WorkflowState> {
@@ -1822,7 +1836,7 @@ where
             queue: self.queue.clone(),
             state: self.state.clone(),
             steps: self.steps.clone(),
-            activity_registry: self.activity_registry.clone(),
+            declared_activities: Arc::clone(&self.declared_activities),
             _marker: PhantomData,
         }
     }
@@ -1839,9 +1853,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        activity::{Activity, Error as ActivityError, Result as ActivityResult},
+        activity::{Activity, ActivityHandler, Error as ActivityError, Result as ActivityResult},
         queue::graceful_shutdown,
         worker::pg_interval_to_span,
+        workflow::InvokeActivity,
     };
 
     struct EchoActivity;
@@ -1851,8 +1866,10 @@ mod tests {
 
         type Input = String;
         type Output = String;
+    }
 
-        async fn execute(&self, input: Self::Input) -> ActivityResult<Self::Output> {
+    impl ActivityHandler<EchoActivity> for EchoActivity {
+        async fn execute(&self, input: String) -> ActivityResult<String> {
             Ok(format!("echo:{input}"))
         }
     }
@@ -1864,8 +1881,10 @@ mod tests {
 
         type Input = String;
         type Output = ();
+    }
 
-        async fn execute(&self, input: Self::Input) -> ActivityResult<Self::Output> {
+    impl ActivityHandler<EmailActivity> for EmailActivity {
+        async fn execute(&self, input: String) -> ActivityResult<()> {
             if input.is_empty() {
                 return Err(ActivityError::fatal(
                     "empty_message",
@@ -2032,7 +2051,10 @@ mod tests {
 
         workflow.enqueue(&()).await?;
 
-        let runtime_handle = workflow.runtime().start();
+        let runtime_handle = workflow
+            .runtime()
+            .start()
+            .expect("Runtime should start cleanly");
 
         // Give the workflow a moment to process.
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -2586,9 +2608,9 @@ mod tests {
         }
 
         let workflow = Workflow::builder()
-            .activity(EchoActivity)
+            .declare::<EchoActivity>()
             .step(|mut cx, Input { message }| async move {
-                let _: String = cx.call::<EchoActivity, _>(&message).await?;
+                let _: String = EchoActivity::call(&mut cx, &message).await?;
                 Transition::complete()
             })
             .name("call_suspends_and_persists_activity_intent")
@@ -2649,9 +2671,9 @@ mod tests {
         }
 
         let workflow = Workflow::builder()
-            .activity(EmailActivity)
+            .declare::<EmailActivity>()
             .step(|mut cx, Input { message }| async move {
-                cx.emit::<EmailActivity, _>(&message).await?;
+                EmailActivity::emit(&mut cx, &message).await?;
                 Err(TaskError::Retryable("retry me".to_string()))
             })
             .name("emit_not_persisted_on_retryable_failure")
@@ -2693,9 +2715,9 @@ mod tests {
         }
 
         let workflow = Workflow::builder()
-            .activity(EmailActivity)
+            .declare::<EmailActivity>()
             .step(|mut cx, Input { message }| async move {
-                cx.emit::<EmailActivity, _>(&message).await?;
+                EmailActivity::emit(&mut cx, &message).await?;
                 Transition::complete()
             })
             .name("emit_persisted_on_success")
@@ -2737,12 +2759,12 @@ mod tests {
         }
 
         let workflow = Workflow::builder()
-            .activity(EchoActivity)
+            .declare::<EchoActivity>()
             .step(|mut cx, Input { message }| async move {
-                let first = cx.call::<EchoActivity, _>(&message).await;
+                let first = EchoActivity::call(&mut cx, &message).await;
                 assert!(matches!(first, Err(TaskError::Suspended(_))));
 
-                let _ = cx.call::<EchoActivity, _>(&message).await?;
+                let _ = EchoActivity::call(&mut cx, &message).await?;
 
                 Transition::complete()
             })

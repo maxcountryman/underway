@@ -18,9 +18,9 @@
 //!   layer; queue coordination and task claiming happen in PostgreSQL.
 //! - **Model Business Flows in Typed Rust** Build multi-step workflows with
 //!   compile-time checked step inputs, outputs, and transitions.
-//! - **Make Side Effects Durable and Replay-Safe** `Context::call` and
-//!   `Context::emit` persist side-effect intent, and registered activities are
-//!   compile-time checked.
+//! - **Make Side Effects Durable and Replay-Safe** `InvokeActivity::call` and
+//!   `InvokeActivity::emit` persist side-effect intent, and declared activities
+//!   are compile-time checked.
 //! - **Operate with Production Controls** Transactional `*_using` APIs,
 //!   retries, cron scheduling, heartbeats, and fencing support reliable
 //!   high-concurrency execution.
@@ -59,7 +59,7 @@
 //!
 //! workflow.enqueue(&SendWelcomeEmail { user_id: 42 }).await?;
 //!
-//! let runtime_handle = workflow.runtime().start();
+//! let runtime_handle = workflow.runtime().start()?;
 //! runtime_handle.shutdown().await?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! # });
@@ -74,21 +74,22 @@
 //!
 //! For durable side effects beyond plain step chaining, workflows can invoke
 //! activities through
-//! [`workflow::Context::call`](crate::workflow::Context::call)
-//! and [`workflow::Context::emit`](crate::workflow::Context::emit).
+//! [`workflow::InvokeActivity`](crate::workflow::InvokeActivity).
 //!
 //! - `call` is request/response and may suspend a step until the activity
 //!   completes.
 //! - `emit` is fire-and-forget and records intent durably.
 //!
-//! Activity handlers are registered on [`Workflow::builder`] via
-//! [`workflow::Builder::activity`](crate::workflow::Builder::activity), and
-//! then run by the workflow's runtime.
+//! Activity contracts are declared on [`Workflow::builder`] via
+//! [`workflow::Builder::declare`](crate::workflow::Builder::declare).
+//! Concrete handlers are then bound on the runtime builder.
 //!
 //! ```rust,no_run
 //! use serde::{Deserialize, Serialize};
 //! use sqlx::PgPool;
-//! use underway::{Activity, ActivityError, Transition, Workflow};
+//! use underway::{
+//!     Activity, ActivityError, ActivityHandler, InvokeActivity, Transition, Workflow,
+//! };
 //!
 //! #[derive(Deserialize, Serialize)]
 //! struct Input {
@@ -102,8 +103,12 @@
 //!
 //!     type Input = i64;
 //!     type Output = String;
+//! }
 //!
-//!     async fn execute(&self, user_id: Self::Input) -> underway::activity::Result<Self::Output> {
+//! struct ResolveEmailHandler;
+//!
+//! impl ActivityHandler<ResolveEmail> for ResolveEmailHandler {
+//!     async fn execute(&self, user_id: i64) -> underway::activity::Result<String> {
 //!         if user_id <= 0 {
 //!             return Err(ActivityError::fatal(
 //!                 "invalid_user",
@@ -121,9 +126,9 @@
 //! # rt.block_on(async {
 //! # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
 //! let workflow = Workflow::builder()
-//!     .activity(ResolveEmail)
+//!     .declare::<ResolveEmail>()
 //!     .step(|mut cx, Input { user_id }| async move {
-//!         let _email: String = cx.call::<ResolveEmail, _>(&user_id).await?;
+//!         let _email: String = ResolveEmail::call(&mut cx, &user_id).await?;
 //!         Transition::complete()
 //!     })
 //!     .name("resolve-email")
@@ -131,7 +136,11 @@
 //!     .build()
 //!     .await?;
 //!
-//! workflow.runtime().run().await?;
+//! workflow
+//!     .runtime()
+//!     .bind::<ResolveEmail>(ResolveEmailHandler)?
+//!     .run()
+//!     .await?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! # });
 //! # }
@@ -181,7 +190,7 @@
 //!
 //! workflow.enqueue(&ResizeImage { asset_id: 42 }).await?;
 //!
-//! let runtime_handle = workflow.runtime().start();
+//! let runtime_handle = workflow.runtime().start()?;
 //! runtime_handle.shutdown().await?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! # });
@@ -193,20 +202,26 @@
 //! ```rust,no_run
 //! use serde::{Deserialize, Serialize};
 //! use sqlx::PgPool;
-//! use underway::{Activity, ActivityError, Transition, Workflow};
+//! use underway::{
+//!     Activity, ActivityError, ActivityHandler, InvokeActivity, Transition, Workflow,
+//! };
 //!
-//! #[derive(Clone)]
-//! struct LookupEmail {
-//!     pool: PgPool,
-//! }
+//! struct LookupEmail;
 //!
 //! impl Activity for LookupEmail {
 //!     const NAME: &'static str = "lookup-email";
 //!
 //!     type Input = i64;
 //!     type Output = String;
+//! }
 //!
-//!     async fn execute(&self, user_id: Self::Input) -> underway::activity::Result<Self::Output> {
+//! #[derive(Clone)]
+//! struct LookupEmailHandler {
+//!     pool: PgPool,
+//! }
+//!
+//! impl ActivityHandler<LookupEmail> for LookupEmailHandler {
+//!     async fn execute(&self, user_id: i64) -> underway::activity::Result<String> {
 //!         let email =
 //!             sqlx::query_scalar::<_, String>("select concat('user-', $1::text, '@example.com')")
 //!                 .bind(user_id)
@@ -225,8 +240,12 @@
 //!
 //!     type Input = String;
 //!     type Output = ();
+//! }
 //!
-//!     async fn execute(&self, email: Self::Input) -> underway::activity::Result<Self::Output> {
+//! struct TrackSignupMetricHandler;
+//!
+//! impl ActivityHandler<TrackSignupMetric> for TrackSignupMetricHandler {
+//!     async fn execute(&self, email: String) -> underway::activity::Result<()> {
 //!         println!("tracking signup metric for {email}");
 //!         Ok(())
 //!     }
@@ -245,20 +264,25 @@
 //! underway::run_migrations(&pool).await?;
 //!
 //! let workflow = Workflow::builder()
-//!     .activity(LookupEmail { pool: pool.clone() })
-//!     .activity(TrackSignupMetric)
+//!     .declare::<LookupEmail>()
+//!     .declare::<TrackSignupMetric>()
 //!     .step(|mut cx, Signup { user_id }| async move {
-//!         let email: String = cx.call::<LookupEmail, _>(&user_id).await?;
-//!         cx.emit::<TrackSignupMetric, _>(&email).await?;
+//!         let email: String = LookupEmail::call(&mut cx, &user_id).await?;
+//!         TrackSignupMetric::emit(&mut cx, &email).await?;
 //!         Transition::complete()
 //!     })
 //!     .name("signup-side-effects")
-//!     .pool(pool)
+//!     .pool(pool.clone())
 //!     .build()
 //!     .await?;
 //!
 //! workflow.enqueue(&Signup { user_id: 42 }).await?;
-//! workflow.runtime().run().await?;
+//! workflow
+//!     .runtime()
+//!     .bind::<LookupEmail>(LookupEmailHandler { pool: pool.clone() })?
+//!     .bind::<TrackSignupMetric>(TrackSignupMetricHandler)?
+//!     .run()
+//!     .await?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! # });
 //! # }
@@ -358,8 +382,8 @@
 //! ## Activities
 //!
 //! Activities are durable side-effect handlers invoked from workflow steps
-//! through [`workflow::Context::call`](crate::workflow::Context::call) and
-//! [`workflow::Context::emit`](crate::workflow::Context::emit).
+//! through [`workflow::InvokeActivity::call`](crate::workflow::InvokeActivity::call)
+//! and [`workflow::InvokeActivity::emit`](crate::workflow::InvokeActivity::emit).
 //!
 //! See [`activity`] for more details about activity handlers and errors.
 //!
@@ -382,13 +406,13 @@
 use sqlx::{migrate::Migrator, Acquire, Postgres};
 
 pub use crate::{
-    activity::{Activity, CallState as ActivityCallState, Error as ActivityError},
+    activity::{Activity, ActivityHandler, CallState as ActivityCallState, Error as ActivityError},
     queue::Queue,
-    runtime::Runtime,
+    runtime::{Runtime, RuntimeBuilder},
     scheduler::{Scheduler, ZonedSchedule},
     task::{Task, ToTaskResult},
     worker::Worker,
-    workflow::{Transition, Workflow},
+    workflow::{InvokeActivity, Transition, Workflow},
 };
 
 pub mod activity;

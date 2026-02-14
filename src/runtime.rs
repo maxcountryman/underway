@@ -17,7 +17,11 @@
 //! ```rust,no_run
 //! use serde::{Deserialize, Serialize};
 //! use sqlx::PgPool;
-//! use underway::{Activity, ActivityError, Transition, Workflow};
+//! use underway::{
+//!     activity::{Activity, ActivityHandler, Error as ActivityError},
+//!     workflow::InvokeActivity,
+//!     Transition, Workflow,
+//! };
 //!
 //! #[derive(Deserialize, Serialize)]
 //! struct FetchUser {
@@ -31,8 +35,12 @@
 //!
 //!     type Input = i64;
 //!     type Output = String;
+//! }
 //!
-//!     async fn execute(&self, user_id: Self::Input) -> underway::activity::Result<Self::Output> {
+//! struct LookupEmailHandler;
+//!
+//! impl ActivityHandler<LookupEmail> for LookupEmailHandler {
+//!     async fn execute(&self, user_id: i64) -> underway::activity::Result<String> {
 //!         if user_id <= 0 {
 //!             return Err(ActivityError::fatal(
 //!                 "invalid_user",
@@ -48,9 +56,9 @@
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
 //!     let workflow = Workflow::builder()
-//!         .activity(LookupEmail)
+//!         .declare::<LookupEmail>()
 //!         .step(|mut cx, FetchUser { user_id }| async move {
-//!             let email: String = cx.call::<LookupEmail, _>(&user_id).await?;
+//!             let email: String = LookupEmail::call(&mut cx, &user_id).await?;
 //!             println!("Got email {email}");
 //!             Transition::complete()
 //!         })
@@ -59,7 +67,11 @@
 //!         .build()
 //!         .await?;
 //!
-//!     workflow.runtime().run().await?;
+//!     workflow
+//!         .runtime()
+//!         .bind::<LookupEmail>(LookupEmailHandler)?
+//!         .run()
+//!         .await?;
 //!     Ok(())
 //! }
 //! ```
@@ -69,7 +81,8 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    activity_worker::{ActivityWorker, Error as ActivityWorkerError},
+    activity::{Activity, ActivityHandler},
+    activity_worker::{ActivityRegistry, ActivityWorker, Error as ActivityWorkerError},
     scheduler::{Error as SchedulerError, Scheduler},
     worker::{Error as WorkerError, Worker},
     workflow::Workflow,
@@ -81,6 +94,15 @@ pub type Result<T = ()> = std::result::Result<T, Error>;
 /// Runtime errors.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// One or more declared activities were not bound on the runtime.
+    #[error("Missing runtime bindings for declared activities: {0:?}")]
+    MissingActivityBindings(Vec<String>),
+
+    /// Attempted to bind a handler for an activity not declared on the
+    /// workflow.
+    #[error("Cannot bind undeclared activity `{0}` on this workflow runtime")]
+    UndeclaredActivityBinding(String),
+
     /// Error returned from worker operation.
     #[error(transparent)]
     Worker(#[from] WorkerError),
@@ -96,6 +118,16 @@ pub enum Error {
     /// Error returned from Tokio task joins.
     #[error(transparent)]
     Join(#[from] tokio::task::JoinError),
+}
+
+/// Builder for configuring workflow runtimes.
+pub struct RuntimeBuilder<I, S>
+where
+    I: Serialize + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
+{
+    workflow: Workflow<I, S>,
+    activity_registry: ActivityRegistry,
 }
 
 /// Handle returned by [`Runtime::start`].
@@ -147,26 +179,98 @@ where
     }
 }
 
+impl<I, S> RuntimeBuilder<I, S>
+where
+    I: Serialize + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
+{
+    pub(crate) fn new(workflow: Workflow<I, S>) -> Self {
+        Self {
+            workflow,
+            activity_registry: ActivityRegistry::default(),
+        }
+    }
+
+    /// Returns a reference to the workflow backing this runtime builder.
+    pub fn workflow(&self) -> &Workflow<I, S> {
+        &self.workflow
+    }
+
+    /// Creates a workflow worker for this runtime's workflow.
+    pub fn worker(&self) -> Worker<Workflow<I, S>> {
+        Worker::new(self.workflow.queue(), self.workflow.clone())
+    }
+
+    /// Creates a workflow scheduler for this runtime's workflow.
+    pub fn scheduler(&self) -> Scheduler<Workflow<I, S>> {
+        Scheduler::new(self.workflow.queue(), self.workflow.clone())
+    }
+
+    /// Binds a concrete activity handler implementation.
+    pub fn bind<A>(mut self, handler: impl ActivityHandler<A>) -> Result<Self>
+    where
+        A: Activity,
+    {
+        let declared_activities = self.workflow.declared_activities();
+        if !declared_activities
+            .iter()
+            .any(|activity| activity == A::NAME)
+        {
+            return Err(Error::UndeclaredActivityBinding(A::NAME.to_string()));
+        }
+
+        self.activity_registry.bind::<A, _>(handler)?;
+
+        Ok(self)
+    }
+
+    /// Builds a runtime after validating all declared activities were bound.
+    pub fn build(self) -> Result<Runtime<I, S>> {
+        self.validate_bindings()?;
+
+        let activity_worker = ActivityWorker::with_registry(
+            self.workflow.queue().pool.clone(),
+            self.workflow.queue().name.clone(),
+            self.activity_registry,
+        );
+
+        Ok(Runtime {
+            workflow: self.workflow,
+            activity_worker,
+        })
+    }
+
+    /// Runs this runtime configuration to completion.
+    pub async fn run(self) -> Result {
+        self.build()?.run().await
+    }
+
+    /// Starts this runtime configuration in background tasks.
+    pub fn start(self) -> Result<RuntimeHandle> {
+        Ok(self.build()?.start())
+    }
+
+    fn validate_bindings(&self) -> Result {
+        let declared_activities = self.workflow.declared_activities();
+        let missing = declared_activities
+            .iter()
+            .filter(|activity| !self.activity_registry.has_binding(activity))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if !missing.is_empty() {
+            return Err(Error::MissingActivityBindings(missing));
+        }
+
+        Ok(())
+    }
+}
+
 impl<I, S> Runtime<I, S>
 where
     I: Serialize + Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
 {
-    /// Creates a runtime from a workflow.
-    ///
-    /// Registered activity handlers are sourced from the workflow's builder.
-    pub fn new(workflow: Workflow<I, S>) -> Self {
-        let activity_worker = ActivityWorker::with_registry(
-            workflow.queue().pool.clone(),
-            workflow.queue().name.clone(),
-            workflow.activity_registry(),
-        );
-        Self {
-            workflow,
-            activity_worker,
-        }
-    }
-
     /// Returns a reference to the workflow managed by this runtime.
     pub fn workflow(&self) -> &Workflow<I, S> {
         &self.workflow
@@ -260,7 +364,7 @@ where
     }
 }
 
-impl<I, S> From<Workflow<I, S>> for Runtime<I, S>
+impl<I, S> From<Workflow<I, S>> for RuntimeBuilder<I, S>
 where
     I: Serialize + Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
@@ -281,9 +385,9 @@ mod tests {
         time::{sleep, timeout, Duration},
     };
 
-    use super::Runtime;
     use crate::{
-        activity::{Activity, CallState, Result as ActivityResult},
+        activity::{Activity, ActivityHandler, CallState, Result as ActivityResult},
+        workflow::InvokeActivity,
         Transition, Workflow,
     };
 
@@ -294,8 +398,10 @@ mod tests {
 
         type Input = String;
         type Output = String;
+    }
 
-        async fn execute(&self, input: Self::Input) -> ActivityResult<Self::Output> {
+    impl ActivityHandler<EchoActivity> for EchoActivity {
+        async fn execute(&self, input: String) -> ActivityResult<String> {
             Ok(format!("echo:{input}"))
         }
     }
@@ -307,8 +413,10 @@ mod tests {
 
         type Input = String;
         type Output = String;
+    }
 
-        async fn execute(&self, input: Self::Input) -> ActivityResult<Self::Output> {
+    impl ActivityHandler<ReverseActivity> for ReverseActivity {
+        async fn execute(&self, input: String) -> ActivityResult<String> {
             Ok(input.chars().rev().collect())
         }
     }
@@ -336,9 +444,9 @@ mod tests {
         let outputs_step = outputs.clone();
 
         let workflow = Workflow::builder()
-            .activity(EchoActivity)
+            .declare::<EchoActivity>()
             .step(|mut cx, Step1 { message }| async move {
-                let echoed: String = cx.call::<EchoActivity, _>(&message).await?;
+                let echoed: String = EchoActivity::call(&mut cx, &message).await?;
                 Transition::next(Step2 { echoed })
             })
             .step(move |_cx, Step2 { echoed }| {
@@ -353,16 +461,16 @@ mod tests {
             .build()
             .await?;
 
-        let runtime = Runtime::new(workflow);
-
-        runtime
-            .workflow()
+        workflow
             .enqueue(&Step1 {
                 message: "hello".to_string(),
             })
             .await?;
 
-        let handle = runtime.start();
+        let handle = workflow
+            .runtime()
+            .bind::<EchoActivity>(EchoActivity)?
+            .start()?;
 
         timeout(Duration::from_secs(10), async {
             loop {
@@ -387,7 +495,7 @@ mod tests {
             limit 1
             "#,
         )
-        .bind(runtime.workflow().queue().name.as_str())
+        .bind(workflow.queue().name.as_str())
         .bind(EchoActivity::NAME)
         .fetch_one(&pool)
         .await?;
@@ -403,7 +511,7 @@ mod tests {
             order by a.attempt_number desc
             limit 1
             "#,
-            runtime.workflow().queue().name,
+            workflow.queue().name,
             call_key,
         )
         .fetch_one(&pool)
@@ -423,9 +531,9 @@ mod tests {
         let queue_name = "runtime_shared_queue_activity_scope";
 
         let workflow = Workflow::builder()
-            .activity(EchoActivity)
+            .declare::<EchoActivity>()
             .step(|mut cx, MessageInput { message }| async move {
-                let _: String = cx.call::<EchoActivity, _>(&message).await?;
+                let _: String = EchoActivity::call(&mut cx, &message).await?;
                 Transition::complete()
             })
             .name(queue_name)
@@ -472,14 +580,17 @@ mod tests {
         assert_eq!(call_state, CallState::Pending);
 
         let unrelated_workflow = Workflow::builder()
-            .activity(ReverseActivity)
+            .declare::<ReverseActivity>()
             .step(|_cx, _: MessageInput| async move { Transition::complete() })
             .name(queue_name)
             .pool(pool.clone())
             .build()
             .await?;
 
-        let handle = unrelated_workflow.runtime().start();
+        let handle = unrelated_workflow
+            .runtime()
+            .bind::<ReverseActivity>(ReverseActivity)?
+            .start()?;
         sleep(Duration::from_millis(300)).await;
         handle.shutdown().await?;
 
@@ -509,9 +620,9 @@ mod tests {
         let outputs_step = outputs.clone();
 
         let workflow = Workflow::builder()
-            .activity(EchoActivity)
+            .declare::<EchoActivity>()
             .step(|mut cx, Step1 { message }| async move {
-                let echoed: String = cx.call::<EchoActivity, _>(&message).await?;
+                let echoed: String = EchoActivity::call(&mut cx, &message).await?;
                 Transition::next(Step2 { echoed })
             })
             .step(move |_cx, Step2 { echoed }| {
@@ -598,8 +709,10 @@ mod tests {
         .execute(&pool)
         .await?;
 
-        let runtime = workflow.runtime();
-        let handle = runtime.start();
+        let handle = workflow
+            .runtime()
+            .bind::<EchoActivity>(EchoActivity)?
+            .start()?;
 
         timeout(Duration::from_secs(10), async {
             loop {
