@@ -11,6 +11,7 @@ use super::{
 };
 use crate::{
     activity::Activity,
+    activity_worker::ActivityRegistry,
     queue::Queue,
     task::{Result as TaskResult, RetryPolicy},
 };
@@ -62,7 +63,7 @@ type BuilderMarker<I, O, S, A> = fn() -> (I, O, S, A);
 pub struct Builder<I, O, S, B, A = NoActivities> {
     builder_state: B,
     steps: Vec<StepConfig<S>>,
-    declared_activities: Vec<String>,
+    activity_registry: ActivityRegistry,
     _marker: PhantomData<BuilderMarker<I, O, S, A>>,
 }
 
@@ -76,18 +77,18 @@ impl<I, S, ASet> Builder<I, I, S, Initial, ASet>
 where
     ASet: 'static,
 {
-    /// Declares an activity contract for subsequent steps.
-    pub fn declare<A>(mut self) -> Builder<I, I, S, Initial, Registered<A, ASet>>
+    /// Registers an activity handler for subsequent steps.
+    pub fn activity<A>(mut self, activity: A) -> Builder<I, I, S, Initial, Registered<A, ASet>>
     where
         ASet: ActivitySet,
         A: Activity,
     {
-        self.declared_activities.push(A::NAME.to_string());
+        self.activity_registry.register(activity);
 
         Builder::<I, I, S, Initial, Registered<A, ASet>> {
             builder_state: Initial,
             steps: Vec::new(),
-            declared_activities: self.declared_activities,
+            activity_registry: self.activity_registry,
             _marker: PhantomData,
         }
     }
@@ -106,7 +107,7 @@ where
         Builder::<I, I, S, _, NoActivities> {
             builder_state: Initial,
             steps: Vec::new(),
-            declared_activities: Vec::new(),
+            activity_registry: ActivityRegistry::default(),
             _marker: PhantomData,
         }
     }
@@ -141,7 +142,7 @@ where
         Builder {
             builder_state: StateSet { state },
             steps: self.steps,
-            declared_activities: self.declared_activities,
+            activity_registry: self.activity_registry,
             _marker: PhantomData,
         }
     }
@@ -183,7 +184,7 @@ where
                 _marker: PhantomData,
             },
             steps: self.steps,
-            declared_activities: self.declared_activities,
+            activity_registry: self.activity_registry,
             _marker: PhantomData,
         }
     }
@@ -194,20 +195,20 @@ impl<I, S, ASet> Builder<I, I, S, StateSet<S>, ASet>
 where
     ASet: 'static,
 {
-    /// Declares an activity contract for subsequent steps.
-    pub fn declare<A>(mut self) -> Builder<I, I, S, StateSet<S>, Registered<A, ASet>>
+    /// Registers an activity handler for subsequent steps.
+    pub fn activity<A>(mut self, activity: A) -> Builder<I, I, S, StateSet<S>, Registered<A, ASet>>
     where
         ASet: ActivitySet,
         A: Activity,
     {
-        self.declared_activities.push(A::NAME.to_string());
+        self.activity_registry.register(activity);
 
         Builder::<I, I, S, StateSet<S>, Registered<A, ASet>> {
             builder_state: StateSet {
                 state: self.builder_state.state,
             },
             steps: Vec::new(),
-            declared_activities: self.declared_activities,
+            activity_registry: self.activity_registry,
             _marker: PhantomData,
         }
     }
@@ -260,7 +261,7 @@ where
                 _marker: PhantomData,
             },
             steps: self.steps,
-            declared_activities: self.declared_activities,
+            activity_registry: self.activity_registry,
             _marker: PhantomData,
         }
     }
@@ -308,7 +309,7 @@ where
                 _marker: PhantomData,
             },
             steps: self.steps,
-            declared_activities: self.declared_activities,
+            activity_registry: self.activity_registry,
             _marker: PhantomData,
         }
     }
@@ -343,7 +344,7 @@ where
                 _marker: PhantomData,
             },
             steps: self.steps,
-            declared_activities: self.declared_activities,
+            activity_registry: self.activity_registry,
             _marker: PhantomData,
         }
     }
@@ -370,7 +371,7 @@ where
                 _marker: PhantomData,
             },
             steps: self.steps,
-            declared_activities: self.declared_activities,
+            activity_registry: self.activity_registry,
             _marker: PhantomData,
         }
     }
@@ -397,7 +398,7 @@ where
                 _marker: PhantomData,
             },
             steps: self.steps,
-            declared_activities: self.declared_activities,
+            activity_registry: self.activity_registry,
             _marker: PhantomData,
         }
     }
@@ -426,7 +427,7 @@ where
                 _marker: PhantomData,
             },
             steps: self.steps,
-            declared_activities: self.declared_activities,
+            activity_registry: self.activity_registry,
             _marker: PhantomData,
         }
     }
@@ -456,7 +457,7 @@ where
                 _marker: PhantomData,
             },
             steps: self.steps,
-            declared_activities: self.declared_activities,
+            activity_registry: self.activity_registry,
             _marker: PhantomData,
         }
     }
@@ -485,7 +486,7 @@ where
                 _marker: PhantomData,
             },
             steps: self.steps,
-            declared_activities: self.declared_activities,
+            activity_registry: self.activity_registry,
             _marker: PhantomData,
         }
     }
@@ -511,7 +512,7 @@ where
                 _marker: PhantomData,
             },
             steps: self.steps,
-            declared_activities: self.declared_activities,
+            activity_registry: self.activity_registry,
             _marker: PhantomData,
         }
     }
@@ -550,7 +551,7 @@ where
                 queue_name: name.into(),
             },
             steps: self.steps,
-            declared_activities: self.declared_activities,
+            activity_registry: self.activity_registry,
             _marker: PhantomData,
         }
     }
@@ -598,7 +599,7 @@ where
                 pool,
             },
             steps: self.steps,
-            declared_activities: self.declared_activities,
+            activity_registry: self.activity_registry,
             _marker: PhantomData,
         }
     }
@@ -647,7 +648,7 @@ where
             queue: Arc::new(queue),
             steps: Arc::new(self.steps),
             state,
-            declared_activities: Arc::new(self.declared_activities),
+            activity_registry: self.activity_registry,
             _marker: PhantomData,
         })
     }
@@ -696,7 +697,7 @@ where
                 queue,
             },
             steps: self.steps,
-            declared_activities: self.declared_activities,
+            activity_registry: self.activity_registry,
             _marker: PhantomData,
         }
     }
@@ -740,7 +741,7 @@ where
             queue: Arc::new(queue),
             steps: Arc::new(self.steps),
             state,
-            declared_activities: Arc::new(self.declared_activities),
+            activity_registry: self.activity_registry,
             _marker: PhantomData,
         }
     }

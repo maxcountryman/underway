@@ -2,10 +2,10 @@ use std::marker::PhantomData;
 
 use crate::activity::Activity;
 
-/// Marker type representing no declared activities.
+/// Marker type representing no registered activities.
 pub struct NoActivities;
 
-/// Type-level set node for declared activities.
+/// Type-level set node for registered activities.
 pub struct Registered<Head, Tail>(pub(crate) PhantomData<(Head, Tail)>);
 
 /// Type-level index for the head of a set.
@@ -18,7 +18,7 @@ mod sealed {
     pub trait ActivitySet {}
 }
 
-/// Type-level set of activities declared on a workflow builder.
+/// Type-level set of activities registered on a workflow builder.
 pub trait ActivitySet: sealed::ActivitySet + 'static {}
 
 impl<T> ActivitySet for T where T: sealed::ActivitySet + 'static {}

@@ -6,24 +6,20 @@ use tokio::{
     sync::Mutex,
     time::{sleep, timeout},
 };
-use underway::{Activity, ActivityError, ActivityHandler, InvokeActivity, Transition, Workflow};
+use underway::{Activity, ActivityError, Transition, Workflow};
 
-struct LookupEmail;
+#[derive(Clone)]
+struct LookupEmail {
+    pool: PgPool,
+}
 
 impl Activity for LookupEmail {
     const NAME: &'static str = "lookup-email";
 
     type Input = i64;
     type Output = String;
-}
 
-#[derive(Clone)]
-struct LookupEmailHandler {
-    pool: PgPool,
-}
-
-impl ActivityHandler<LookupEmail> for LookupEmailHandler {
-    async fn execute(&self, user_id: i64) -> underway::activity::Result<String> {
+    async fn execute(&self, user_id: Self::Input) -> underway::activity::Result<Self::Output> {
         let email = sqlx::query_scalar::<_, String>("select concat('user-', $1::text, '@example.com')")
             .bind(user_id)
             .fetch_one(&self.pool)
@@ -41,12 +37,8 @@ impl Activity for TrackSignupMetric {
 
     type Input = String;
     type Output = ();
-}
 
-struct TrackSignupMetricHandler;
-
-impl ActivityHandler<TrackSignupMetric> for TrackSignupMetricHandler {
-    async fn execute(&self, email: String) -> underway::activity::Result<()> {
+    async fn execute(&self, email: Self::Input) -> underway::activity::Result<Self::Output> {
         println!("Tracked signup metric for {email}");
         Ok(())
     }
@@ -73,30 +65,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let workflow = Workflow::builder()
         .state(state.clone())
-        .declare::<LookupEmail>()
-        .declare::<TrackSignupMetric>()
+        .activity(LookupEmail { pool: pool.clone() })
+        .activity(TrackSignupMetric)
         .step(|mut cx, Signup { user_id }| {
             let resolved_emails = cx.state.resolved_emails.clone();
 
             async move {
-                let email: String = LookupEmail::call(&mut cx, &user_id).await?;
-                TrackSignupMetric::emit(&mut cx, &email).await?;
+                let email: String = cx.call::<LookupEmail, _>(&user_id).await?;
+                cx.emit::<TrackSignupMetric, _>(&email).await?;
                 resolved_emails.lock().await.push(email);
                 Transition::complete()
             }
         })
         .name("example-activities-workflow")
-        .pool(pool.clone())
+        .pool(pool)
         .build()
         .await?;
 
     workflow.enqueue(&Signup { user_id: 42 }).await?;
 
-    let runtime_handle = workflow
-        .runtime()
-        .bind::<LookupEmail>(LookupEmailHandler { pool: pool.clone() })?
-        .bind::<TrackSignupMetric>(TrackSignupMetricHandler)?
-        .start()?;
+    let runtime_handle = workflow.runtime().start();
 
     timeout(Duration::from_secs(10), async {
         loop {

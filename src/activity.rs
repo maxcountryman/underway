@@ -1,23 +1,20 @@
 //! Activities for durable workflow side effects.
 //!
-//! Activity definitions are split into two parts:
-//! - [`Activity`], the durable contract (name + input/output types), and
-//! - [`ActivityHandler`], the runtime implementation bound on a runtime.
+//! Activities are units of side-effecting work invoked by workflow steps.
+//! Unlike workflow code, activity handlers are expected to perform external
+//! I/O such as HTTP requests, emails, or writes to other systems.
 //!
-//! Workflow steps invoke activities through
-//! [`workflow::InvokeActivity`](crate::workflow::InvokeActivity). Calls are
-//! persisted and executed asynchronously by the runtime's activity worker.
+//! Workflow steps call activities via [`crate::workflow::Context::call`] and
+//! [`crate::workflow::Context::emit`]. Calls are persisted and executed by the
+//! activity worker managed by [`crate::Runtime`].
 //!
-//! # Defining activity contracts and handlers
+//! # Defining activities
 //!
-//! ```rust,no_run
+//! Activities are ordinary Rust types implementing [`Activity`].
+//!
+//! ```rust
 //! use serde::{Deserialize, Serialize};
-//! use sqlx::PgPool;
-//! use underway::{
-//!     activity::{Activity, ActivityHandler, Error, Result},
-//!     workflow::InvokeActivity,
-//!     Transition, Workflow,
-//! };
+//! use underway::activity::{Activity, Error, Result};
 //!
 //! #[derive(Deserialize, Serialize)]
 //! struct SendEmail {
@@ -32,12 +29,8 @@
 //!
 //!     type Input = SendEmail;
 //!     type Output = ();
-//! }
 //!
-//! struct SendWelcomeEmailHandler;
-//!
-//! impl ActivityHandler<SendWelcomeEmail> for SendWelcomeEmailHandler {
-//!     async fn execute(&self, input: SendEmail) -> Result<()> {
+//!     async fn execute(&self, input: Self::Input) -> Result<Self::Output> {
 //!         if input.to.is_empty() {
 //!             return Err(Error::fatal(
 //!                 "missing_recipient",
@@ -48,32 +41,6 @@
 //!         Ok(())
 //!     }
 //! }
-//!
-//! # use tokio::runtime::Runtime;
-//! # fn main() {
-//! # let rt = Runtime::new().unwrap();
-//! # rt.block_on(async {
-//! let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
-//!
-//! let workflow = Workflow::<SendEmail, ()>::builder()
-//!     .declare::<SendWelcomeEmail>()
-//!     .step(|mut cx, input| async move {
-//!         SendWelcomeEmail::emit(&mut cx, &input).await?;
-//!         Transition::complete()
-//!     })
-//!     .name("send-welcome-email")
-//!     .pool(pool.clone())
-//!     .build()
-//!     .await?;
-//!
-//! workflow
-//!     .runtime()
-//!     .bind::<SendWelcomeEmail>(SendWelcomeEmailHandler)?
-//!     .run()
-//!     .await?;
-//! # Ok::<(), Box<dyn std::error::Error>>(())
-//! # });
-//! # }
 //! ```
 //!
 //! # Error handling
@@ -159,7 +126,7 @@ impl Error {
     }
 }
 
-/// Durable activity contract.
+/// Trait for activity handlers.
 pub trait Activity: Send + Sync + 'static {
     /// Stable activity name.
     ///
@@ -172,15 +139,11 @@ pub trait Activity: Send + Sync + 'static {
 
     /// Output payload for this activity.
     type Output: DeserializeOwned + Serialize + Send + 'static;
-}
 
-/// Runtime implementation for an [`Activity`] contract.
-pub trait ActivityHandler<A>: Send + Sync + 'static
-where
-    A: Activity,
-{
-    /// Executes the activity implementation.
-    fn execute(&self, input: A::Input) -> impl Future<Output = Result<A::Output>> + Send;
+    /// Executes the activity.
+    ///
+    /// This is expected to perform side-effecting I/O.
+    fn execute(&self, input: Self::Input) -> impl Future<Output = Result<Self::Output>> + Send;
 
     /// Retry policy for this activity.
     ///
