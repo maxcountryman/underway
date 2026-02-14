@@ -6,7 +6,7 @@ use sqlx::PgPool;
 
 use super::{
     registration::{ActivitySet, NoActivities, Registered},
-    step::{StepConfig, To},
+    step::{StepConfig, Transition},
     Context, Result, Workflow, WorkflowQueue,
 };
 use crate::{
@@ -153,18 +153,20 @@ where
     /// followed by some type that's `Serialize` and `Deserialize` as its
     /// second argument.
     ///
-    /// It should also return one of the [`To`] variants. For convenience, `To`
-    /// provides methods that return the correct types. Most commonly these
-    /// will be [`To::next`], when going on to another step, or [`To::done`],
-    /// when there are no more steps.
+    /// It should also return one of the [`Transition`] variants. For
+    /// convenience, `Transition` provides methods that return the correct
+    /// types. Most commonly these will be [`Transition::next`], when going
+    /// on to another step, or [`Transition::complete`], when there are no
+    /// more steps.
     ///
     /// # Example
     ///
     /// ```rust
-    /// use underway::{To, Workflow};
+    /// use underway::{Transition, Workflow};
     ///
     /// // Set a step.
-    /// let workflow_builder = Workflow::<(), ()>::builder().step(|_cx, _| async move { To::done() });
+    /// let workflow_builder =
+    ///     Workflow::<(), ()>::builder().step(|_cx, _| async move { Transition::complete() });
     /// ```
     pub fn step<F, O, Fut>(mut self, func: F) -> Builder<I, O, S, StepSet<O, ()>, ASet>
     where
@@ -172,7 +174,7 @@ where
         O: Serialize + Send + Sync + 'static,
         S: Send + Sync + 'static,
         F: Fn(Context<S, ASet>, I) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = TaskResult<To<O>>> + Send + 'static,
+        Fut: Future<Output = TaskResult<Transition<O>>> + Send + 'static,
     {
         self.steps.push(StepConfig::new(func));
 
@@ -217,15 +219,16 @@ where
     /// followed by some type that's `Serialize` and `Deserialize` as its
     /// second argument.
     ///
-    /// It should also return one of the [`To`] variants. For convenience, `To`
-    /// provides methods that return the correct types. Most commonly these
-    /// will be [`To::next`], when going on to another step, or [`To::done`],
-    /// when there are no more steps.
+    /// It should also return one of the [`Transition`] variants. For
+    /// convenience, `Transition` provides methods that return the correct
+    /// types. Most commonly these will be [`Transition::next`], when going
+    /// on to another step, or [`Transition::complete`], when there are no
+    /// more steps.
     ///
     /// # Example
     ///
     /// ```rust
-    /// use underway::{To, Workflow};
+    /// use underway::{Transition, Workflow};
     ///
     /// #[derive(Clone)]
     /// struct State {
@@ -239,7 +242,7 @@ where
     ///     })
     ///     .step(|cx, _| async move {
     ///         println!("State data: {}", cx.state.data);
-    ///         To::done()
+    ///         Transition::complete()
     ///     });
     /// ```
     pub fn step<F, O, Fut>(mut self, func: F) -> Builder<I, O, S, StepSet<O, S>, ASet>
@@ -248,7 +251,7 @@ where
         O: Serialize + Send + Sync + 'static,
         S: Send + Sync + 'static,
         F: Fn(Context<S, ASet>, I) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = TaskResult<To<O>>> + Send + 'static,
+        Fut: Future<Output = TaskResult<Transition<O>>> + Send + 'static,
     {
         self.steps.push(StepConfig::new(func));
 
@@ -278,7 +281,7 @@ where
     ///
     /// ```rust
     /// use serde::{Deserialize, Serialize};
-    /// use underway::{To, Workflow};
+    /// use underway::{Transition, Workflow};
     ///
     /// #[derive(Deserialize, Serialize)]
     /// struct Step2 {
@@ -287,8 +290,8 @@ where
     ///
     /// // Set one step after another.
     /// let workflow_builder = Workflow::<(), ()>::builder()
-    ///     .step(|_cx, _| async move { To::next(Step2 { n: 42 }) })
-    ///     .step(|_cx, Step2 { n }| async move { To::done() });
+    ///     .step(|_cx, _| async move { Transition::next(Step2 { n: 42 }) })
+    ///     .step(|_cx, Step2 { n }| async move { Transition::complete() });
     /// ```
     pub fn step<F, New, Fut>(mut self, func: F) -> Builder<I, New, S, StepSet<New, S>, ASet>
     where
@@ -296,7 +299,7 @@ where
         New: Serialize + Send + Sync + 'static,
         S: Send + Sync + 'static,
         F: Fn(Context<S, ASet>, Current) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = TaskResult<To<New>>> + Send + 'static,
+        Fut: Future<Output = TaskResult<Transition<New>>> + Send + 'static,
     {
         self.steps.push(StepConfig::new(func));
 
@@ -320,12 +323,12 @@ where
     /// # Example
     ///
     /// ```rust
-    /// use underway::{task::RetryPolicy, To, Workflow};
+    /// use underway::{task::RetryPolicy, Transition, Workflow};
     ///
     /// // Set a retry policy for the step.
     /// let retry_policy = RetryPolicy::builder().max_attempts(15).build();
     /// let workflow_builder = Workflow::<(), ()>::builder()
-    ///     .step(|_cx, _| async move { To::done() })
+    ///     .step(|_cx, _| async move { Transition::complete() })
     ///     .retry_policy(retry_policy);
     /// ```
     pub fn retry_policy(
@@ -352,10 +355,10 @@ where
     ///
     /// ```rust
     /// use jiff::ToSpan;
-    /// use underway::{To, Workflow};
+    /// use underway::{Transition, Workflow};
     ///
     /// let workflow_builder = Workflow::<(), ()>::builder()
-    ///     .step(|_cx, _| async move { To::done() })
+    ///     .step(|_cx, _| async move { Transition::complete() })
     ///     .timeout(1.minute());
     /// ```
     pub fn timeout(mut self, timeout: Span) -> Builder<I, Current, S, StepSet<Current, S>, ASet> {
@@ -379,10 +382,10 @@ where
     ///
     /// ```rust
     /// use jiff::ToSpan;
-    /// use underway::{To, Workflow};
+    /// use underway::{Transition, Workflow};
     ///
     /// let workflow_builder = Workflow::<(), ()>::builder()
-    ///     .step(|_cx, _| async move { To::done() })
+    ///     .step(|_cx, _| async move { Transition::complete() })
     ///     .ttl(7.days());
     /// ```
     pub fn ttl(mut self, ttl: Span) -> Builder<I, Current, S, StepSet<Current, S>, ASet> {
@@ -402,16 +405,16 @@ where
 
     /// Sets a base delay before the previous step can be dequeued.
     ///
-    /// This delay is added to any delay specified by [`To::delay_for`].
+    /// This delay is added to any delay specified by [`Transition::after`].
     ///
     /// # Example
     ///
     /// ```rust
     /// use jiff::ToSpan;
-    /// use underway::{To, Workflow};
+    /// use underway::{Transition, Workflow};
     ///
     /// let workflow_builder = Workflow::<(), ()>::builder()
-    ///     .step(|_cx, _| async move { To::done() })
+    ///     .step(|_cx, _| async move { Transition::complete() })
     ///     .delay(30.seconds());
     /// ```
     pub fn delay(mut self, delay: Span) -> Builder<I, Current, S, StepSet<Current, S>, ASet> {
@@ -435,10 +438,10 @@ where
     ///
     /// ```rust
     /// use jiff::ToSpan;
-    /// use underway::{To, Workflow};
+    /// use underway::{Transition, Workflow};
     ///
     /// let workflow_builder = Workflow::<(), ()>::builder()
-    ///     .step(|_cx, _| async move { To::done() })
+    ///     .step(|_cx, _| async move { Transition::complete() })
     ///     .heartbeat(5.seconds());
     /// ```
     pub fn heartbeat(
@@ -464,10 +467,10 @@ where
     /// # Example
     ///
     /// ```rust
-    /// use underway::{To, Workflow};
+    /// use underway::{Transition, Workflow};
     ///
     /// let workflow_builder = Workflow::<(), ()>::builder()
-    ///     .step(|_cx, _| async move { To::done() })
+    ///     .step(|_cx, _| async move { Transition::complete() })
     ///     .concurrency_key("customer:42");
     /// ```
     pub fn concurrency_key(
@@ -493,10 +496,10 @@ where
     /// # Example
     ///
     /// ```rust
-    /// use underway::{To, Workflow};
+    /// use underway::{Transition, Workflow};
     ///
     /// let workflow_builder = Workflow::<(), ()>::builder()
-    ///     .step(|_cx, _| async move { To::done() })
+    ///     .step(|_cx, _| async move { Transition::complete() })
     ///     .priority(10);
     /// ```
     pub fn priority(mut self, priority: i32) -> Builder<I, Current, S, StepSet<Current, S>, ASet> {
@@ -534,11 +537,11 @@ where
     /// # Example
     ///
     /// ```rust
-    /// use underway::{To, Workflow};
+    /// use underway::{Transition, Workflow};
     ///
     /// // Set a name.
     /// let workflow_builder = Workflow::<(), ()>::builder()
-    ///     .step(|_cx, _| async move { To::done() })
+    ///     .step(|_cx, _| async move { Transition::complete() })
     ///     .name("example");
     /// ```
     pub fn name(self, name: impl Into<String>) -> Builder<I, (), S, QueueNameSet<S>, ASet> {
@@ -570,7 +573,7 @@ where
     /// use std::env;
     ///
     /// use sqlx::PgPool;
-    /// use underway::{To, Workflow};
+    /// use underway::{Transition, Workflow};
     /// # use tokio::runtime::Runtime;
     /// # fn main() {
     /// # let rt = Runtime::new().unwrap();
@@ -580,7 +583,7 @@ where
     ///
     /// // Set a pool.
     /// let workflow_builder = Workflow::<(), ()>::builder()
-    ///     .step(|_cx, _| async move { To::done() })
+    ///     .step(|_cx, _| async move { Transition::complete() })
     ///     .name("example")
     ///     .pool(pool);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -615,7 +618,7 @@ where
     /// use std::env;
     ///
     /// use sqlx::PgPool;
-    /// use underway::{To, Workflow};
+    /// use underway::{Transition, Workflow};
     ///
     /// # use tokio::runtime::Runtime;
     /// # fn main() {
@@ -625,7 +628,7 @@ where
     ///
     /// // Build the workflow.
     /// let workflow = Workflow::<(), ()>::builder()
-    ///     .step(|_cx, _| async move { To::done() })
+    ///     .step(|_cx, _| async move { Transition::complete() })
     ///     .name("example")
     ///     .pool(pool)
     ///     .build()
@@ -666,7 +669,7 @@ where
     ///
     /// ```rust,no_run
     /// # use sqlx::PgPool;
-    /// use underway::{Queue, To, Workflow};
+    /// use underway::{Queue, Transition, Workflow};
     ///
     /// # use tokio::runtime::Runtime;
     /// # fn main() {
@@ -681,7 +684,7 @@ where
     ///
     /// // Set a queue.
     /// let workflow = Workflow::<(), ()>::builder()
-    ///     .step(|_cx, _| async move { To::done() })
+    ///     .step(|_cx, _| async move { Transition::complete() })
     ///     .queue(queue);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// # });
@@ -711,7 +714,7 @@ where
     ///
     /// ```rust,no_run
     /// # use sqlx::PgPool;
-    /// use underway::{Workflow, To, Queue};
+    /// use underway::{Workflow, Transition, Queue};
     ///
     /// # use tokio::runtime::Runtime;
     /// # fn main() {
@@ -726,7 +729,7 @@ where
     ///
     /// // Build the workflow.
     /// let workflow = Workflow::<(), ()>::builder()
-    ///     .step(|_cx, _| async move { To::done() })
+    ///     .step(|_cx, _| async move { Transition::complete() })
     ///     .queue(queue)
     ///     .build();
     /// # Ok::<(), Box<dyn std::error::Error>>(())

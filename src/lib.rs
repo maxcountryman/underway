@@ -33,7 +33,7 @@
 //! ```rust,no_run
 //! use serde::{Deserialize, Serialize};
 //! use sqlx::PgPool;
-//! use underway::{To, Workflow};
+//! use underway::{Transition, Workflow};
 //!
 //! #[derive(Deserialize, Serialize)]
 //! struct SendWelcomeEmail {
@@ -50,7 +50,7 @@
 //! let workflow = Workflow::builder()
 //!     .step(|_cx, SendWelcomeEmail { user_id }| async move {
 //!         println!("sending welcome email to user {user_id}");
-//!         To::done()
+//!         Transition::complete()
 //!     })
 //!     .name("send-welcome-email")
 //!     .pool(pool)
@@ -66,8 +66,9 @@
 //! # }
 //! ```
 //!
-//! This same pattern scales to multi-step workflows by returning `To::next`.
-//! For durable side effects, see the Workflow Activities section below.
+//! This same pattern scales to multi-step workflows by returning
+//! `Transition::next`. For durable side effects, see the Workflow Activities
+//! section below.
 //!
 //! ## Workflow Activities
 //!
@@ -87,7 +88,7 @@
 //! ```rust,no_run
 //! use serde::{Deserialize, Serialize};
 //! use sqlx::PgPool;
-//! use underway::{Activity, ActivityError, To, Workflow};
+//! use underway::{Activity, ActivityError, Transition, Workflow};
 //!
 //! #[derive(Deserialize, Serialize)]
 //! struct Input {
@@ -122,8 +123,8 @@
 //! let workflow = Workflow::builder()
 //!     .activity(ResolveEmail)
 //!     .step(|mut cx, Input { user_id }| async move {
-//!         let _email: String = cx.call::<ResolveEmail, _>("resolve", &user_id).await?;
-//!         To::done()
+//!         let _email: String = cx.call::<ResolveEmail, _>(&user_id).await?;
+//!         Transition::complete()
 //!     })
 //!     .name("resolve-email")
 //!     .pool(pool)
@@ -145,7 +146,7 @@
 //! ```rust,no_run
 //! use serde::{Deserialize, Serialize};
 //! use sqlx::PgPool;
-//! use underway::{To, Workflow};
+//! use underway::{Transition, Workflow};
 //!
 //! #[derive(Deserialize, Serialize)]
 //! struct ResizeImage {
@@ -167,11 +168,11 @@
 //! let workflow = Workflow::builder()
 //!     .step(|_cx, ResizeImage { asset_id }| async move {
 //!         let object_key = format!("images/{asset_id}.webp");
-//!         To::next(PublishImage { object_key })
+//!         Transition::next(PublishImage { object_key })
 //!     })
 //!     .step(|_cx, PublishImage { object_key }| async move {
 //!         println!("Publishing {object_key}");
-//!         To::done()
+//!         Transition::complete()
 //!     })
 //!     .name("image-pipeline")
 //!     .pool(pool)
@@ -192,7 +193,7 @@
 //! ```rust,no_run
 //! use serde::{Deserialize, Serialize};
 //! use sqlx::PgPool;
-//! use underway::{Activity, ActivityError, To, Workflow};
+//! use underway::{Activity, ActivityError, Transition, Workflow};
 //!
 //! #[derive(Clone)]
 //! struct LookupEmail {
@@ -247,9 +248,9 @@
 //!     .activity(LookupEmail { pool: pool.clone() })
 //!     .activity(TrackSignupMetric)
 //!     .step(|mut cx, Signup { user_id }| async move {
-//!         let email: String = cx.call::<LookupEmail, _>("lookup", &user_id).await?;
-//!         cx.emit::<TrackSignupMetric, _>("track", &email).await?;
-//!         To::done()
+//!         let email: String = cx.call::<LookupEmail, _>(&user_id).await?;
+//!         cx.emit::<TrackSignupMetric, _>(&email).await?;
+//!         Transition::complete()
 //!     })
 //!     .name("signup-side-effects")
 //!     .pool(pool)
@@ -268,7 +269,7 @@
 //! ```rust,no_run
 //! use serde::{Deserialize, Serialize};
 //! use sqlx::PgPool;
-//! use underway::{To, Workflow};
+//! use underway::{Transition, Workflow};
 //!
 //! #[derive(Deserialize, Serialize)]
 //! struct TenantCleanup {
@@ -285,7 +286,7 @@
 //! let workflow = Workflow::builder()
 //!     .step(|_cx, TenantCleanup { tenant_id }| async move {
 //!         println!("Running cleanup for tenant {tenant_id}");
-//!         To::done()
+//!         Transition::complete()
 //!     })
 //!     .name("tenant-cleanup")
 //!     .pool(pool.clone())
@@ -387,7 +388,7 @@ pub use crate::{
     scheduler::{Scheduler, ZonedSchedule},
     task::{Task, ToTaskResult},
     worker::Worker,
-    workflow::{To, Workflow},
+    workflow::{Transition, Workflow},
 };
 
 pub mod activity;

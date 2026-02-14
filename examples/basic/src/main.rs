@@ -6,7 +6,7 @@ use tokio::{
     sync::Mutex,
     time::{sleep, timeout},
 };
-use underway::{To, Workflow};
+use underway::{Transition, Workflow};
 
 #[derive(Debug, Deserialize, Serialize)]
 struct ResizeImage {
@@ -38,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let object_key = format!("images/{asset_id}.webp");
             println!("Resized image {asset_id} -> {object_key}");
 
-            To::next(PublishImage { object_key })
+            Transition::next(PublishImage { object_key })
         })
         .step(|cx, PublishImage { object_key }| {
             let completions = cx.state.completions.clone();
@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             async move {
                 println!("Publishing {object_key}");
                 completions.lock().await.push(object_key);
-                To::done()
+                Transition::complete()
             }
         })
         .name("example-basic-workflow")

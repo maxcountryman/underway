@@ -19,7 +19,7 @@ impl<S> StepConfig<S> {
         S: Send + Sync + 'static,
         A: 'static,
         F: Fn(Context<S, A>, I) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = TaskResult<To<O>>> + Send + 'static,
+        Fut: Future<Output = TaskResult<Transition<O>>> + Send + 'static,
     {
         let step_fn = StepFn::new(move |cx, input| Box::pin(func(cx, input)));
         Self {
@@ -56,27 +56,27 @@ impl Default for StepTaskConfig {
 
 /// Represents the state after executing a step.
 #[derive(Deserialize, Serialize)]
-pub enum To<N> {
-    /// The next step to transition to.
-    Next(N),
-
-    /// The next step to transition to after the delay.
-    Delay {
-        /// The step itself.
+pub enum Transition<N> {
+    /// Continue to the next step payload after an optional delay.
+    Continue {
+        /// The next step payload itself.
         next: N,
 
-        /// The delay before which the step will not be run.
+        /// The delay before which the next step will not be run.
         delay: Span,
     },
 
-    /// The terminal state.
-    Done,
+    /// Terminal state (no further steps are enqueued).
+    Complete,
 }
 
-impl<S> To<S> {
+impl<S> Transition<S> {
     /// Transitions from the current step to the next step.
     pub fn next(step: S) -> TaskResult<Self> {
-        Ok(Self::Next(step))
+        Ok(Self::Continue {
+            next: step,
+            delay: Span::new(),
+        })
     }
 
     /// Transitions from the current step to the next step, but after the given
@@ -84,15 +84,15 @@ impl<S> To<S> {
     ///
     /// The next step will be enqueued immediately, but won't be dequeued until
     /// the span has elapsed.
-    pub fn delay_for(step: S, delay: Span) -> TaskResult<Self> {
-        Ok(Self::Delay { next: step, delay })
+    pub fn after(step: S, delay: Span) -> TaskResult<Self> {
+        Ok(Self::Continue { next: step, delay })
     }
 }
 
-impl To<()> {
+impl Transition<()> {
     /// Signals that this is the final step and no more steps will follow.
-    pub fn done() -> TaskResult<To<()>> {
-        Ok(To::Done)
+    pub fn complete() -> TaskResult<Transition<()>> {
+        Ok(Transition::Complete)
     }
 }
 
@@ -100,7 +100,7 @@ type StepFnMarker<I, O, S, A> = fn() -> (I, O, S, A);
 
 struct StepFn<I, O, S, A, F>
 where
-    F: Fn(Context<S, A>, I) -> Pin<Box<dyn Future<Output = TaskResult<To<O>>> + Send>>
+    F: Fn(Context<S, A>, I) -> Pin<Box<dyn Future<Output = TaskResult<Transition<O>>> + Send>>
         + Send
         + Sync
         + 'static,
@@ -111,7 +111,7 @@ where
 
 impl<I, O, S, A, F> StepFn<I, O, S, A, F>
 where
-    F: Fn(Context<S, A>, I) -> Pin<Box<dyn Future<Output = TaskResult<To<O>>> + Send>>
+    F: Fn(Context<S, A>, I) -> Pin<Box<dyn Future<Output = TaskResult<Transition<O>>> + Send>>
         + Send
         + Sync
         + 'static,
@@ -139,7 +139,7 @@ where
     I: DeserializeOwned + Serialize + Send + Sync + 'static,
     O: Serialize + Send + Sync + 'static,
     S: Send + Sync + 'static,
-    F: Fn(Context<S, A>, I) -> Pin<Box<dyn Future<Output = TaskResult<To<O>>> + Send>>
+    F: Fn(Context<S, A>, I) -> Pin<Box<dyn Future<Output = TaskResult<Transition<O>>> + Send>>
         + Send
         + Sync
         + 'static,
@@ -158,13 +158,7 @@ where
 
         Box::pin(async move {
             match fut.await {
-                Ok(To::Next(output)) => {
-                    let serialized_output = serde_json::to_value(output)
-                        .map_err(|err| TaskError::Fatal(err.to_string()))?;
-                    Ok(Some((serialized_output, Span::new())))
-                }
-
-                Ok(To::Delay {
+                Ok(Transition::Continue {
                     next: output,
                     delay,
                 }) => {
@@ -173,7 +167,7 @@ where
                     Ok(Some((serialized_output, delay)))
                 }
 
-                Ok(To::Done) => Ok(None),
+                Ok(Transition::Complete) => Ok(None),
 
                 Err(err) => Err(err),
             }

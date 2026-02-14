@@ -20,18 +20,19 @@
 //! Workflows are formed from at least one step function.
 //!
 //! ```rust
-//! use underway::{To, Workflow};
+//! use underway::{Transition, Workflow};
 //!
-//! let workflow_builder = Workflow::<(), ()>::builder().step(|_cx, _| async move { To::done() });
+//! let workflow_builder =
+//!     Workflow::<(), ()>::builder().step(|_cx, _| async move { Transition::complete() });
 //! ```
 //!
 //! Instead of a closure, we could also use a named function.
 //!
 //! ```rust
-//! use underway::{task::Result as TaskResult, workflow::Context, To, Workflow};
+//! use underway::{task::Result as TaskResult, workflow::Context, Transition, Workflow};
 //!
-//! async fn named_step(_cx: Context<()>, _: ()) -> TaskResult<To<()>> {
-//!     To::done()
+//! async fn named_step(_cx: Context<()>, _: ()) -> TaskResult<Transition<()>> {
+//!     Transition::complete()
 //! }
 //!
 //! let workflow_builder = Workflow::<_, ()>::builder().step(named_step);
@@ -55,7 +56,7 @@
 //!
 //! ```rust
 //! use serde::{Deserialize, Serialize};
-//! use underway::{To, Workflow};
+//! use underway::{Transition, Workflow};
 //!
 //! // Our very own input type.
 //! #[derive(Serialize, Deserialize)]
@@ -63,21 +64,22 @@
 //!     name: String,
 //! };
 //!
-//! let workflow_builder =
-//!     Workflow::<_, ()>::builder().step(|_cx, MyArgs { name }| async move { To::done() });
+//! let workflow_builder = Workflow::<_, ()>::builder()
+//!     .step(|_cx, MyArgs { name }| async move { Transition::complete() });
 //! ```
 //!
 //! Besides input, it's also important to point out that we return a specific
 //! type that indicates what to do next. So far, we've only had a single step
-//! and so we've returned [`To::done`].
+//! and so we've returned [`Transition::complete`].
 //!
 //! But workflows may be composed of any number of sequential steps. Each step
-//! is structured to take the output of the last step. By returning [`To::next`]
-//! with the input of the next step, we move on to that step.
+//! is structured to take the output of the last step. By returning
+//! [`Transition::next`] with the input of the next step, we move on to that
+//! step.
 //!
 //! ```rust
 //! use serde::{Deserialize, Serialize};
-//! use underway::{To, Workflow};
+//! use underway::{Transition, Workflow};
 //!
 //! // Here's the input for our first step.
 //! #[derive(Serialize, Deserialize)]
@@ -97,7 +99,7 @@
 //!         println!("Got {n}");
 //!
 //!         // Go to the next step with step 2's input.
-//!         To::next(Step2 {
+//!         Transition::next(Step2 {
 //!             original: n,
 //!             new: n + 2,
 //!         })
@@ -106,7 +108,7 @@
 //!         println!("Was {original} now is {new}");
 //!
 //!         // No more steps, so we're done.
-//!         To::done()
+//!         Transition::complete()
 //!     });
 //! ```
 //!
@@ -118,7 +120,7 @@
 //!
 //! ```rust,compile_fail
 //! use serde::{Deserialize, Serialize};
-//! use underway::{Workflow, To};
+//! use underway::{Workflow, Transition};
 //!
 //! #[derive(Serialize, Deserialize)]
 //! struct Step1 {
@@ -136,17 +138,17 @@
 //!         println!("Got {n}");
 //!
 //!         // This does not compile!
-//!         To::next(Step1 { n })
+//!         Transition::next(Step1 { n })
 //!     })
 //!     .step(|_cx, Step2 { original, new }| async move {
 //!         println!("Was {original} now is {new}");
-//!         To::done()
+//!         Transition::complete()
 //!     });
 //! ```
 //!
 //! Often we want to immediately transition to the next step. However, there may
 //! be cases where we want to wait some time beforehand. We can return
-//! [`To::delay_for`] to express this.
+//! [`Transition::after`] to express this.
 //!
 //! Like transitioning to the next step, we give the input still but also supply
 //! a delay as the second argument.
@@ -154,7 +156,7 @@
 //! ```rust
 //! use jiff::ToSpan;
 //! use serde::{Deserialize, Serialize};
-//! use underway::{To, Workflow};
+//! use underway::{Transition, Workflow};
 //!
 //! #[derive(Serialize, Deserialize)]
 //! struct Step1 {
@@ -172,7 +174,7 @@
 //!         println!("Got {n}");
 //!
 //!         // We aren't quite ready for the next step so we wait one hour.
-//!         To::delay_for(
+//!         Transition::after(
 //!             Step2 {
 //!                 original: n,
 //!                 new: n + 2,
@@ -182,7 +184,7 @@
 //!     })
 //!     .step(|_cx, Step2 { original, new }| async move {
 //!         println!("Was {original} now is {new}");
-//!         To::done()
+//!         Transition::complete()
 //!     });
 //! ```
 //!
@@ -203,7 +205,7 @@
 //! # assert!(until_tomorrow_morning.is_positive());
 //! ```
 //!
-//! Then this span may be used as our delay given to `To::delay_for`.
+//! Then this span may be used as our delay given to `Transition::after`.
 //!
 //! # Stateful workflows
 //!
@@ -214,7 +216,7 @@
 //! that all steps should have access to. The only requirement is that the state
 //! type be `Clone`, as it will be cloned into each step.
 //! ```rust
-//! use underway::{workflow::Context, To, Workflow};
+//! use underway::{workflow::Context, Transition, Workflow};
 //!
 //! // A simple state that'll be provided to our steps.
 //! #[derive(Clone)]
@@ -230,7 +232,7 @@
 //!     .state(state) // Here we've set the state.
 //!     .step(|Context { state, .. }, _| async move {
 //!         println!("State data is: {}", state.data);
-//!         To::done()
+//!         Transition::complete()
 //!     });
 //! ```
 //!
@@ -267,11 +269,11 @@
 //! A `call` does **not** require user polling loops. When a call has not
 //! completed yet, it suspends the current step. The worker marks the task as
 //! waiting, and once the activity completes the step is replayed and the same
-//! call key resolves to the persisted result.
+//! operation resolves to the persisted result.
 //!
 //! ```rust
 //! use serde::{Deserialize, Serialize};
-//! use underway::{Activity, To, Workflow};
+//! use underway::{Activity, Transition, Workflow};
 //!
 //! #[derive(Serialize, Deserialize)]
 //! struct Step1 {
@@ -314,21 +316,22 @@
 //!     .activity(WriteAuditLog)
 //!     .step(|mut cx, Step1 { user_id }| async move {
 //!         // Fire-and-forget effect intent.
-//!         cx.emit::<WriteAuditLog, _>("audit", &user_id).await?;
+//!         cx.emit::<WriteAuditLog, _>(&user_id).await?;
 //!
 //!         // Suspends/resumes durably until completion.
-//!         let profile_id: i64 = cx.call::<CreateProfile, _>("profile", &user_id).await?;
-//!         To::next(Step2 { profile_id })
+//!         let profile_id: i64 = cx.call::<CreateProfile, _>(&user_id).await?;
+//!         Transition::next(Step2 { profile_id })
 //!     })
-//!     .step(|_cx, Step2 { profile_id: _ }| async move { To::done() });
+//!     .step(|_cx, Step2 { profile_id: _ }| async move { Transition::complete() });
 //! ```
 //!
-//! Call keys should be stable and deterministic for a given step execution.
-//! Reusing a key with a different activity name or input is treated as
-//! non-deterministic and fails execution.
+//! Activity operation identity is derived from workflow run ID, step index, and
+//! deterministic operation order within the step. Reordering operations in
+//! in-flight workflow runs is non-deterministic and fails execution.
 //!
-//! Because [`Context::call`] requires mutable context, issuing multiple
-//! unresolved calls in parallel fails to compile. Issue calls sequentially as
+//! Because [`Context::call`] and [`Context::emit`] require mutable context,
+//! activity operations are issued sequentially within a step. Multiple
+//! unresolved calls in parallel are not supported; issue calls as
 //! `call(...).await?`.
 //!
 //! If a workflow needs direct transaction-level database semantics, implement
@@ -342,7 +345,7 @@
 //!
 //! ```rust
 //! use serde::{Deserialize, Serialize};
-//! use underway::{task::RetryPolicy, To, Workflow};
+//! use underway::{task::RetryPolicy, Transition, Workflow};
 //!
 //! #[derive(Serialize, Deserialize)]
 //! struct Step1 {
@@ -358,7 +361,7 @@
 //! let workflow_builder = Workflow::<_, ()>::builder()
 //!     .step(|_cx, Step1 { n }| async move {
 //!         println!("Got {n}");
-//!         To::next(Step2 {
+//!         Transition::next(Step2 {
 //!             original: n,
 //!             new: n + 2,
 //!         })
@@ -366,7 +369,7 @@
 //!     .retry_policy(RetryPolicy::builder().max_attempts(1).build())
 //!     .step(|_cx, Step2 { original, new }| async move {
 //!         println!("Was {original} now is {new}");
-//!         To::done()
+//!         Transition::complete()
 //!     })
 //!     .retry_policy(RetryPolicy::builder().max_interval_ms(15_000).build());
 //! ```
@@ -376,14 +379,14 @@
 //! Steps can configure the same task-level settings as standalone tasks. Each
 //! step can set its timeout, TTL, delay, heartbeat interval, concurrency key,
 //! and priority. Base delays are added to any delay returned by
-//! [`To::delay_for`].
+//! [`Transition::after`].
 //!
 //! ```rust
 //! use jiff::ToSpan;
-//! use underway::{To, Workflow};
+//! use underway::{Transition, Workflow};
 //!
 //! let workflow_builder = Workflow::<(), ()>::builder()
-//!     .step(|_cx, _| async move { To::done() })
+//!     .step(|_cx, _| async move { Transition::complete() })
 //!     .timeout(2.minutes())
 //!     .ttl(7.days())
 //!     .delay(10.seconds())
@@ -399,7 +402,7 @@
 //!
 //! ```rust,no_run
 //! # use sqlx::PgPool;
-//! use underway::{To, Workflow};
+//! use underway::{Transition, Workflow};
 //!
 //! # use tokio::runtime::Runtime;
 //! # fn main() {
@@ -412,7 +415,7 @@
 //! #
 //!
 //! let workflow = Workflow::builder()
-//!     .step(|_cx, _| async move { To::done() })
+//!     .step(|_cx, _| async move { Transition::complete() })
 //!     .name("example-workflow")
 //!     .pool(pool)
 //!     .build()
@@ -430,7 +433,7 @@
 //!
 //! ```rust,no_run
 //! # use sqlx::PgPool;
-//! use underway::{Queue, To, Workflow};
+//! use underway::{Queue, Transition, Workflow};
 //!
 //! # use tokio::runtime::Runtime;
 //! # fn main() {
@@ -450,7 +453,7 @@
 //!     .await?;
 //!
 //! let workflow = Workflow::builder()
-//!     .step(|_cx, _| async move { To::done() })
+//!     .step(|_cx, _| async move { Transition::complete() })
 //!     .queue(queue)
 //!     .build();
 //!
@@ -467,7 +470,7 @@
 //! ```rust,no_run
 //! # use sqlx::PgPool;
 //! use serde::{Deserialize, Serialize};
-//! use underway::{To, Workflow};
+//! use underway::{Transition, Workflow};
 //!
 //! # use tokio::runtime::Runtime;
 //! # fn main() {
@@ -485,7 +488,7 @@
 //! }
 //!
 //! let workflow = Workflow::builder()
-//!     .step(|_cx, Input { bucket_name }| async move { To::done() })
+//!     .step(|_cx, Input { bucket_name }| async move { Transition::complete() })
 //!     .name("example-workflow")
 //!     .pool(pool)
 //!     .build()
@@ -517,7 +520,7 @@
 //! ```rust,no_run
 //! # use sqlx::PgPool;
 //! use serde::{Deserialize, Serialize};
-//! use underway::{To, Workflow};
+//! use underway::{Transition, Workflow};
 //!
 //! # use tokio::runtime::Runtime;
 //! # fn main() {
@@ -530,7 +533,7 @@
 //! #
 //!
 //! let workflow = Workflow::builder()
-//!     .step(|_cx, _| async move { To::done() })
+//!     .step(|_cx, _| async move { Transition::complete() })
 //!     .name("atomic-enqueue")
 //!     .pool(pool.clone())
 //!     .build()
@@ -561,7 +564,7 @@
 //!
 //! ```rust,no_run
 //! # use sqlx::PgPool;
-//! use underway::{To, Workflow};
+//! use underway::{Transition, Workflow};
 //!
 //! # use tokio::runtime::Runtime;
 //! # fn main() {
@@ -574,7 +577,7 @@
 //! #
 //!
 //! let workflow = Workflow::builder()
-//!     .step(|_cx, _: ()| async move { To::done() })
+//!     .step(|_cx, _: ()| async move { Transition::complete() })
 //!     .name("example-workflow")
 //!     .pool(pool)
 //!     .build()
@@ -592,7 +595,7 @@
 //!
 //! ```rust,no_run
 //! # use sqlx::PgPool;
-//! use underway::{To, Workflow};
+//! use underway::{Transition, Workflow};
 //!
 //! # use tokio::runtime::Runtime;
 //! # fn main() {
@@ -605,7 +608,7 @@
 //! #
 //!
 //! let workflow = Workflow::builder()
-//!     .step(|_cx, _: ()| async move { To::done() })
+//!     .step(|_cx, _: ()| async move { Transition::complete() })
 //!     .name("example-workflow")
 //!     .pool(pool)
 //!     .build()
@@ -622,7 +625,7 @@
 //!
 //! ```rust,no_run
 //! # use sqlx::PgPool;
-//! use underway::{To, Workflow};
+//! use underway::{Transition, Workflow};
 //!
 //! # use tokio::runtime::Runtime;
 //! # fn main() {
@@ -635,7 +638,7 @@
 //! #
 //!
 //! let workflow = Workflow::builder()
-//!     .step(|_cx, _: ()| async move { To::done() })
+//!     .step(|_cx, _: ()| async move { Transition::complete() })
 //!     .name("example-workflow")
 //!     .pool(pool)
 //!     .build()
@@ -656,7 +659,7 @@
 //!
 //! ```rust,no_run
 //! # use sqlx::PgPool;
-//! use underway::{To, Workflow};
+//! use underway::{Transition, Workflow};
 //!
 //! # use tokio::runtime::Runtime;
 //! # fn main() {
@@ -669,7 +672,7 @@
 //! #
 //!
 //! let workflow = Workflow::builder()
-//!     .step(|_cx, _: ()| async move { To::done() })
+//!     .step(|_cx, _: ()| async move { Transition::complete() })
 //!     .name("scheduled-workflow")
 //!     .pool(pool)
 //!     .build()
@@ -713,7 +716,7 @@ use jiff::Span;
 use sealed::{WorkflowScheduleTemplate, WorkflowState};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgConnection, PgExecutor, Postgres, Transaction};
-pub use step::To;
+pub use step::Transition;
 use step::{StepConfig, StepTaskConfig};
 use tracing::instrument;
 use ulid::Ulid;
@@ -835,14 +838,14 @@ impl<T: Task> EnqueuedWorkflow<T> {
     ///
     /// ```rust,no_run
     /// # use sqlx::PgPool;
-    /// # use underway::{Workflow, To};
+    /// # use underway::{Workflow, Transition};
     /// # use tokio::runtime::Runtime;
     /// # fn main() {
     /// # let rt = Runtime::new().unwrap();
     /// # rt.block_on(async {
     /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
     /// # let workflow = Workflow::builder()
-    /// #     .step(|_cx, _| async move { To::done() })
+    /// #     .step(|_cx, _| async move { Transition::complete() })
     /// #     .name("example")
     /// #     .pool(pool)
     /// #     .build()
@@ -922,7 +925,7 @@ where
     ///
     /// ```rust,no_run
     /// # use sqlx::PgPool;
-    /// use underway::{To, Workflow};
+    /// use underway::{Transition, Workflow};
     ///
     /// # use tokio::runtime::Runtime;
     /// # fn main() {
@@ -935,7 +938,7 @@ where
     /// #
     ///
     /// let workflow = Workflow::<(), ()>::builder()
-    ///     .step(|_cx, _| async move { To::done() })
+    ///     .step(|_cx, _| async move { Transition::complete() })
     ///     .name("example")
     ///     .pool(pool)
     ///     .build()
@@ -964,14 +967,14 @@ where
     ///
     /// ```rust,no_run
     /// # use sqlx::PgPool;
-    /// # use underway::{Workflow, To};
+    /// # use underway::{Workflow, Transition};
     /// # use tokio::runtime::Runtime;
     /// # fn main() {
     /// # let rt = Runtime::new().unwrap();
     /// # rt.block_on(async {
     /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
     /// # let workflow = Workflow::builder()
-    /// #     .step(|_cx, _| async move { To::done() })
+    /// #     .step(|_cx, _| async move { Transition::complete() })
     /// #     .name("example")
     /// #     .pool(pool)
     /// #     .build()
@@ -1003,14 +1006,14 @@ where
     ///
     /// ```rust,no_run
     /// # use sqlx::PgPool;
-    /// # use underway::{Workflow, To};
+    /// # use underway::{Workflow, Transition};
     /// # use tokio::runtime::Runtime;
     /// # fn main() {
     /// # let rt = Runtime::new().unwrap();
     /// # rt.block_on(async {
     /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
     /// # let workflow = Workflow::builder()
-    /// #     .step(|_cx, _| async move { To::done() })
+    /// #     .step(|_cx, _| async move { Transition::complete() })
     /// #     .name("example")
     /// #     .pool(pool)
     /// #     .build()
@@ -1048,7 +1051,7 @@ where
     ///
     /// ```rust,no_run
     /// # use sqlx::PgPool;
-    /// # use underway::{Workflow, To};
+    /// # use underway::{Workflow, Transition};
     /// # use tokio::runtime::Runtime;
     /// # fn main() {
     /// # let rt = Runtime::new().unwrap();
@@ -1063,7 +1066,7 @@ where
     /// let mut tx = pool.begin().await?;
     ///
     /// # let workflow = Workflow::builder()
-    /// #     .step(|_cx, _| async move { To::done() })
+    /// #     .step(|_cx, _| async move { Transition::complete() })
     /// #     .name("example")
     /// #     .pool(pool.clone())
     /// #     .build()
@@ -1107,7 +1110,7 @@ where
     ///
     /// ```rust,no_run
     /// # use sqlx::PgPool;
-    /// # use underway::{Workflow, To};
+    /// # use underway::{Workflow, Transition};
     /// # use tokio::runtime::Runtime;
     /// # fn main() {
     /// # let rt = Runtime::new().unwrap();
@@ -1121,7 +1124,7 @@ where
     /// let mut tx = pool.begin().await?;
     ///
     /// # let workflow = Workflow::builder()
-    /// #     .step(|_cx, _| async move { To::done() })
+    /// #     .step(|_cx, _| async move { Transition::complete() })
     /// #     .name("example")
     /// #     .pool(pool.clone())
     /// #     .build()
@@ -1182,7 +1185,7 @@ where
     ///
     /// ```rust,no_run
     /// # use sqlx::PgPool;
-    /// # use underway::{Workflow, To};
+    /// # use underway::{Workflow, Transition};
     /// use jiff::ToSpan;
     ///
     /// # use tokio::runtime::Runtime;
@@ -1191,7 +1194,7 @@ where
     /// # rt.block_on(async {
     /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
     /// # let workflow = Workflow::builder()
-    /// #     .step(|_cx, _| async move { To::done() })
+    /// #     .step(|_cx, _| async move { Transition::complete() })
     /// #     .name("example")
     /// #     .pool(pool)
     /// #     .build()
@@ -1231,7 +1234,7 @@ where
     ///
     /// ```rust,no_run
     /// # use sqlx::PgPool;
-    /// # use underway::{Workflow, To};
+    /// # use underway::{Workflow, Transition};
     /// use jiff::ToSpan;
     ///
     /// # use tokio::runtime::Runtime;
@@ -1248,7 +1251,7 @@ where
     /// let mut tx = pool.begin().await?;
     ///
     /// # let workflow = Workflow::builder()
-    /// #     .step(|_cx, _| async move { To::done() })
+    /// #     .step(|_cx, _| async move { Transition::complete() })
     /// #     .name("example")
     /// #     .pool(pool.clone())
     /// #     .build()
@@ -1299,14 +1302,14 @@ where
     ///
     /// ```rust,no_run
     /// # use sqlx::PgPool;
-    /// # use underway::{Workflow, To};
+    /// # use underway::{Workflow, Transition};
     /// # use tokio::runtime::Runtime;
     /// # fn main() {
     /// # let rt = Runtime::new().unwrap();
     /// # rt.block_on(async {
     /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
     /// # let workflow = Workflow::builder()
-    /// #     .step(|_cx, _| async move { To::done() })
+    /// #     .step(|_cx, _| async move { Transition::complete() })
     /// #     .name("example")
     /// #     .pool(pool)
     /// #     .build()
@@ -1340,7 +1343,7 @@ where
     ///
     /// ```rust,no_run
     /// # use sqlx::PgPool;
-    /// # use underway::{Workflow, To};
+    /// # use underway::{Workflow, Transition};
     /// # use tokio::runtime::Runtime;
     /// # fn main() {
     /// # let rt = Runtime::new().unwrap();
@@ -1355,7 +1358,7 @@ where
     /// let mut tx = pool.begin().await?;
     ///
     /// # let workflow = Workflow::builder()
-    /// #     .step(|_cx, _| async move { To::done() })
+    /// #     .step(|_cx, _| async move { Transition::complete() })
     /// #     .name("example")
     /// #     .pool(pool.clone())
     /// #     .build()
@@ -1401,14 +1404,14 @@ where
     ///
     /// ```rust,no_run
     /// # use sqlx::PgPool;
-    /// # use underway::{Workflow, To};
+    /// # use underway::{Workflow, Transition};
     /// # use tokio::runtime::Runtime;
     /// # fn main() {
     /// # let rt = Runtime::new().unwrap();
     /// # rt.block_on(async {
     /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
     /// # let workflow = Workflow::<(), _>::builder()
-    /// #     .step(|_cx, _| async move { To::done() })
+    /// #     .step(|_cx, _| async move { Transition::complete() })
     /// #     .name("example")
     /// #     .pool(pool)
     /// #     .build()
@@ -1441,7 +1444,7 @@ where
     ///
     /// ```rust,no_run
     /// # use sqlx::PgPool;
-    /// # use underway::{Workflow, To};
+    /// # use underway::{Workflow, Transition};
     /// # use tokio::runtime::Runtime;
     /// # fn main() {
     /// # let rt = Runtime::new().unwrap();
@@ -1455,7 +1458,7 @@ where
     /// let mut tx = pool.begin().await?;
     ///
     /// # let workflow = Workflow::<(), _>::builder()
-    /// #     .step(|_cx, _| async move { To::done() })
+    /// #     .step(|_cx, _| async move { Transition::complete() })
     /// #     .name("example")
     /// #     .pool(pool.clone())
     /// #     .build()
@@ -1486,14 +1489,14 @@ where
     ///
     /// ```rust,no_run
     /// # use sqlx::PgPool;
-    /// # use underway::{Workflow, To};
+    /// # use underway::{Workflow, Transition};
     /// # use tokio::runtime::Runtime;
     /// # fn main() {
     /// # let rt = Runtime::new().unwrap();
     /// # rt.block_on(async {
     /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
     /// # let workflow = Workflow::<(), _>::builder()
-    /// #     .step(|_cx, _| async move { To::done() })
+    /// #     .step(|_cx, _| async move { Transition::complete() })
     /// #     .name("example")
     /// #     .pool(pool)
     /// #     .build()
@@ -1521,14 +1524,14 @@ where
     ///
     /// ```rust,no_run
     /// # use sqlx::PgPool;
-    /// # use underway::{Workflow, To};
+    /// # use underway::{Workflow, Transition};
     /// # use tokio::runtime::Runtime as TokioRuntime;
     /// # fn main() {
     /// # let rt = TokioRuntime::new().unwrap();
     /// # rt.block_on(async {
     /// # let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
     /// # let workflow = Workflow::<(), _>::builder()
-    /// #     .step(|_cx, _| async move { To::done() })
+    /// #     .step(|_cx, _| async move { Transition::complete() })
     /// #     .name("example")
     /// #     .pool(pool)
     /// #     .build()
@@ -1908,7 +1911,7 @@ mod tests {
         let workflow = Workflow::builder()
             .step(|_cx, Input { message }| async move {
                 println!("Executing workflow with message: {message}");
-                To::done()
+                Transition::complete()
             })
             .queue(queue.clone())
             .build();
@@ -1939,9 +1942,9 @@ mod tests {
             message: String,
         }
 
-        async fn step(_cx: Context<()>, Input { message }: Input) -> TaskResult<To<()>> {
+        async fn step(_cx: Context<()>, Input { message }: Input) -> TaskResult<Transition<()>> {
             println!("Executing workflow with message: {message}");
-            To::done()
+            Transition::complete()
         }
 
         let queue = Queue::builder()
@@ -1998,7 +2001,7 @@ mod tests {
                     "Executing workflow with message: {message} and state: {state}",
                     state = cx.state.data
                 );
-                To::done()
+                Transition::complete()
             })
             .queue(queue.clone())
             .build();
@@ -2038,7 +2041,7 @@ mod tests {
             .step(|cx, _| async move {
                 let mut data = cx.state.data.lock().expect("Mutex should not be poisoned");
                 *data = "bar".to_string();
-                To::done()
+                Transition::complete()
             })
             .name("one_step_with_mutable_state")
             .pool(pool.clone())
@@ -2080,12 +2083,12 @@ mod tests {
             message: String,
         }
 
-        async fn step(cx: Context<State>, Input { message }: Input) -> TaskResult<To<()>> {
+        async fn step(cx: Context<State>, Input { message }: Input) -> TaskResult<Transition<()>> {
             println!(
                 "Executing workflow with message: {message} and state: {data}",
                 data = cx.state.data
             );
-            To::done()
+            Transition::complete()
         }
 
         let state = State {
@@ -2139,7 +2142,7 @@ mod tests {
         let workflow = Workflow::builder()
             .step(|_cx, Input { message }| async move {
                 println!("Executing workflow with message: {message}");
-                To::done()
+                Transition::complete()
             })
             .queue(queue.clone())
             .build();
@@ -2177,7 +2180,7 @@ mod tests {
         let workflow = Workflow::builder()
             .step(|_cx, Input { message }| async move {
                 println!("Processing {message}");
-                To::done()
+                Transition::complete()
             })
             .queue(queue.clone())
             .build();
@@ -2243,7 +2246,7 @@ mod tests {
             .build();
 
         let workflow = Workflow::builder()
-            .step(|_cx, _| async move { To::done() })
+            .step(|_cx, _| async move { Transition::complete() })
             .retry_policy(retry_policy)
             .timeout(2.minutes())
             .ttl(3.days())
@@ -2388,10 +2391,10 @@ mod tests {
         let step2_policy = RetryPolicy::builder().max_attempts(9).build();
 
         let workflow = Workflow::builder()
-            .step(|_cx, Step1 { message }| async move { To::next(Step2 { message }) })
+            .step(|_cx, Step1 { message }| async move { Transition::next(Step2 { message }) })
             .step(|_cx, Step2 { message }| async move {
                 println!("Processed {message}");
-                To::done()
+                Transition::complete()
             })
             .retry_policy(step2_policy)
             .priority(7)
@@ -2459,7 +2462,7 @@ mod tests {
             .await?;
 
         let workflow = Workflow::builder()
-            .step(|_, _| async { To::done() })
+            .step(|_, _| async { Transition::complete() })
             .queue(queue.clone())
             .build();
 
@@ -2501,7 +2504,7 @@ mod tests {
         let workflow: Workflow<Input, ()> = Workflow::builder()
             .step(|_cx, Input { message }| async move {
                 println!("Executing workflow with message: {message}");
-                To::done()
+                Transition::complete()
             })
             .queue(queue.clone())
             .build();
@@ -2561,7 +2564,7 @@ mod tests {
                 assert_eq!(ctx.step_index, 0);
                 assert_eq!(ctx.step_count, 1);
                 assert_eq!(ctx.queue_name.as_str(), "one_step_context_attributes");
-                To::done()
+                Transition::complete()
             })
             .name("one_step_context_attributes")
             .pool(pool.clone())
@@ -2588,8 +2591,8 @@ mod tests {
         let workflow = Workflow::builder()
             .activity(EchoActivity)
             .step(|mut cx, Input { message }| async move {
-                let _: String = cx.call::<EchoActivity, _>("echo-main", &message).await?;
-                To::done()
+                let _: String = cx.call::<EchoActivity, _>(&message).await?;
+                Transition::complete()
             })
             .name("call_suspends_and_persists_activity_intent")
             .pool(pool.clone())
@@ -2631,7 +2634,7 @@ mod tests {
             workflow.queue.name,
             *enqueued.run_id,
             0_i32,
-            "echo-main",
+            format!("activity:{}:0:0", enqueued.run_id.as_hyphenated()),
         )
         .fetch_one(&pool)
         .await?;
@@ -2650,8 +2653,8 @@ mod tests {
 
         let workflow = Workflow::builder()
             .activity(EmailActivity)
-            .step(|cx, Input { message }| async move {
-                cx.emit::<EmailActivity, _>("notify", &message).await?;
+            .step(|mut cx, Input { message }| async move {
+                cx.emit::<EmailActivity, _>(&message).await?;
                 Err(TaskError::Retryable("retry me".to_string()))
             })
             .name("emit_not_persisted_on_retryable_failure")
@@ -2694,9 +2697,9 @@ mod tests {
 
         let workflow = Workflow::builder()
             .activity(EmailActivity)
-            .step(|cx, Input { message }| async move {
-                cx.emit::<EmailActivity, _>("notify", &message).await?;
-                To::done()
+            .step(|mut cx, Input { message }| async move {
+                cx.emit::<EmailActivity, _>(&message).await?;
+                Transition::complete()
             })
             .name("emit_persisted_on_success")
             .pool(pool.clone())
@@ -2739,12 +2742,12 @@ mod tests {
         let workflow = Workflow::builder()
             .activity(EchoActivity)
             .step(|mut cx, Input { message }| async move {
-                let first = cx.call::<EchoActivity, _>("call-1", &message).await;
+                let first = cx.call::<EchoActivity, _>(&message).await;
                 assert!(matches!(first, Err(TaskError::Suspended(_))));
 
-                let _ = cx.call::<EchoActivity, _>("call-2", &message).await?;
+                let _ = cx.call::<EchoActivity, _>(&message).await?;
 
-                To::done()
+                Transition::complete()
             })
             .name("second_call_after_suspension_is_rejected")
             .pool(pool.clone())
@@ -2813,13 +2816,13 @@ mod tests {
         let workflow = Workflow::builder()
             .step(|_cx, Step1 { message }| async move {
                 println!("Executing workflow with message: {message}");
-                To::next(Step2 {
+                Transition::next(Step2 {
                     data: message.as_bytes().into(),
                 })
             })
             .step(|_cx, Step2 { data }| async move {
                 println!("Executing workflow with data: {data:?}");
-                To::done()
+                Transition::complete()
             })
             .queue(queue.clone())
             .build();
@@ -2877,14 +2880,14 @@ mod tests {
         let workflow = Workflow::builder()
             .step(|_cx, Step1 { message }| async move {
                 println!("Executing workflow with message: {message}");
-                To::next(Step2 {
+                Transition::next(Step2 {
                     data: message.as_bytes().into(),
                 })
             })
             .retry_policy(step1_policy)
             .step(|_cx, Step2 { data }| async move {
                 println!("Executing workflow with data: {data:?}");
-                To::done()
+                Transition::complete()
             })
             .retry_policy(step2_policy)
             .queue(queue.clone())
@@ -2969,7 +2972,7 @@ mod tests {
                     "Executing workflow with message: {message} and state: {state}",
                     state = cx.state.data
                 );
-                To::next(Step2 {
+                Transition::next(Step2 {
                     data: message.as_bytes().into(),
                 })
             })
@@ -2978,7 +2981,7 @@ mod tests {
                     "Executing workflow with data: {data:?} and state: {state}",
                     state = cx.state.data
                 );
-                To::done()
+                Transition::complete()
             })
             .queue(queue.clone())
             .build();
@@ -3032,13 +3035,13 @@ mod tests {
         let workflow = Workflow::builder()
             .step(|_cx, Step1 { message }| async move {
                 println!("Executing workflow with message: {message}",);
-                To::next(Step2 {
+                Transition::next(Step2 {
                     data: message.as_bytes().into(),
                 })
             })
             .step(|_cx, Step2 { data }| async move {
                 println!("Executing workflow with data: {data:?}");
-                To::done()
+                Transition::complete()
             })
             .queue(queue.clone())
             .build();
@@ -3124,7 +3127,7 @@ mod tests {
         let workflow = Workflow::builder()
             .step(|_cx, Input { message }| async move {
                 println!("Executing workflow with message: {message}");
-                To::done()
+                Transition::complete()
             })
             .queue(queue.clone())
             .build();
@@ -3167,7 +3170,7 @@ mod tests {
         let workflow = Workflow::builder()
             .step(|_cx, Input { message }| async move {
                 println!("Executing workflow with message: {message}");
-                To::done()
+                Transition::complete()
             })
             .queue(queue.clone())
             .build();
@@ -3204,7 +3207,7 @@ mod tests {
         let workflow = Workflow::builder()
             .step(|_cx, Input { message }| async move {
                 println!("Executing workflow with message: {message}");
-                To::done()
+                Transition::complete()
             })
             .queue(queue.clone())
             .build();
@@ -3226,7 +3229,7 @@ mod tests {
             .await?;
 
         let workflow = Workflow::builder()
-            .step(|_cx, _| async move { To::done() })
+            .step(|_cx, _| async move { Transition::complete() })
             .queue(queue.clone())
             .build();
 

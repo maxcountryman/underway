@@ -84,6 +84,7 @@ pub(super) struct ActivityCallBuffer {
 #[derive(Default)]
 pub(super) struct CallSequenceState {
     unresolved_call_key: Option<String>,
+    next_activity_call_index: usize,
 }
 
 impl ActivityCallBuffer {
@@ -176,13 +177,17 @@ impl<S, Set> Context<S, Set> {
     /// If the step fails and retries before that boundary is reached, the emit
     /// intent is not recorded.
     ///
-    /// `key` should be deterministic for this step execution.
-    pub async fn emit<A, Idx>(&self, key: impl Into<String>, input: &A::Input) -> TaskResult<()>
+    /// The call identity is derived from the workflow run ID, step index, and
+    /// deterministic operation order within the step.
+    ///
+    /// This method takes `&mut self` so emit/call operation ordering remains
+    /// deterministic within a step.
+    pub async fn emit<A, Idx>(&mut self, input: &A::Input) -> TaskResult<()>
     where
         A: Activity,
         Set: Contains<A, Idx>,
     {
-        let key = key.into();
+        let key = self.next_activity_call_key()?;
         let input = serde_json::to_value(input).map_err(|err| TaskError::Fatal(err.to_string()))?;
 
         self.register_activity_call(&key, A::NAME, &input)?;
@@ -198,20 +203,16 @@ impl<S, Set> Context<S, Set> {
     /// In normal step code you should propagate that with `?` instead of
     /// looping manually. The worker marks the task as waiting and re-runs the
     /// step after the activity completes, at which point this call returns the
-    /// durable result for the same call key.
+    /// durable result for the same derived operation identity.
     ///
-    /// This method takes `&mut self`, which enforces sequential call issuance
-    /// within a step at compile time.
-    pub async fn call<A, Idx>(
-        &mut self,
-        key: impl Into<String>,
-        input: &A::Input,
-    ) -> TaskResult<A::Output>
+    /// This method takes `&mut self`, which enforces sequential activity
+    /// operation issuance within a step at compile time.
+    pub async fn call<A, Idx>(&mut self, input: &A::Input) -> TaskResult<A::Output>
     where
         A: Activity,
         Set: Contains<A, Idx>,
     {
-        let key = key.into();
+        let key = self.next_activity_call_key()?;
         let input = serde_json::to_value(input).map_err(|err| TaskError::Fatal(err.to_string()))?;
 
         let record = self.register_activity_call(&key, A::NAME, &input)?;
@@ -254,11 +255,30 @@ impl<S, Set> Context<S, Set> {
                 self.register_call_sequence_wait(&key)?;
 
                 Err(TaskError::Suspended(format!(
-                    "Waiting on activity call `{activity}` with key `{key}",
+                    "Waiting on activity call `{activity}` with key `{key}`.",
                     activity = A::NAME
                 )))
             }
         }
+    }
+
+    fn next_activity_call_key(&self) -> TaskResult<String> {
+        let mut call_sequence_state = self
+            .call_sequence_state
+            .lock()
+            .map_err(|_| TaskError::Fatal("Call sequence state lock was poisoned.".to_string()))?;
+
+        let operation_index = call_sequence_state.next_activity_call_index;
+        call_sequence_state.next_activity_call_index = call_sequence_state
+            .next_activity_call_index
+            .checked_add(1)
+            .ok_or_else(|| TaskError::Fatal("Activity operation index overflowed.".to_string()))?;
+
+        Ok(format!(
+            "activity:{workflow_run_id}:{step_index}:{operation_index}",
+            workflow_run_id = self.workflow_run_id.as_hyphenated(),
+            step_index = self.step_index,
+        ))
     }
 
     fn register_activity_call(
