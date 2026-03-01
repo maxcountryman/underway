@@ -384,7 +384,7 @@ pub use crate::{
     activity::{Activity, CallState as ActivityCallState, Error as ActivityError},
     queue::Queue,
     runtime::Runtime,
-    scheduler::{Scheduler, ZonedSchedule},
+    scheduler::{Scheduler, ZonedSchedule, ZonedScheduleError},
     task::{Task, ToTaskResult},
     worker::Worker,
     workflow::{InvokeActivity, Transition, Workflow},
