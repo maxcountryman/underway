@@ -717,7 +717,7 @@ pub use context::{Context, InvokeActivity};
 use jiff::Span;
 use sealed::{WorkflowScheduleTemplate, WorkflowState};
 use serde::{Deserialize, Serialize};
-use sqlx::{PgConnection, PgExecutor, Postgres, Transaction};
+use sqlx::{types::Json, PgConnection, PgExecutor, Postgres, Transaction};
 pub use step::Transition;
 use step::{StepConfig, StepTaskConfig};
 use tracing::instrument;
@@ -727,7 +727,7 @@ use uuid::Uuid;
 use crate::{
     activity::CallState,
     activity_worker::ActivityRegistry,
-    queue::{Error as QueueError, InProgressTask, Queue},
+    queue::{Error as QueueError, InProgressTask, Meta, Queue},
     runtime::Runtime,
     scheduler::{Error as SchedulerError, ZonedSchedule},
     task::{
@@ -874,6 +874,7 @@ impl<T: Task> EnqueuedWorkflow<T> {
               id as "id: TaskId",
               task_queue_name as "queue_name",
               input,
+              meta as "meta: Json<Meta>",
               retry_policy as "retry_policy: RetryPolicy",
               timeout,
               heartbeat,

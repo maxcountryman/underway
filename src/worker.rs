@@ -814,7 +814,12 @@ impl<T: Task + Sync> Worker<T> {
         };
 
         let task_id = in_progress_task.id;
-        tracing::Span::current().record("task.id", task_id.as_hyphenated().to_string());
+        let span = tracing::Span::current();
+        span.record("task.id", task_id.as_hyphenated().to_string());
+        #[cfg(feature = "otel")]
+        if let Some(span_context) = in_progress_task.meta.span_context.as_ref() {
+            span_context.set_parent(&span);
+        }
 
         // Transaction scoped to the task execution.
         let mut tx = conn.begin().await?;

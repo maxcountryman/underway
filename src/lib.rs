@@ -392,6 +392,8 @@ pub use crate::{
 
 pub mod activity;
 mod activity_worker;
+#[cfg(feature = "otel")]
+mod observability;
 pub mod queue;
 pub mod runtime;
 mod scheduler;

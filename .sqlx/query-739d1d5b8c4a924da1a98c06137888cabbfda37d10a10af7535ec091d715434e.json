@@ -1,15 +1,30 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            select\n              input,\n              retry_policy as \"retry_policy: RetryPolicy\",\n              priority\n            from underway.task\n            where task_queue_name = $1\n              and state = $2\n            ",
+  "query": "\n            select\n              id as \"id: TaskId\",\n              task_queue_name as \"queue_name\",\n              input,\n              meta as \"meta: Json<Meta>\",\n              retry_policy as \"retry_policy: RetryPolicy\",\n              timeout,\n              heartbeat,\n              concurrency_key,\n              0 as \"attempt_number!\"\n            from underway.task\n            where input->>'workflow_run_id' = $1\n              and state = $2\n            for update skip locked\n            ",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
+        "name": "id: TaskId",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "queue_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
         "name": "input",
         "type_info": "Jsonb"
       },
       {
-        "ordinal": 1,
+        "ordinal": 3,
+        "name": "meta: Json<Meta>",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 4,
         "name": "retry_policy: RetryPolicy",
         "type_info": {
           "Custom": {
@@ -42,8 +57,23 @@
         }
       },
       {
-        "ordinal": 2,
-        "name": "priority",
+        "ordinal": 5,
+        "name": "timeout",
+        "type_info": "Interval"
+      },
+      {
+        "ordinal": 6,
+        "name": "heartbeat",
+        "type_info": "Interval"
+      },
+      {
+        "ordinal": 7,
+        "name": "concurrency_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "attempt_number!",
         "type_info": "Int4"
       }
     ],
@@ -70,8 +100,14 @@
     "nullable": [
       false,
       false,
-      false
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      null
     ]
   },
-  "hash": "aeaaafb72815d711f8a4812a271a6269b299fb55045d48c24a85cf88dca90ecd"
+  "hash": "739d1d5b8c4a924da1a98c06137888cabbfda37d10a10af7535ec091d715434e"
 }
