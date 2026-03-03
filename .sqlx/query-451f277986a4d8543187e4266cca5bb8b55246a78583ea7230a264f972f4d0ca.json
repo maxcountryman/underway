@@ -1,0 +1,50 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            select retry_policy as \"retry_policy: RetryPolicy\"\n            from underway.task\n            where id = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "retry_policy: RetryPolicy",
+        "type_info": {
+          "Custom": {
+            "name": "underway.task_retry_policy",
+            "kind": {
+              "Composite": [
+                [
+                  "max_attempts",
+                  "Int4"
+                ],
+                [
+                  "initial_interval_ms",
+                  "Int4"
+                ],
+                [
+                  "max_interval_ms",
+                  "Int4"
+                ],
+                [
+                  "backoff_coefficient",
+                  "Float8"
+                ],
+                [
+                  "jitter_factor",
+                  "Float8"
+                ]
+              ]
+            }
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "451f277986a4d8543187e4266cca5bb8b55246a78583ea7230a264f972f4d0ca"
+}

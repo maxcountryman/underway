@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            select a.state as \"state: CallState\"\n            from underway.activity_call_attempt a\n            inner join underway.activity_call c\n              on c.id = a.activity_call_id\n            where c.task_queue_name = $1\n              and c.call_key = $2\n            order by a.attempt_number desc\n            limit 1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "state: CallState",
+        "type_info": {
+          "Custom": {
+            "name": "underway.activity_call_state",
+            "kind": {
+              "Enum": [
+                "pending",
+                "in_progress",
+                "succeeded",
+                "failed"
+              ]
+            }
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "44183cbdb502ac5defce69e6d747030b6c7dc39429e23013729d36b49806c276"
+}

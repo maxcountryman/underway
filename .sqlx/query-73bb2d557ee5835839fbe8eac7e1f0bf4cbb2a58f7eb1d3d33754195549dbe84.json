@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            select task_queue_name\n            from underway.task_attempt\n            where task_id = $1\n            order by attempt_number desc\n            limit 1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "task_queue_name",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "73bb2d557ee5835839fbe8eac7e1f0bf4cbb2a58f7eb1d3d33754195549dbe84"
+}

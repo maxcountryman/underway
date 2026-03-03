@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            select state as \"state: CallState\"\n            from underway.activity_call\n            where id = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "state: CallState",
+        "type_info": {
+          "Custom": {
+            "name": "underway.activity_call_state",
+            "kind": {
+              "Enum": [
+                "pending",
+                "in_progress",
+                "succeeded",
+                "failed"
+              ]
+            }
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "0cec46982ce972f0cd9b6ebdaa9782cf3dcacde303482c612b4489bf024d0db5"
+}

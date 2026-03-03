@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            insert into underway.activity_call_attempt (\n                activity_call_id,\n                attempt_number,\n                state,\n                started_at,\n                updated_at\n            ) values (\n                $1,\n                1,\n                'in_progress'::underway.activity_call_state,\n                now() - interval '2 hours',\n                now() - interval '2 hours'\n            )\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "49c128a9a930a0ecf34d36c3d0e7689e19b65dd4fb6a4ab62407713289275ee7"
+}
