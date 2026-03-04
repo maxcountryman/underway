@@ -4,7 +4,9 @@ use opentelemetry::{
     },
     Context,
 };
-use serde::{de::Error as _, ser::SerializeStruct, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{
+    de::Error as _, ser::SerializeStruct, Deserialize, Deserializer, Serialize, Serializer,
+};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

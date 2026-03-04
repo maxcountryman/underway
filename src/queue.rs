@@ -238,8 +238,6 @@ use std::{borrow::Cow, marker::PhantomData, sync::OnceLock, time::Duration as St
 
 use builder_states::{Initial, NameSet, PoolSet};
 use jiff::{Span, ToSpan};
-#[cfg(feature = "otel")]
-use crate::observability::SpanContext;
 use serde::{Deserialize, Serialize};
 use sqlx::{
     postgres::{PgAdvisoryLock, PgAdvisoryLockGuard},
@@ -249,6 +247,8 @@ use sqlx::{
 use tracing::instrument;
 use uuid::Uuid;
 
+#[cfg(feature = "otel")]
+use crate::observability::SpanContext;
 use crate::{
     task::{Error as TaskError, RetryPolicy, State as TaskState, Task, TaskId},
     ZonedSchedule,
