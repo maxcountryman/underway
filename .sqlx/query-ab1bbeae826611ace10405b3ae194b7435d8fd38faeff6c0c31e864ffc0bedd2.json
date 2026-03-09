@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                insert into underway.task (\n                  id,\n                  task_queue_name,\n                  input,\n                  meta,\n                  timeout,\n                  heartbeat,\n                  ttl,\n                  delay,\n                  run_at,\n                  retry_policy,\n                  concurrency_key,\n                  priority\n                )\n                select\n                  t.id,\n                  $1 as task_queue_name,\n                  t.input,\n                  $2 as meta,\n                  t.timeout,\n                  t.heartbeat,\n                  t.ttl,\n                  t.delay,\n                  now() + t.delay,\n                  (\n                    t.retry_max_attempts,\n                    t.retry_initial_interval_ms,\n                    t.retry_max_interval_ms,\n                    t.retry_backoff_coefficient,\n                    t.retry_jitter_factor\n                  )::underway.task_retry_policy,\n                  t.concurrency_key,\n                  t.priority\n                from unnest(\n                  $3::uuid[],\n                  $4::jsonb[],\n                  $5::interval[],\n                  $6::interval[],\n                  $7::interval[],\n                  $8::interval[],\n                  $9::int4[],\n                  $10::int4[],\n                  $11::int4[],\n                  $12::float8[],\n                  $13::float8[],\n                  $14::text[],\n                  $15::int4[]\n                ) as t(\n                  id,\n                  input,\n                  timeout,\n                  heartbeat,\n                  ttl,\n                  delay,\n                  retry_max_attempts,\n                  retry_initial_interval_ms,\n                  retry_max_interval_ms,\n                  retry_backoff_coefficient,\n                  retry_jitter_factor,\n                  concurrency_key,\n                  priority\n                )\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Jsonb",
+        "UuidArray",
+        "JsonbArray",
+        "IntervalArray",
+        "IntervalArray",
+        "IntervalArray",
+        "IntervalArray",
+        "Int4Array",
+        "Int4Array",
+        "Int4Array",
+        "Float8Array",
+        "Float8Array",
+        "TextArray",
+        "Int4Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ab1bbeae826611ace10405b3ae194b7435d8fd38faeff6c0c31e864ffc0bedd2"
+}

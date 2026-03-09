@@ -238,19 +238,38 @@ use std::{borrow::Cow, marker::PhantomData, sync::OnceLock, time::Duration as St
 
 use builder_states::{Initial, NameSet, PoolSet};
 use jiff::{Span, ToSpan};
+use serde::{Deserialize, Serialize};
 use sqlx::{
     postgres::{PgAdvisoryLock, PgAdvisoryLockGuard},
+    types::Json,
     Acquire, PgConnection, PgExecutor, PgPool, Postgres, Transaction,
 };
 use tracing::instrument;
 use uuid::Uuid;
 
+#[cfg(feature = "otel")]
+use crate::observability::SpanContext;
 use crate::{
     task::{Error as TaskError, RetryPolicy, State as TaskState, Task, TaskId},
     ZonedSchedule,
 };
 
 type Result<T = ()> = std::result::Result<T, Error>;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct Meta {
+    #[cfg(feature = "otel")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) span_context: Option<SpanContext>,
+}
+
+impl Meta {
+    #[cfg(feature = "otel")]
+    pub(crate) fn capture_span_context(mut self) -> Self {
+        self.span_context = SpanContext::capture_current();
+        self
+    }
+}
 
 #[derive(Clone, PartialEq)]
 struct BatchTaskConfig {
@@ -536,6 +555,12 @@ impl<T: Task> Queue<T> {
         let id = TaskId::new();
 
         let input_value = serde_json::to_value(input)?;
+        let task_meta = {
+            let meta = Meta::default();
+            #[cfg(feature = "otel")]
+            let meta = meta.capture_span_context();
+            serde_json::to_value(meta)?
+        };
 
         let retry_policy = task.retry_policy_for(input);
         let timeout = task.timeout_for(input);
@@ -552,6 +577,7 @@ impl<T: Task> Queue<T> {
               id,
               task_queue_name,
               input,
+              meta,
               timeout,
               heartbeat,
               ttl,
@@ -560,11 +586,12 @@ impl<T: Task> Queue<T> {
               retry_policy,
               concurrency_key,
               priority
-            ) values ($1, $2, $3, $4, $5, $6, $7, now() + $7, $8, $9, $10)
+            ) values ($1, $2, $3, $4, $5, $6, $7, $8, now() + $8, $9, $10, $11)
             "#,
             id as TaskId,
             self.name,
             input_value,
+            task_meta,
             StdDuration::try_from(timeout)? as _,
             StdDuration::try_from(heartbeat)? as _,
             StdDuration::try_from(ttl)? as _,
@@ -670,10 +697,16 @@ impl<T: Task> Queue<T> {
             return Ok(Vec::new());
         }
 
-        let tasks_number = inputs.len();
-        let mut task_ids = Vec::with_capacity(tasks_number);
+        let task_count = inputs.len();
+        let mut task_ids = Vec::with_capacity(task_count);
+        let task_meta = {
+            let meta = Meta::default();
+            #[cfg(feature = "otel")]
+            let meta = meta.capture_span_context();
+            serde_json::to_value(meta)?
+        };
 
-        tracing::Span::current().record("tasks_numbers", tasks_number.to_string());
+        tracing::Span::current().record("tasks_numbers", task_count.to_string());
 
         let mut tx = executor.begin().await?;
 
@@ -720,6 +753,7 @@ impl<T: Task> Queue<T> {
                   id,
                   task_queue_name,
                   input,
+                  meta,
                   timeout,
                   heartbeat,
                   ttl,
@@ -733,21 +767,23 @@ impl<T: Task> Queue<T> {
                   t.id,
                   $1 as task_queue_name,
                   t.input,
-                  $2 as timeout,
-                  $3 as heartbeat,
-                  $4 as ttl,
+                  $2 as meta,
+                  $3 as timeout,
+                  $4 as heartbeat,
+                  $5 as ttl,
                   t.delay,
                   now() + t.delay,
-                  $5 as retry_policy,
-                  $6 as concurrency_key,
-                  $7 as priority
+                  $6 as retry_policy,
+                  $7 as concurrency_key,
+                  $8 as priority
                 from unnest(
-                  $8::uuid[],
-                  $9::jsonb[],
-                  $10::interval[]
+                  $9::uuid[],
+                  $10::jsonb[],
+                  $11::interval[]
                 ) as t(id, input, delay)
                 "#,
                     self.name,
+                    &task_meta,
                     timeout as _,
                     heartbeat as _,
                     ttl as _,
@@ -791,6 +827,7 @@ impl<T: Task> Queue<T> {
                   id,
                   task_queue_name,
                   input,
+                  meta,
                   timeout,
                   heartbeat,
                   ttl,
@@ -804,6 +841,7 @@ impl<T: Task> Queue<T> {
                   t.id,
                   $1 as task_queue_name,
                   t.input,
+                  $2 as meta,
                   t.timeout,
                   t.heartbeat,
                   t.ttl,
@@ -819,19 +857,19 @@ impl<T: Task> Queue<T> {
                   t.concurrency_key,
                   t.priority
                 from unnest(
-                  $2::uuid[],
-                  $3::jsonb[],
-                  $4::interval[],
+                  $3::uuid[],
+                  $4::jsonb[],
                   $5::interval[],
                   $6::interval[],
                   $7::interval[],
-                  $8::int4[],
+                  $8::interval[],
                   $9::int4[],
                   $10::int4[],
-                  $11::float8[],
+                  $11::int4[],
                   $12::float8[],
-                  $13::text[],
-                  $14::int4[]
+                  $13::float8[],
+                  $14::text[],
+                  $15::int4[]
                 ) as t(
                   id,
                   input,
@@ -849,6 +887,7 @@ impl<T: Task> Queue<T> {
                 )
                 "#,
                     self.name,
+                    &task_meta,
                     &ids as _,
                     &input_values,
                     &timeouts as _,
@@ -1091,6 +1130,7 @@ impl<T: Task> Queue<T> {
                     t.id,
                     t.task_queue_name,
                     t.input,
+                    t.meta,
                     t.timeout,
                     t.heartbeat,
                     t.retry_policy,
@@ -1138,6 +1178,7 @@ impl<T: Task> Queue<T> {
                 c.id as "id: TaskId",
                 c.task_queue_name as "queue_name",
                 c.input,
+                c.meta as "meta: Json<Meta>",
                 c.timeout,
                 c.heartbeat,
                 c.retry_policy as "retry_policy: RetryPolicy",
@@ -1454,6 +1495,8 @@ pub struct InProgressTask {
     pub(crate) id: TaskId,
     pub(crate) queue_name: String,
     pub(crate) input: serde_json::Value,
+    #[cfg_attr(not(feature = "otel"), allow(dead_code))]
+    pub(crate) meta: Json<Meta>,
     pub(crate) timeout: sqlx::postgres::types::PgInterval,
     pub(crate) heartbeat: sqlx::postgres::types::PgInterval,
     pub(crate) retry_policy: RetryPolicy,
