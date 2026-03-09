@@ -46,7 +46,7 @@ impl SpanContext {
             TraceState::default(),
         );
         let parent_context = Context::new().with_remote_span_context(span_context);
-        span.set_parent(parent_context);
+        let _ = span.set_parent(parent_context);
         self.trace_id.to_string()
     }
 }
