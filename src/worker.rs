@@ -134,7 +134,7 @@ use sqlx::{
 };
 use tokio::{sync::Semaphore, task::JoinSet};
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument as _, instrument};
+use tracing::{instrument, Instrument as _};
 
 use crate::{
     queue::{
