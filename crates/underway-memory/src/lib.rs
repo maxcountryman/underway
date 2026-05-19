@@ -1,4 +1,11 @@
 //! Deterministic in-process backend for Underway.
+//!
+//! This backend is intended for tests and local development. It keeps all state
+//! in process memory, uses a deterministic logical clock, and is not a durable
+//! production backend.
+//!
+//! Wakeups use `tokio::sync::Notify` to reduce latency, but polling remains the
+//! source of correctness.
 #![forbid(unsafe_code)]
 
 use std::{

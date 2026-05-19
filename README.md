@@ -40,6 +40,21 @@ Key Features:
   cron scheduling, heartbeats, and fencing support reliable high-concurrency
   execution.
 
+## Backend Model
+
+Underway's core API is backend-neutral: it defines semantic values and commands
+for queues, tasks, schedules, workflow progress, activity calls, retries, leases,
+and fencing. Backend crates implement those semantics atomically.
+
+Use `underway-postgres` as the durable production backend. It owns migrations,
+SQLx integration, advisory locks, and Postgres-specific optimizations. Use
+`underway-memory` for deterministic tests and local development; it is
+in-process infrastructure, not a durable cross-process backend.
+
+Backends may use notifications to reduce worker latency, but notifications do
+not define correctness. Workers and schedulers still poll, and shared backend
+contracts define the behavior each backend must satisfy.
+
 ## Usage
 
 Underway supports a few common patterns out of the box:

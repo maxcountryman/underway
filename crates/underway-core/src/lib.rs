@@ -1,4 +1,11 @@
 //! Backend-neutral durable workflow semantics.
+//!
+//! This crate defines Underway's values, commands, and runtime semantics
+//! without depending on any storage engine. Backend crates are responsible for
+//! atomicity, leases, fencing, time assignment, and durable state transitions.
+//!
+//! Backend notifications are latency hints only. Workers and schedulers keep
+//! polling, and the backend contracts define correctness.
 #![forbid(unsafe_code)]
 
 use std::{

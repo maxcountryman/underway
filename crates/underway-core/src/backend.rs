@@ -100,6 +100,10 @@ pub trait SchedulerLease: Send {
 }
 
 /// Backend transaction semantic API.
+///
+/// These operations describe Underway state transitions, not storage tables.
+/// Implementations must provide atomicity and fencing for the semantic command
+/// being applied.
 pub trait BackendTransaction: Send {
     /// Backend error type.
     type Error: std::error::Error + Send + Sync + 'static;
@@ -256,6 +260,10 @@ pub trait BackendTransaction: Send {
 }
 
 /// Durable backend.
+///
+/// Backends may implement wait methods with database notifications or in-memory
+/// wakeups, but those wakeups are best-effort latency optimizations. Polling
+/// and the backend contract tests define correctness.
 pub trait Backend: Clone + Send + Sync + 'static {
     /// Backend error type.
     type Error: std::error::Error + Send + Sync + 'static;
@@ -298,7 +306,8 @@ pub trait Backend: Clone + Send + Sync + 'static {
         }
     }
 
-    /// Waits for possible activity work.
+    /// Waits for possible activity work. Backends may implement this with
+    /// notifications; polling remains authoritative.
     fn wait_for_activity_change(
         &self,
         _queue_name: &str,
