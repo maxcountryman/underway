@@ -377,7 +377,7 @@ impl BackendTransaction for PostgresTransaction<'_> {
         Ok(())
     }
 
-    async fn task_schedule(
+    async fn load_task_schedule(
         &mut self,
         queue_name: &str,
     ) -> Result<Option<StoredSchedule>, Self::Error> {
@@ -424,7 +424,7 @@ impl BackendTransaction for PostgresTransaction<'_> {
         rows.into_iter().map(activity_record_from_row).collect()
     }
 
-    async fn insert_activity_call(
+    async fn record_activity_call(
         &mut self,
         queue_name: &str,
         workflow_run_id: WorkflowRunId,

@@ -152,11 +152,13 @@ where
         tx.unschedule_task(&self.name).await.map_err(Error::backend)
     }
 
-    pub(crate) async fn task_schedule(
+    pub(crate) async fn load_task_schedule(
         &self,
         tx: &mut B::Transaction<'_>,
     ) -> Result<Option<backend::StoredSchedule>> {
-        tx.task_schedule(&self.name).await.map_err(Error::backend)
+        tx.load_task_schedule(&self.name)
+            .await
+            .map_err(Error::backend)
     }
 }
 

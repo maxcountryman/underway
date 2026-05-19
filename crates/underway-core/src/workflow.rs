@@ -744,7 +744,7 @@ where
                     command.activity
                 )));
             };
-            tx.insert_activity_call(
+            tx.record_activity_call(
                 &self.queue.name,
                 workflow_run_id,
                 step_index,

@@ -267,10 +267,10 @@ where
         timeout: 15.seconds(),
         retry_policy: task::RetryPolicy::default(),
     };
-    tx.insert_activity_call(&queue_name, workflow_run_id, 0, command.clone())
+    tx.record_activity_call(&queue_name, workflow_run_id, 0, command.clone())
         .await
         .map_err(|err| backend_error(CONTRACT, err))?;
-    tx.insert_activity_call(&queue_name, workflow_run_id, 0, command)
+    tx.record_activity_call(&queue_name, workflow_run_id, 0, command)
         .await
         .map_err(|err| backend_error(CONTRACT, err))?;
     tx.commit()
@@ -693,7 +693,7 @@ where
         .await
         .map_err(|err| backend_error(CONTRACT, err))?;
     let stored = tx
-        .task_schedule(&queue_name)
+        .load_task_schedule(&queue_name)
         .await
         .map_err(|err| backend_error(CONTRACT, err))?;
     let stored = expect_some(CONTRACT, stored, "stored schedule")?;
@@ -704,7 +704,7 @@ where
         .await
         .map_err(|err| backend_error(CONTRACT, err))?;
     let removed = tx
-        .task_schedule(&queue_name)
+        .load_task_schedule(&queue_name)
         .await
         .map_err(|err| backend_error(CONTRACT, err))?;
     expect_none(CONTRACT, removed, "no schedule after unschedule")?;
@@ -801,10 +801,10 @@ where
     tx.create_queue(&queue_name, None)
         .await
         .map_err(|err| backend_error(CONTRACT, err))?;
-    tx.insert_activity_call(&queue_name, workflow_run_id, 0, command)
+    tx.record_activity_call(&queue_name, workflow_run_id, 0, command)
         .await
         .map_err(|err| backend_error(CONTRACT, err))?;
-    tx.insert_activity_call(&queue_name, workflow_run_id, 0, conflicting)
+    tx.record_activity_call(&queue_name, workflow_run_id, 0, conflicting)
         .await
         .map_err(|err| backend_error(CONTRACT, err))?;
     let records = tx

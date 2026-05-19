@@ -442,7 +442,7 @@ impl BackendTransaction for MemoryTransaction {
         Ok(())
     }
 
-    async fn task_schedule(
+    async fn load_task_schedule(
         &mut self,
         queue_name: &str,
     ) -> Result<Option<StoredSchedule>, Self::Error> {
@@ -476,7 +476,7 @@ impl BackendTransaction for MemoryTransaction {
             .collect())
     }
 
-    async fn insert_activity_call(
+    async fn record_activity_call(
         &mut self,
         queue_name: &str,
         workflow_run_id: WorkflowRunId,

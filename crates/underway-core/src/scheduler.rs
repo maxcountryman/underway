@@ -55,7 +55,7 @@ where
 
         loop {
             let mut tx = self.queue.backend.begin().await.map_err(Error::backend)?;
-            let schedule = self.queue.task_schedule(&mut tx).await?;
+            let schedule = self.queue.load_task_schedule(&mut tx).await?;
             tx.commit().await.map_err(Error::backend)?;
 
             let Some(stored) = schedule else {

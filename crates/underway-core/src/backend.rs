@@ -191,8 +191,8 @@ pub trait BackendTransaction: Send {
         queue_name: &str,
     ) -> impl Future<Output = StdResult<(), Self::Error>> + Send;
 
-    /// Loads a schedule.
-    fn task_schedule(
+    /// Loads the queue schedule.
+    fn load_task_schedule(
         &mut self,
         queue_name: &str,
     ) -> impl Future<Output = StdResult<Option<StoredSchedule>, Self::Error>> + Send;
@@ -205,8 +205,8 @@ pub trait BackendTransaction: Send {
         step_index: usize,
     ) -> impl Future<Output = StdResult<Vec<ActivityCallRecord>, Self::Error>> + Send;
 
-    /// Persists an activity call intent idempotently.
-    fn insert_activity_call(
+    /// Records an activity call intent idempotently.
+    fn record_activity_call(
         &mut self,
         queue_name: &str,
         workflow_run_id: workflow::WorkflowRunId,
