@@ -115,6 +115,8 @@ impl<B: backend::Backend> ActivityWorker<B> {
 
     pub(crate) async fn run_every(&self, period: Span) -> Result {
         let period: StdDuration = period.try_into()?;
+        self.drain_pending_calls().await?;
+
         loop {
             tokio::select! {
                 _ = self.shutdown_token.cancelled() => return Ok(()),

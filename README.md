@@ -234,7 +234,8 @@ workflow.enqueue(&Input).await?;
 ## Getting Help
 
 The [API docs][docs] include module-level walkthroughs and runnable snippets.
-Runnable examples are available in `examples/basic` and `examples/activities`.
+Runnable examples are available in `examples/basic`, `examples/activities`,
+and `examples/memory-basic`.
 You're also welcome to [open a discussion](https://github.com/maxcountryman/underway/discussions/new?category=q-a) and ask additional questions you might have.
 
 ## Contributing

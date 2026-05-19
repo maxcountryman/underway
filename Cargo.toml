@@ -6,6 +6,7 @@ members = [
   "crates/underway-postgres",
   "examples/activities",
   "examples/basic",
+  "examples/memory-basic",
 ]
 resolver = "2"
 

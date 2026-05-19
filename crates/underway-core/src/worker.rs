@@ -59,13 +59,25 @@ where
 
     /// Runs the worker.
     pub async fn run(&self) -> Result {
-        self.run_every(1.minute()).await
+        self.run_every(1.second()).await
     }
 
     /// Runs the worker with polling period.
     pub async fn run_every(&self, period: Span) -> Result {
         let period: StdDuration = period.try_into()?;
         let mut tasks = JoinSet::new();
+
+        if self.concurrency_limit > 0 {
+            let worker = self.clone();
+            tasks.spawn(async move {
+                while worker.process_next_task().await?.is_some() {
+                    if worker.shutdown_token.is_cancelled() {
+                        break;
+                    }
+                }
+                Ok::<_, Error>(())
+            });
+        }
 
         loop {
             tokio::select! {

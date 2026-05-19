@@ -79,9 +79,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: |
           rustup toolchain install nightly --profile minimal
-          cargo install sqlx-cli --no-default-features --features native-tls,postgres
       - uses: Swatinem/rust-cache@v2
       - name: Run lib tests
         run: |
-          cargo sqlx database setup
           cargo test --workspace --all-features --lib
