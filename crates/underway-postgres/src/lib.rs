@@ -1047,3 +1047,91 @@ fn duration_ms_i32(span: Span) -> Result<i32, Error> {
     let duration: Duration = span.try_into()?;
     Ok(duration.as_millis().min(i32::MAX as u128) as i32)
 }
+
+#[cfg(all(test, feature = "contracts"))]
+mod tests {
+    use std::time::Duration as StdDuration;
+
+    use underway_core::contracts as core_contracts;
+
+    use super::*;
+
+    async fn setup(pool: PgPool) -> PostgresBackend {
+        let backend = PostgresBackend::from_pool(pool);
+        backend.run_migrations().await.unwrap();
+        backend
+    }
+
+    async fn sleep_for(span: Span) -> Result<(), jiff::Error> {
+        tokio::time::sleep(StdDuration::try_from(span)?).await;
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn satisfies_queue_ordering_and_retry_contract(pool: PgPool) {
+        core_contracts::queue_ordering_and_retry(setup(pool).await)
+            .await
+            .unwrap();
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn satisfies_activity_call_idempotency_contract(pool: PgPool) {
+        core_contracts::activity_call_idempotency(setup(pool).await)
+            .await
+            .unwrap();
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn satisfies_delayed_availability_contract(pool: PgPool) {
+        core_contracts::delayed_availability(setup(pool).await, sleep_for)
+            .await
+            .unwrap();
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn satisfies_retry_delay_and_stale_lease_reclaim_contract(pool: PgPool) {
+        core_contracts::retry_delay_and_stale_lease_reclaim(setup(pool).await, sleep_for)
+            .await
+            .unwrap();
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn satisfies_attempt_fencing_contract(pool: PgPool) {
+        core_contracts::attempt_fencing(setup(pool).await)
+            .await
+            .unwrap();
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn satisfies_dlq_move_contract(pool: PgPool) {
+        core_contracts::dlq_move(setup(pool).await).await.unwrap();
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn satisfies_schedule_round_trip_contract(pool: PgPool) {
+        core_contracts::schedule_round_trip(setup(pool).await)
+            .await
+            .unwrap();
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn satisfies_cancellation_contract(pool: PgPool) {
+        core_contracts::cancellation(setup(pool).await)
+            .await
+            .unwrap();
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn satisfies_activity_retry_and_replay_fencing_contract(pool: PgPool) {
+        core_contracts::activity_retry_and_replay_fencing(setup(pool).await, sleep_for)
+            .await
+            .unwrap();
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn satisfies_workflow_wait_and_resume_contract(pool: PgPool) {
+        core_contracts::workflow_wait_and_resume(setup(pool).await)
+            .await
+            .unwrap();
+    }
+}
