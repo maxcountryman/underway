@@ -3,7 +3,7 @@
 </h1>
 
 <p align="center">
-    ⏳ Durable background workflows on Postgres.
+    Durable background workflows with pluggable backends.
 </p>
 
 <div align="center">
@@ -18,9 +18,9 @@
     </a>
 </div>
 
-## 🎨 Overview
+## Overview
 
-**Underway** runs durable background workflows on the Postgres you already operate.
+**Underway** runs durable background workflows against a pluggable backend.
 Model business flows as typed Rust steps, execute durable side effects through
 activities, and recover cleanly across retries, restarts, and deploys.
 
@@ -28,8 +28,9 @@ Key Features:
 
 - **Recover from Failures Automatically** Workflow progress and activity intent
   are persisted, so work resumes after restarts, crashes, and deploys.
-- **Use the Postgres You Already Run** No extra broker or orchestration layer;
-  queue coordination and task claiming happen in PostgreSQL.
+- **Choose the Backend Your Semantics Need** Use Postgres for durable
+  deployment, or the in-process memory backend for deterministic tests and
+  local development.
 - **Model Business Flows in Typed Rust** Build multi-step workflows with
   compile-time checked step inputs, outputs, and transitions.
 - **Make Side Effects Durable and Replay-Safe** `InvokeActivity::call` and
@@ -39,20 +40,20 @@ Key Features:
   cron scheduling, heartbeats, and fencing support reliable high-concurrency
   execution.
 
-## 🤸 Usage
+## Usage
 
 Underway supports a few common patterns out of the box:
 
 1. Build a typed workflow and run it with `runtime()`.
 2. Use durable activity calls for side effects.
-3. Enqueue and schedule atomically inside your own transaction.
+3. Enqueue and schedule atomically inside a backend transaction.
 
 ### 1) Build and run a workflow
 
 ```rust
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use underway::{Transition, Workflow};
+use underway::{PostgresBackend, Transition, Workflow};
 
 #[derive(Deserialize, Serialize)]
 struct ResizeImage {
@@ -67,9 +68,10 @@ struct PublishImage {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
-    underway::run_migrations(&pool).await?;
+    let backend = PostgresBackend::from_pool(pool);
+    backend.run_migrations().await?;
 
-    let workflow = Workflow::builder()
+    let workflow = Workflow::<PostgresBackend, ResizeImage>::builder()
         .step(|_cx, ResizeImage { asset_id }| async move {
             let object_key = format!("images/{asset_id}.webp");
             Transition::next(PublishImage { object_key })
@@ -79,7 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Transition::complete()
         })
         .name("image-pipeline")
-        .pool(pool)
+        .backend(backend)
         .build()
         .await?;
 
@@ -96,7 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```rust
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use underway::{Activity, ActivityError, InvokeActivity, Transition, Workflow};
+use underway::{Activity, ActivityError, InvokeActivity, PostgresBackend, Transition, Workflow};
 
 #[derive(Clone)]
 struct LookupEmail {
@@ -142,9 +144,10 @@ struct Signup {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
-    underway::run_migrations(&pool).await?;
+    let backend = PostgresBackend::from_pool(pool.clone());
+    backend.run_migrations().await?;
 
-    let workflow = Workflow::builder()
+    let workflow = Workflow::<PostgresBackend, Signup>::builder()
         .activity(LookupEmail { pool: pool.clone() })
         .activity(TrackSignupMetric)
         .step(|mut cx, Signup { user_id }| async move {
@@ -153,7 +156,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Transition::complete()
         })
         .name("signup-side-effects")
-        .pool(pool)
+        .backend(backend)
         .build()
         .await?;
 
@@ -163,12 +166,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### 3) Enqueue and schedule in your transaction
+### 3) Enqueue and schedule in a backend transaction
 
 ```rust
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use underway::{Transition, Workflow};
+use underway::{Backend, BackendTransaction, PostgresBackend, Transition, Workflow};
 
 #[derive(Deserialize, Serialize)]
 struct TenantCleanup {
@@ -178,31 +181,26 @@ struct TenantCleanup {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
-    underway::run_migrations(&pool).await?;
+    let backend = PostgresBackend::from_pool(pool);
+    backend.run_migrations().await?;
 
-    let workflow = Workflow::builder()
+    let workflow = Workflow::<PostgresBackend, TenantCleanup>::builder()
         .step(|_cx, TenantCleanup { tenant_id }| async move {
             println!("Running cleanup for tenant {tenant_id}");
             Transition::complete()
         })
         .name("tenant-cleanup")
-        .pool(pool.clone())
+        .backend(backend.clone())
         .build()
         .await?;
 
     let nightly = "0 2 * * *[UTC]".parse()?;
     let tenant_id = 7;
 
-    let mut tx = pool.begin().await?;
-
-    sqlx::query("update app_tenant set cleanup_enabled = true where id = $1")
-        .bind(tenant_id)
-        .execute(&mut *tx)
-        .await?;
-
     let input = TenantCleanup { tenant_id };
-    workflow.enqueue_using(&mut *tx, &input).await?;
-    workflow.schedule_using(&mut *tx, &nightly, &input).await?;
+    let mut tx = backend.begin().await?;
+    workflow.enqueue_using(&mut tx, &input).await?;
+    workflow.schedule_using(&mut tx, &nightly, &input).await?;
 
     tx.commit().await?;
 
@@ -210,13 +208,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-## 🛟 Getting Help
+### Memory backend
+
+```rust
+use serde::{Deserialize, Serialize};
+use underway::{MemoryBackend, Transition, Workflow};
+
+#[derive(Deserialize, Serialize)]
+struct Input;
+
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let backend = MemoryBackend::new();
+let workflow = Workflow::<MemoryBackend, Input>::builder()
+    .step(|_cx, _input: Input| async move { Transition::complete() })
+    .name("test-workflow")
+    .backend(backend)
+    .build()
+    .await?;
+
+workflow.enqueue(&Input).await?;
+# Ok(())
+# }
+```
+
+## Getting Help
 
 The [API docs][docs] include module-level walkthroughs and runnable snippets.
 Runnable examples are available in `examples/basic` and `examples/activities`.
 You're also welcome to [open a discussion](https://github.com/maxcountryman/underway/discussions/new?category=q-a) and ask additional questions you might have.
 
-## 👯 Contributing
+## Contributing
 
 We appreciate all kinds of contributions, thank you!
 

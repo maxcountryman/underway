@@ -6,7 +6,7 @@ use tokio::{
     sync::Mutex,
     time::{sleep, timeout},
 };
-use underway::{Activity, ActivityError, InvokeActivity, Transition, Workflow};
+use underway::{Activity, ActivityError, InvokeActivity, PostgresBackend, Transition, Workflow};
 
 #[derive(Clone)]
 struct LookupEmail {
@@ -59,12 +59,13 @@ struct State {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database_url = std::env::var("DATABASE_URL")?;
     let pool = PgPool::connect(&database_url).await?;
+    let backend = PostgresBackend::from_pool(pool.clone());
 
-    underway::run_migrations(&pool).await?;
+    backend.run_migrations().await?;
 
     let state = State::default();
 
-    let workflow = Workflow::builder()
+    let workflow = Workflow::<PostgresBackend, Signup>::builder()
         .state(state.clone())
         .activity(LookupEmail { pool: pool.clone() })
         .activity(TrackSignupMetric)
@@ -79,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         })
         .name("example-activities-workflow")
-        .pool(pool)
+        .backend(backend)
         .build()
         .await?;
 

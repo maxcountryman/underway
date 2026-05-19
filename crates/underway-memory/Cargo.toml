@@ -1,0 +1,18 @@
+[package]
+name = "underway-memory"
+description = "Deterministic in-process backend for Underway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+
+[dependencies]
+jiff.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+underway-core = { path = "../underway-core" }
+uuid.workspace = true

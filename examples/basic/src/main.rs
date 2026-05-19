@@ -6,7 +6,7 @@ use tokio::{
     sync::Mutex,
     time::{sleep, timeout},
 };
-use underway::{Transition, Workflow};
+use underway::{PostgresBackend, Transition, Workflow};
 
 #[derive(Debug, Deserialize, Serialize)]
 struct ResizeImage {
@@ -27,12 +27,13 @@ struct State {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database_url = std::env::var("DATABASE_URL")?;
     let pool = PgPool::connect(&database_url).await?;
+    let backend = PostgresBackend::from_pool(pool);
 
-    underway::run_migrations(&pool).await?;
+    backend.run_migrations().await?;
 
     let state = State::default();
 
-    let workflow = Workflow::builder()
+    let workflow = Workflow::<PostgresBackend, ResizeImage>::builder()
         .state(state.clone())
         .step(|_cx, ResizeImage { asset_id }| async move {
             let object_key = format!("images/{asset_id}.webp");
@@ -50,7 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         })
         .name("example-basic-workflow")
-        .pool(pool)
+        .backend(backend)
         .build()
         .await?;
 
