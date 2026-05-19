@@ -4,7 +4,7 @@
 //! is enabled. Backend crates can enable that feature in dev-dependencies to
 //! validate semantic behavior without pulling contract code into normal builds.
 
-use std::{fmt::Debug, result::Result as StdResult};
+use std::{fmt::Debug, future::Future, result::Result as StdResult};
 
 use super::*;
 
@@ -89,6 +89,35 @@ where
         None => Ok(()),
         Some(actual) => Err(violation(contract, expected, format!("{actual:?}"))),
     }
+}
+
+fn default_task_config(contract: &'static str) -> ContractResult<task::TaskConfig> {
+    task::TaskConfig::builder()
+        .build()
+        .map_err(|err| backend_error(contract, err))
+}
+
+fn task_config_with_short_heartbeat(contract: &'static str) -> ContractResult<task::TaskConfig> {
+    let retry_policy = task::RetryPolicy {
+        max_attempts: 3,
+        ..task::RetryPolicy::default()
+    };
+    task::TaskConfig::builder()
+        .retry_policy(retry_policy)
+        .heartbeat(100.milliseconds())
+        .build()
+        .map_err(|err| backend_error(contract, err))
+}
+
+fn workflow_input(
+    workflow_run_id: workflow::WorkflowRunId,
+    step_index: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "step_index": step_index,
+        "step_input": {},
+        "workflow_run_id": workflow_run_id.to_string(),
+    })
 }
 
 /// Verifies priority ordering, FIFO ordering within equal priority, retry, and
@@ -282,6 +311,656 @@ where
         records[0].output.clone(),
         Some(serde_json::json!({"ok": true})),
     )?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    Ok(())
+}
+
+/// Verifies delayed task availability. The `advance` callback lets
+/// deterministic backends move logical time while real-time backends can sleep.
+pub async fn delayed_availability<B, Advance, AdvanceFuture, AdvanceError>(
+    backend: B,
+    mut advance: Advance,
+) -> ContractResult
+where
+    B: backend::Backend,
+    Advance: FnMut(Span) -> AdvanceFuture,
+    AdvanceFuture: Future<Output = StdResult<(), AdvanceError>>,
+    AdvanceError: Display,
+{
+    const CONTRACT: &str = "delayed_availability";
+
+    let queue_name = format!("contract-delay-{}", task::TaskId::new());
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.create_queue(&queue_name, None)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.enqueue_task(
+        &queue_name,
+        backend::EnqueueTask {
+            input: serde_json::json!("delayed"),
+            config: default_task_config(CONTRACT)?,
+            delay: 100.milliseconds(),
+        },
+    )
+    .await
+    .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let unavailable = tx
+        .claim_task(&queue_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    expect_none(CONTRACT, unavailable, "no claim before delay elapses")?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    advance(120.milliseconds())
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let claimed = tx
+        .claim_task(&queue_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let claimed = expect_some(CONTRACT, claimed, "claim after delay elapses")?;
+    expect_eq(
+        CONTRACT,
+        claimed.input.clone(),
+        serde_json::json!("delayed"),
+    )?;
+    tx.mark_task_succeeded(&claimed)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    Ok(())
+}
+
+/// Verifies retry delay semantics and stale lease reclaim attempt numbering.
+pub async fn retry_delay_and_stale_lease_reclaim<B, Advance, AdvanceFuture, AdvanceError>(
+    backend: B,
+    mut advance: Advance,
+) -> ContractResult
+where
+    B: backend::Backend,
+    Advance: FnMut(Span) -> AdvanceFuture,
+    AdvanceFuture: Future<Output = StdResult<(), AdvanceError>>,
+    AdvanceError: Display,
+{
+    const CONTRACT: &str = "retry_delay_and_stale_lease_reclaim";
+
+    let queue_name = format!("contract-reclaim-{}", task::TaskId::new());
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.create_queue(&queue_name, None)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.enqueue_task(
+        &queue_name,
+        backend::EnqueueTask {
+            input: serde_json::json!("reclaim"),
+            config: task_config_with_short_heartbeat(CONTRACT)?,
+            delay: Span::new(),
+        },
+    )
+    .await
+    .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let first = tx
+        .claim_task(&queue_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let first = expect_some(CONTRACT, first, "first claim")?;
+    expect_eq(CONTRACT, first.attempt_number, 1)?;
+    tx.record_task_failure(&first, &task::Error::Retryable("retry".to_string()))
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.retry_task(&first, 100.milliseconds())
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let unavailable = tx
+        .claim_task(&queue_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    expect_none(CONTRACT, unavailable, "no claim during retry backoff")?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    advance(120.milliseconds())
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let second = tx
+        .claim_task(&queue_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let second = expect_some(CONTRACT, second, "claim after retry backoff")?;
+    expect_eq(CONTRACT, second.attempt_number, 2)?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    advance(120.milliseconds())
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let reclaimed = tx
+        .claim_task(&queue_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let reclaimed = expect_some(CONTRACT, reclaimed, "stale lease reclaim")?;
+    expect_eq(CONTRACT, reclaimed.attempt_number, 3)?;
+    tx.mark_task_succeeded(&reclaimed)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    Ok(())
+}
+
+/// Verifies stale attempts cannot complete or hide the current attempt.
+pub async fn attempt_fencing<B>(backend: B) -> ContractResult
+where
+    B: backend::Backend,
+{
+    const CONTRACT: &str = "attempt_fencing";
+
+    let queue_name = format!("contract-fencing-{}", task::TaskId::new());
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.create_queue(&queue_name, None)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.enqueue_task(
+        &queue_name,
+        backend::EnqueueTask {
+            input: serde_json::json!("fenced"),
+            config: task_config_with_short_heartbeat(CONTRACT)?,
+            delay: Span::new(),
+        },
+    )
+    .await
+    .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let first = tx
+        .claim_task(&queue_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let first = expect_some(CONTRACT, first, "first claim")?;
+    tx.retry_task(&first, Span::new())
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let second = tx
+        .claim_task(&queue_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let second = expect_some(CONTRACT, second, "second claim")?;
+    expect_eq(CONTRACT, second.attempt_number, 2)?;
+
+    let _ = tx.mark_task_succeeded(&first).await;
+    let duplicate = tx
+        .claim_task(&queue_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    expect_none(
+        CONTRACT,
+        duplicate,
+        "no duplicate claim after stale completion attempt",
+    )?;
+
+    tx.record_task_failure(&second, &task::Error::Retryable("retry".to_string()))
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.retry_task(&second, Span::new())
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let third = tx
+        .claim_task(&queue_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let third = expect_some(CONTRACT, third, "third claim after current retry")?;
+    expect_eq(CONTRACT, third.attempt_number, 3)?;
+    tx.mark_task_succeeded(&third)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    Ok(())
+}
+
+/// Verifies moving a pending task to a DLQ removes it from the source queue and
+/// leaves it claimable from the DLQ.
+pub async fn dlq_move<B>(backend: B) -> ContractResult
+where
+    B: backend::Backend,
+{
+    const CONTRACT: &str = "dlq_move";
+
+    let queue_name = format!("contract-dlq-{}", task::TaskId::new());
+    let dlq_name = format!("{queue_name}-dead");
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.create_queue(&queue_name, Some(&dlq_name))
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let task_id = tx
+        .enqueue_task(
+            &queue_name,
+            backend::EnqueueTask {
+                input: serde_json::json!("dead-letter"),
+                config: default_task_config(CONTRACT)?,
+                delay: Span::new(),
+            },
+        )
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.move_task_to_dlq(task_id, &queue_name, &dlq_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let original = tx
+        .claim_task(&queue_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    expect_none(
+        CONTRACT,
+        original,
+        "no claim from source queue after DLQ move",
+    )?;
+    let moved = tx
+        .claim_task(&dlq_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let moved = expect_some(CONTRACT, moved, "claim from DLQ after move")?;
+    expect_eq(
+        CONTRACT,
+        moved.input.clone(),
+        serde_json::json!("dead-letter"),
+    )?;
+    tx.mark_task_succeeded(&moved)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    Ok(())
+}
+
+/// Verifies schedule storage, replacement, and removal.
+pub async fn schedule_round_trip<B>(backend: B) -> ContractResult
+where
+    B: backend::Backend,
+{
+    const CONTRACT: &str = "schedule_round_trip";
+
+    let queue_name = format!("contract-schedule-{}", task::TaskId::new());
+    let schedule = scheduler::ZonedSchedule::new("* * * * * * *", "UTC")
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let input = serde_json::json!({"scheduled": true});
+
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.create_queue(&queue_name, None)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.schedule_task(&queue_name, schedule.clone(), input.clone())
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let stored = tx
+        .task_schedule(&queue_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let stored = expect_some(CONTRACT, stored, "stored schedule")?;
+    expect_eq(CONTRACT, stored.schedule.cron_expr(), schedule.cron_expr())?;
+    expect_eq(CONTRACT, stored.schedule.iana_name(), schedule.iana_name())?;
+    expect_eq(CONTRACT, stored.input, input)?;
+    tx.unschedule_task(&queue_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let removed = tx
+        .task_schedule(&queue_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    expect_none(CONTRACT, removed, "no schedule after unschedule")?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    Ok(())
+}
+
+/// Verifies cancellation of pending workflow work by workflow run ID.
+pub async fn cancellation<B>(backend: B) -> ContractResult
+where
+    B: backend::Backend,
+{
+    const CONTRACT: &str = "cancellation";
+
+    let queue_name = format!("contract-cancel-{}", task::TaskId::new());
+    let workflow_run_id = workflow::WorkflowRunId::new();
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.create_queue(&queue_name, None)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.enqueue_task(
+        &queue_name,
+        backend::EnqueueTask {
+            input: workflow_input(workflow_run_id, 0),
+            config: default_task_config(CONTRACT)?,
+            delay: Span::new(),
+        },
+    )
+    .await
+    .map_err(|err| backend_error(CONTRACT, err))?;
+    let cancelled = tx
+        .cancel_workflow(&queue_name, workflow_run_id)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    expect_eq(CONTRACT, cancelled, true)?;
+    let cancelled_again = tx
+        .cancel_workflow(&queue_name, workflow_run_id)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    expect_eq(CONTRACT, cancelled_again, false)?;
+    let claimed = tx
+        .claim_task(&queue_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    expect_none(CONTRACT, claimed, "no claim after cancellation")?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    Ok(())
+}
+
+/// Verifies activity retry delay, replay idempotency, and stale activity claim
+/// fencing.
+pub async fn activity_retry_and_replay_fencing<B, Advance, AdvanceFuture, AdvanceError>(
+    backend: B,
+    mut advance: Advance,
+) -> ContractResult
+where
+    B: backend::Backend,
+    Advance: FnMut(Span) -> AdvanceFuture,
+    AdvanceFuture: Future<Output = StdResult<(), AdvanceError>>,
+    AdvanceError: Display,
+{
+    const CONTRACT: &str = "activity_retry_and_replay_fencing";
+
+    let queue_name = format!("contract-activity-retry-{}", task::TaskId::new());
+    let workflow_run_id = workflow::WorkflowRunId::new();
+    let command = backend::ActivityCallCommand {
+        call_key: "activity:0:0".to_string(),
+        activity: "activity".to_string(),
+        input: serde_json::json!({"original": true}),
+        timeout: 100.milliseconds(),
+        retry_policy: task::RetryPolicy::default(),
+    };
+    let conflicting = backend::ActivityCallCommand {
+        call_key: command.call_key.clone(),
+        activity: "other-activity".to_string(),
+        input: serde_json::json!({"original": false}),
+        timeout: 100.milliseconds(),
+        retry_policy: task::RetryPolicy::default(),
+    };
+
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.create_queue(&queue_name, None)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.insert_activity_call(&queue_name, workflow_run_id, 0, command)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.insert_activity_call(&queue_name, workflow_run_id, 0, conflicting)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let records = tx
+        .load_activity_calls(&queue_name, workflow_run_id, 0)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    expect_eq(CONTRACT, records.len(), 1)?;
+    expect_eq(
+        CONTRACT,
+        records[0].activity.clone(),
+        "activity".to_string(),
+    )?;
+    expect_eq(
+        CONTRACT,
+        records[0].input.clone(),
+        serde_json::json!({"original": true}),
+    )?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let first = tx
+        .claim_activity_call(&queue_name, &["activity".to_string()])
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let first = expect_some(CONTRACT, first, "first activity claim")?;
+    expect_eq(CONTRACT, first.attempt_number, 1)?;
+    tx.retry_activity_call(
+        &first,
+        activity::Error::retryable("retry", "try again"),
+        100.milliseconds(),
+    )
+    .await
+    .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let unavailable = tx
+        .claim_activity_call(&queue_name, &["activity".to_string()])
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    expect_none(
+        CONTRACT,
+        unavailable,
+        "no activity claim during retry delay",
+    )?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    advance(120.milliseconds())
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let second = tx
+        .claim_activity_call(&queue_name, &["activity".to_string()])
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let second = expect_some(CONTRACT, second, "second activity claim")?;
+    expect_eq(CONTRACT, second.attempt_number, 2)?;
+    let _ = tx
+        .complete_activity_call(&first, serde_json::json!("stale"))
+        .await;
+    tx.complete_activity_call(&second, serde_json::json!({"ok": true}))
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let records = tx
+        .load_activity_calls(&queue_name, workflow_run_id, 0)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    expect_eq(CONTRACT, records.len(), 1)?;
+    expect_eq(CONTRACT, records[0].state, activity::CallState::Succeeded)?;
+    expect_eq(
+        CONTRACT,
+        records[0].output.clone(),
+        Some(serde_json::json!({"ok": true})),
+    )?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    Ok(())
+}
+
+/// Verifies waiting workflow tasks can be woken for the exact run and step.
+pub async fn workflow_wait_and_resume<B>(backend: B) -> ContractResult
+where
+    B: backend::Backend,
+{
+    const CONTRACT: &str = "workflow_wait_and_resume";
+
+    let queue_name = format!("contract-wait-{}", task::TaskId::new());
+    let workflow_run_id = workflow::WorkflowRunId::new();
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.create_queue(&queue_name, None)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.enqueue_task(
+        &queue_name,
+        backend::EnqueueTask {
+            input: workflow_input(workflow_run_id, 0),
+            config: default_task_config(CONTRACT)?,
+            delay: Span::new(),
+        },
+    )
+    .await
+    .map_err(|err| backend_error(CONTRACT, err))?;
+    let claimed = tx
+        .claim_task(&queue_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let claimed = expect_some(CONTRACT, claimed, "claim workflow task")?;
+    tx.mark_task_waiting(&claimed)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let unavailable = tx
+        .claim_task(&queue_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    expect_none(CONTRACT, unavailable, "no claim while workflow is waiting")?;
+    tx.wake_workflow_task(&queue_name, workflow_run_id, 1)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let wrong_step = tx
+        .claim_task(&queue_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    expect_none(CONTRACT, wrong_step, "wrong step does not wake workflow")?;
+    tx.wake_workflow_task(&queue_name, workflow_run_id, 0)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let resumed = tx
+        .claim_task(&queue_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let resumed = expect_some(CONTRACT, resumed, "claim after workflow wake")?;
+    expect_eq(CONTRACT, resumed.attempt_number, 2)?;
+    tx.mark_task_succeeded(&resumed)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
     tx.commit()
         .await
         .map_err(|err| backend_error(CONTRACT, err))?;

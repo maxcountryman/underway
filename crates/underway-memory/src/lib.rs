@@ -724,13 +724,22 @@ fn workflow_run_id_from_input(input: &serde_json::Value) -> Option<WorkflowRunId
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{future::Future, pin::Pin, sync::Arc};
 
     use serde::{Deserialize, Serialize};
     use tokio::sync::Mutex as TokioMutex;
     use underway_core::{BackendTransaction, Task, Transition, Workflow};
 
     use super::*;
+
+    fn advance_clock(
+        backend: MemoryBackend,
+    ) -> impl FnMut(Span) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send>> {
+        move |span| {
+            let backend = backend.clone();
+            Box::pin(async move { backend.advance(span) })
+        }
+    }
 
     #[derive(Debug, Deserialize, Serialize)]
     struct Input {
@@ -821,6 +830,71 @@ mod tests {
     #[tokio::test]
     async fn satisfies_activity_call_idempotency_contract() {
         underway_core::contracts::activity_call_idempotency(MemoryBackend::new())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn satisfies_delayed_availability_contract() {
+        let backend = MemoryBackend::new();
+        underway_core::contracts::delayed_availability(backend.clone(), advance_clock(backend))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn satisfies_retry_delay_and_stale_lease_reclaim_contract() {
+        let backend = MemoryBackend::new();
+        underway_core::contracts::retry_delay_and_stale_lease_reclaim(
+            backend.clone(),
+            advance_clock(backend),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn satisfies_attempt_fencing_contract() {
+        underway_core::contracts::attempt_fencing(MemoryBackend::new())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn satisfies_dlq_move_contract() {
+        underway_core::contracts::dlq_move(MemoryBackend::new())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn satisfies_schedule_round_trip_contract() {
+        underway_core::contracts::schedule_round_trip(MemoryBackend::new())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn satisfies_cancellation_contract() {
+        underway_core::contracts::cancellation(MemoryBackend::new())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn satisfies_activity_retry_and_replay_fencing_contract() {
+        let backend = MemoryBackend::new();
+        underway_core::contracts::activity_retry_and_replay_fencing(
+            backend.clone(),
+            advance_clock(backend),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn satisfies_workflow_wait_and_resume_contract() {
+        underway_core::contracts::workflow_wait_and_resume(MemoryBackend::new())
             .await
             .unwrap();
     }
