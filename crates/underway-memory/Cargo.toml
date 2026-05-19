@@ -16,3 +16,6 @@ tokio.workspace = true
 tracing.workspace = true
 underway-core = { path = "../underway-core" }
 uuid.workspace = true
+
+[dev-dependencies]
+underway-core = { path = "../underway-core", features = ["contracts"] }
