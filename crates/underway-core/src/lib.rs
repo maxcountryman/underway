@@ -24,7 +24,7 @@ pub use queue::{Queue, QueueBuilder};
 pub use runtime::{Runtime, RuntimeHandle};
 pub use scheduler::{Scheduler, ZonedSchedule};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-pub use task::{Task, TaskConfig, TaskId, ToTaskResult};
+pub use task::{Task, TaskConfig, TaskConfigBuilder, TaskId, ToTaskResult};
 use tokio::{task::JoinSet, time::sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
@@ -48,6 +48,10 @@ pub enum Error {
     /// Error returned by task execution.
     #[error(transparent)]
     Task(#[from] task::Error),
+
+    /// Invalid task configuration.
+    #[error(transparent)]
+    TaskConfig(#[from] task::ConfigError),
 
     /// Error returned by JSON serialization/deserialization.
     #[error(transparent)]
@@ -221,6 +225,9 @@ pub mod task {
     /// A type alias for task execution results.
     pub type Result<T> = StdResult<T, Error>;
 
+    /// A type alias for task configuration results.
+    pub type ConfigResult<T = TaskConfig> = StdResult<T, ConfigError>;
+
     /// Task execution errors.
     #[derive(Debug, thiserror::Error)]
     #[non_exhaustive]
@@ -241,6 +248,70 @@ pub mod task {
         /// Recoverable error.
         #[error("{0}")]
         Retryable(String),
+    }
+
+    /// Task configuration validation errors.
+    #[derive(Debug, thiserror::Error)]
+    #[non_exhaustive]
+    pub enum ConfigError {
+        /// Retry policy must allow at least one attempt.
+        #[error("retry policy max_attempts must be at least 1, got {0}")]
+        InvalidMaxAttempts(i32),
+
+        /// Retry initial interval must not be negative.
+        #[error("retry policy initial_interval_ms must be non-negative, got {0}")]
+        InvalidInitialInterval(i32),
+
+        /// Retry maximum interval must not be negative.
+        #[error("retry policy max_interval_ms must be non-negative, got {0}")]
+        InvalidMaxInterval(i32),
+
+        /// Retry maximum interval must be greater than or equal to the initial
+        /// interval.
+        #[error(
+            "retry policy max_interval_ms must be greater than or equal to initial_interval_ms, \
+             got max={max} and initial={initial}"
+        )]
+        InvalidIntervalRange {
+            /// Configured maximum interval.
+            max: i32,
+            /// Configured initial interval.
+            initial: i32,
+        },
+
+        /// Retry backoff coefficient must be finite and at least one.
+        #[error("retry policy backoff_coefficient must be finite and at least 1, got {0}")]
+        InvalidBackoffCoefficient(f64),
+
+        /// Retry jitter factor must be finite and between zero and one.
+        #[error("retry policy jitter_factor must be finite and between 0 and 1, got {0}")]
+        InvalidJitterFactor(f64),
+
+        /// Duration field must be representable as an invariant unsigned
+        /// duration.
+        #[error("task config {field} must be a non-negative invariant duration: {message}")]
+        InvalidDuration {
+            /// Field being validated.
+            field: &'static str,
+            /// Conversion failure message.
+            message: String,
+        },
+
+        /// Duration field must be greater than zero.
+        #[error("task config {0} must be greater than zero")]
+        NonPositiveDuration(&'static str),
+
+        /// Heartbeat interval cannot be greater than the task timeout.
+        #[error("task config heartbeat must be less than or equal to timeout")]
+        HeartbeatExceedsTimeout,
+
+        /// Concurrency keys must not be empty.
+        #[error("task config concurrency_key must not be empty")]
+        EmptyConcurrencyKey,
+
+        /// Error returned by span arithmetic.
+        #[error(transparent)]
+        Jiff(#[from] jiff::Error),
     }
 
     /// Converts external errors into task errors.
@@ -281,6 +352,37 @@ pub mod task {
         /// Creates a retry policy builder.
         pub fn builder() -> RetryPolicyBuilder {
             RetryPolicyBuilder::default()
+        }
+
+        /// Validates the retry policy invariants.
+        pub fn validate(&self) -> ConfigResult<()> {
+            if self.max_attempts < 1 {
+                return Err(ConfigError::InvalidMaxAttempts(self.max_attempts));
+            }
+            if self.initial_interval_ms < 0 {
+                return Err(ConfigError::InvalidInitialInterval(
+                    self.initial_interval_ms,
+                ));
+            }
+            if self.max_interval_ms < 0 {
+                return Err(ConfigError::InvalidMaxInterval(self.max_interval_ms));
+            }
+            if self.max_interval_ms < self.initial_interval_ms {
+                return Err(ConfigError::InvalidIntervalRange {
+                    max: self.max_interval_ms,
+                    initial: self.initial_interval_ms,
+                });
+            }
+            if !self.backoff_coefficient.is_finite() || self.backoff_coefficient < 1.0 {
+                return Err(ConfigError::InvalidBackoffCoefficient(
+                    self.backoff_coefficient,
+                ));
+            }
+            if !self.jitter_factor.is_finite() || !(0.0..=1.0).contains(&self.jitter_factor) {
+                return Err(ConfigError::InvalidJitterFactor(self.jitter_factor));
+            }
+
+            Ok(())
         }
 
         /// Calculates the delay for a retry count.
@@ -371,22 +473,15 @@ pub mod task {
     }
 
     /// Task execution configuration.
-    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[derive(Debug, Clone, PartialEq, Serialize)]
     pub struct TaskConfig {
-        /// Retry policy.
-        pub retry_policy: RetryPolicy,
-        /// Execution timeout.
-        pub timeout: Span,
-        /// Retention TTL.
-        pub ttl: Span,
-        /// Base delay.
-        pub delay: Span,
-        /// Heartbeat interval.
-        pub heartbeat: Span,
-        /// Optional serializing key.
-        pub concurrency_key: Option<String>,
-        /// Priority, higher first.
-        pub priority: i32,
+        retry_policy: RetryPolicy,
+        timeout: Span,
+        ttl: Span,
+        delay: Span,
+        heartbeat: Span,
+        concurrency_key: Option<String>,
+        priority: i32,
     }
 
     impl Default for TaskConfig {
@@ -401,6 +496,231 @@ pub mod task {
                 priority: 0,
             }
         }
+    }
+
+    impl<'de> Deserialize<'de> for TaskConfig {
+        fn deserialize<D>(deserializer: D) -> StdResult<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            #[derive(Deserialize)]
+            struct RawTaskConfig {
+                retry_policy: RetryPolicy,
+                timeout: Span,
+                ttl: Span,
+                delay: Span,
+                heartbeat: Span,
+                concurrency_key: Option<String>,
+                priority: i32,
+            }
+
+            let raw = RawTaskConfig::deserialize(deserializer)?;
+            Self {
+                retry_policy: raw.retry_policy,
+                timeout: raw.timeout,
+                ttl: raw.ttl,
+                delay: raw.delay,
+                heartbeat: raw.heartbeat,
+                concurrency_key: raw.concurrency_key,
+                priority: raw.priority,
+            }
+            .validated()
+            .map_err(serde::de::Error::custom)
+        }
+    }
+
+    impl TaskConfig {
+        /// Creates a task configuration builder.
+        pub fn builder() -> TaskConfigBuilder {
+            TaskConfigBuilder::default()
+        }
+
+        /// Creates a builder initialized from this configuration.
+        pub fn into_builder(self) -> TaskConfigBuilder {
+            TaskConfigBuilder { inner: self }
+        }
+
+        /// Validates this configuration.
+        pub fn validate(&self) -> ConfigResult<()> {
+            self.retry_policy.validate()?;
+
+            let timeout = positive_duration("timeout", self.timeout)?;
+            positive_duration("ttl", self.ttl)?;
+            non_negative_duration("delay", self.delay)?;
+            let heartbeat = positive_duration("heartbeat", self.heartbeat)?;
+
+            if heartbeat > timeout {
+                return Err(ConfigError::HeartbeatExceedsTimeout);
+            }
+
+            if self
+                .concurrency_key
+                .as_deref()
+                .is_some_and(|key| key.is_empty())
+            {
+                return Err(ConfigError::EmptyConcurrencyKey);
+            }
+
+            Ok(())
+        }
+
+        /// Returns this configuration after validating it.
+        pub fn validated(self) -> ConfigResult<Self> {
+            self.validate()?;
+            Ok(self)
+        }
+
+        /// Returns this configuration with additional enqueue delay applied.
+        pub fn with_additional_delay(mut self, delay: Span) -> ConfigResult<Self> {
+            non_negative_duration("additional delay", delay)?;
+            self.delay = self.delay.checked_add(delay)?;
+            self.validated()
+        }
+
+        /// Returns the retry policy.
+        pub const fn retry_policy(&self) -> RetryPolicy {
+            self.retry_policy
+        }
+
+        /// Returns the execution timeout.
+        pub const fn timeout(&self) -> Span {
+            self.timeout
+        }
+
+        /// Returns the retention TTL.
+        pub const fn ttl(&self) -> Span {
+            self.ttl
+        }
+
+        /// Returns the base delay.
+        pub const fn delay(&self) -> Span {
+            self.delay
+        }
+
+        /// Returns the heartbeat interval.
+        pub const fn heartbeat(&self) -> Span {
+            self.heartbeat
+        }
+
+        /// Returns the optional serializing key.
+        pub fn concurrency_key(&self) -> Option<&str> {
+            self.concurrency_key.as_deref()
+        }
+
+        /// Returns the priority. Higher values are claimed first.
+        pub const fn priority(&self) -> i32 {
+            self.priority
+        }
+
+        pub(crate) fn set_retry_policy(&mut self, retry_policy: RetryPolicy) {
+            self.retry_policy = retry_policy;
+        }
+
+        pub(crate) fn set_timeout(&mut self, timeout: Span) {
+            self.timeout = timeout;
+        }
+
+        pub(crate) fn set_ttl(&mut self, ttl: Span) {
+            self.ttl = ttl;
+        }
+
+        pub(crate) fn set_delay(&mut self, delay: Span) {
+            self.delay = delay;
+        }
+
+        pub(crate) fn set_heartbeat(&mut self, heartbeat: Span) {
+            self.heartbeat = heartbeat;
+        }
+
+        pub(crate) fn set_concurrency_key(&mut self, concurrency_key: Option<String>) {
+            self.concurrency_key = concurrency_key;
+        }
+
+        pub(crate) fn set_priority(&mut self, priority: i32) {
+            self.priority = priority;
+        }
+    }
+
+    /// Builder for [`TaskConfig`].
+    #[derive(Debug, Clone, Default)]
+    pub struct TaskConfigBuilder {
+        inner: TaskConfig,
+    }
+
+    impl TaskConfigBuilder {
+        /// Sets the retry policy.
+        pub fn retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
+            self.inner.retry_policy = retry_policy;
+            self
+        }
+
+        /// Sets the execution timeout.
+        pub fn timeout(mut self, timeout: Span) -> Self {
+            self.inner.timeout = timeout;
+            self
+        }
+
+        /// Sets the retention TTL.
+        pub fn ttl(mut self, ttl: Span) -> Self {
+            self.inner.ttl = ttl;
+            self
+        }
+
+        /// Sets the base delay.
+        pub fn delay(mut self, delay: Span) -> Self {
+            self.inner.delay = delay;
+            self
+        }
+
+        /// Sets the heartbeat interval.
+        pub fn heartbeat(mut self, heartbeat: Span) -> Self {
+            self.inner.heartbeat = heartbeat;
+            self
+        }
+
+        /// Sets the optional serializing key.
+        pub fn concurrency_key(mut self, concurrency_key: impl Into<String>) -> Self {
+            self.inner.concurrency_key = Some(concurrency_key.into());
+            self
+        }
+
+        /// Sets the optional serializing key.
+        pub fn maybe_concurrency_key(mut self, concurrency_key: Option<String>) -> Self {
+            self.inner.concurrency_key = concurrency_key;
+            self
+        }
+
+        /// Clears the optional serializing key.
+        pub fn clear_concurrency_key(mut self) -> Self {
+            self.inner.concurrency_key = None;
+            self
+        }
+
+        /// Sets the priority. Higher values are claimed first.
+        pub fn priority(mut self, priority: i32) -> Self {
+            self.inner.priority = priority;
+            self
+        }
+
+        /// Builds a validated task configuration.
+        pub fn build(self) -> ConfigResult<TaskConfig> {
+            self.inner.validated()
+        }
+    }
+
+    fn non_negative_duration(field: &'static str, span: Span) -> ConfigResult<StdDuration> {
+        StdDuration::try_from(span).map_err(|err| ConfigError::InvalidDuration {
+            field,
+            message: err.to_string(),
+        })
+    }
+
+    fn positive_duration(field: &'static str, span: Span) -> ConfigResult<StdDuration> {
+        let duration = non_negative_duration(field, span)?;
+        if duration.is_zero() {
+            return Err(ConfigError::NonPositiveDuration(field));
+        }
+        Ok(duration)
     }
 
     /// Trait for defining executable tasks.
@@ -418,87 +738,63 @@ pub mod task {
             input: Self::Input,
         ) -> impl Future<Output = Result<Self::Output>> + Send;
 
-        /// Default retry policy.
-        fn retry_policy(&self) -> RetryPolicy {
-            RetryPolicy::default()
-        }
-
-        /// Default timeout.
-        fn timeout(&self) -> Span {
-            15.minutes()
-        }
-
-        /// Default TTL.
-        fn ttl(&self) -> Span {
-            14.days()
-        }
-
-        /// Default delay.
-        fn delay(&self) -> Span {
-            Span::new()
-        }
-
-        /// Default heartbeat.
-        fn heartbeat(&self) -> Span {
-            30.seconds()
-        }
-
-        /// Default concurrency key.
-        fn concurrency_key(&self) -> Option<String> {
-            None
-        }
-
-        /// Default priority.
-        fn priority(&self) -> i32 {
-            0
-        }
-
-        /// Per-input retry policy.
-        fn retry_policy_for(&self, _input: &Self::Input) -> RetryPolicy {
-            self.retry_policy()
-        }
-
-        /// Per-input timeout.
-        fn timeout_for(&self, _input: &Self::Input) -> Span {
-            self.timeout()
-        }
-
-        /// Per-input TTL.
-        fn ttl_for(&self, _input: &Self::Input) -> Span {
-            self.ttl()
-        }
-
-        /// Per-input delay.
-        fn delay_for(&self, _input: &Self::Input) -> Span {
-            self.delay()
-        }
-
-        /// Per-input heartbeat.
-        fn heartbeat_for(&self, _input: &Self::Input) -> Span {
-            self.heartbeat()
-        }
-
-        /// Per-input concurrency key.
-        fn concurrency_key_for(&self, _input: &Self::Input) -> Option<String> {
-            self.concurrency_key()
-        }
-
-        /// Per-input priority.
-        fn priority_for(&self, _input: &Self::Input) -> i32 {
-            self.priority()
+        /// Default task configuration.
+        fn config(&self) -> ConfigResult {
+            Ok(TaskConfig::default())
         }
 
         /// Per-input task configuration.
-        fn config_for(&self, input: &Self::Input) -> TaskConfig {
-            TaskConfig {
-                retry_policy: self.retry_policy_for(input),
-                timeout: self.timeout_for(input),
-                ttl: self.ttl_for(input),
-                delay: self.delay_for(input),
-                heartbeat: self.heartbeat_for(input),
-                concurrency_key: self.concurrency_key_for(input),
-                priority: self.priority_for(input),
-            }
+        fn config_for(&self, _input: &Self::Input) -> ConfigResult {
+            self.config()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn default_task_config_is_valid() {
+            TaskConfig::default().validate().unwrap();
+        }
+
+        #[test]
+        fn task_config_rejects_zero_timeout() {
+            let err = TaskConfig::builder()
+                .timeout(Span::new())
+                .build()
+                .unwrap_err();
+
+            assert!(matches!(err, ConfigError::NonPositiveDuration("timeout")));
+        }
+
+        #[test]
+        fn task_config_rejects_heartbeat_greater_than_timeout() {
+            let err = TaskConfig::builder()
+                .timeout(10.seconds())
+                .heartbeat(30.seconds())
+                .build()
+                .unwrap_err();
+
+            assert!(matches!(err, ConfigError::HeartbeatExceedsTimeout));
+        }
+
+        #[test]
+        fn task_config_accepts_zero_delay() {
+            TaskConfig::builder().delay(Span::new()).build().unwrap();
+        }
+
+        #[test]
+        fn retry_policy_rejects_invalid_attempts() {
+            let policy = RetryPolicy {
+                max_attempts: 0,
+                ..RetryPolicy::default()
+            };
+
+            assert!(matches!(
+                policy.validate().unwrap_err(),
+                ConfigError::InvalidMaxAttempts(0)
+            ));
         }
     }
 }
@@ -918,9 +1214,7 @@ pub mod queue {
             input: &T::Input,
             delay: Span,
         ) -> Result<task::TaskId> {
-            let mut config = task.config_for(input);
-            let configured_delay = config.delay;
-            config.delay = configured_delay.checked_add(delay)?;
+            let config = task.config_for(input)?.with_additional_delay(delay)?;
             let command = backend::EnqueueTask {
                 input: serde_json::to_value(input)?,
                 config,
@@ -1235,8 +1529,8 @@ pub mod worker {
             };
 
             let input: T::Input = serde_json::from_value(claimed.input.clone())?;
-            let timeout: StdDuration = claimed.config.timeout.try_into()?;
-            let heartbeat: StdDuration = claimed.config.heartbeat.try_into()?;
+            let timeout: StdDuration = claimed.config.timeout().try_into()?;
+            let heartbeat: StdDuration = claimed.config.heartbeat().try_into()?;
 
             let heartbeat_task = tokio::spawn({
                 let backend = self.queue.backend.clone();
@@ -1272,7 +1566,7 @@ pub mod worker {
                         &mut tx,
                         &self.queue,
                         &claimed,
-                        &claimed.config.retry_policy,
+                        &claimed.config.retry_policy(),
                         &err,
                     )
                     .await?;
@@ -1283,7 +1577,7 @@ pub mod worker {
                         &mut tx,
                         &self.queue,
                         &claimed,
-                        &claimed.config.retry_policy,
+                        &claimed.config.retry_policy(),
                         &err,
                     )
                     .await?;
@@ -2595,60 +2889,12 @@ pub mod workflow {
             Ok(())
         }
 
-        fn retry_policy(&self) -> task::RetryPolicy {
-            self.step_task_config(0).retry_policy
+        fn config(&self) -> task::ConfigResult {
+            Ok(self.step_task_config(0))
         }
 
-        fn timeout(&self) -> Span {
-            self.step_task_config(0).timeout
-        }
-
-        fn ttl(&self) -> Span {
-            self.step_task_config(0).ttl
-        }
-
-        fn delay(&self) -> Span {
-            self.step_task_config(0).delay
-        }
-
-        fn heartbeat(&self) -> Span {
-            self.step_task_config(0).heartbeat
-        }
-
-        fn concurrency_key(&self) -> Option<String> {
-            self.step_task_config(0).concurrency_key
-        }
-
-        fn priority(&self) -> i32 {
-            self.step_task_config(0).priority
-        }
-
-        fn retry_policy_for(&self, input: &Self::Input) -> task::RetryPolicy {
-            self.step_task_config(input.step_index).retry_policy
-        }
-
-        fn timeout_for(&self, input: &Self::Input) -> Span {
-            self.step_task_config(input.step_index).timeout
-        }
-
-        fn ttl_for(&self, input: &Self::Input) -> Span {
-            self.step_task_config(input.step_index).ttl
-        }
-
-        fn delay_for(&self, input: &Self::Input) -> Span {
-            self.step_task_config(input.step_index).delay
-        }
-
-        fn heartbeat_for(&self, input: &Self::Input) -> Span {
-            self.step_task_config(input.step_index).heartbeat
-        }
-
-        fn concurrency_key_for(&self, input: &Self::Input) -> Option<String> {
-            self.step_task_config(input.step_index).concurrency_key
-        }
-
-        fn priority_for(&self, input: &Self::Input) -> i32 {
-            self.step_task_config(input.step_index).priority
+        fn config_for(&self, input: &Self::Input) -> task::ConfigResult {
+            Ok(self.step_task_config(input.step_index))
         }
     }
 
@@ -2832,7 +3078,7 @@ pub mod workflow {
                 .last_mut()
                 .expect("step must exist")
                 .task_config
-                .retry_policy = retry_policy;
+                .set_retry_policy(retry_policy);
             self
         }
 
@@ -2842,7 +3088,7 @@ pub mod workflow {
                 .last_mut()
                 .expect("step must exist")
                 .task_config
-                .timeout = timeout;
+                .set_timeout(timeout);
             self
         }
 
@@ -2852,7 +3098,7 @@ pub mod workflow {
                 .last_mut()
                 .expect("step must exist")
                 .task_config
-                .ttl = ttl;
+                .set_ttl(ttl);
             self
         }
 
@@ -2862,7 +3108,7 @@ pub mod workflow {
                 .last_mut()
                 .expect("step must exist")
                 .task_config
-                .delay = delay;
+                .set_delay(delay);
             self
         }
 
@@ -2872,7 +3118,7 @@ pub mod workflow {
                 .last_mut()
                 .expect("step must exist")
                 .task_config
-                .heartbeat = heartbeat;
+                .set_heartbeat(heartbeat);
             self
         }
 
@@ -2882,7 +3128,7 @@ pub mod workflow {
                 .last_mut()
                 .expect("step must exist")
                 .task_config
-                .concurrency_key = Some(concurrency_key.into());
+                .set_concurrency_key(Some(concurrency_key.into()));
             self
         }
 
@@ -2892,7 +3138,7 @@ pub mod workflow {
                 .last_mut()
                 .expect("step must exist")
                 .task_config
-                .priority = priority;
+                .set_priority(priority);
             self
         }
     }
@@ -2952,6 +3198,9 @@ pub mod workflow {
         /// Builds workflow.
         pub async fn build(self) -> Result<Workflow<B, I, S>> {
             let state = self.builder_state;
+            for step in &self.steps {
+                step.task_config.validate()?;
+            }
             let queue = queue::Queue::builder()
                 .name(state.queue_name)
                 .backend(state.backend.clone())

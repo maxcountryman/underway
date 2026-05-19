@@ -108,14 +108,14 @@ where
         .await
         .map_err(|err| backend_error(CONTRACT, err))?;
 
-    let low = task::TaskConfig {
-        priority: 0,
-        ..Default::default()
-    };
-    let high = task::TaskConfig {
-        priority: 10,
-        ..Default::default()
-    };
+    let low = task::TaskConfig::builder()
+        .priority(0)
+        .build()
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let high = task::TaskConfig::builder()
+        .priority(10)
+        .build()
+        .map_err(|err| backend_error(CONTRACT, err))?;
 
     tx.enqueue_task(
         &queue_name,

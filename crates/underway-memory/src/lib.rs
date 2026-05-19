@@ -185,7 +185,8 @@ impl Backend for MemoryBackend {
                 row.state == TaskState::InProgress && row.current_attempt == task.attempt_number
             })
         {
-            row.lease_expires_at_ms = Some(now.saturating_add(duration_ms(row.config.heartbeat)?));
+            row.lease_expires_at_ms =
+                Some(now.saturating_add(duration_ms(row.config.heartbeat())?));
         }
         Ok(())
     }
@@ -270,7 +271,7 @@ impl BackendTransaction for MemoryTransaction {
     ) -> Result<TaskId, Self::Error> {
         let mut state = self.backend.state()?;
         let id = TaskId::new();
-        let delay_ms = duration_ms(task.config.delay.checked_add(task.delay)?)?;
+        let delay_ms = duration_ms(task.config.delay().checked_add(task.delay)?)?;
         let row = TaskRow {
             id,
             queue_name: queue_name.to_string(),
@@ -306,12 +307,12 @@ impl BackendTransaction for MemoryTransaction {
                             && row
                                 .lease_expires_at_ms
                                 .is_some_and(|expires| expires <= now)
-                            && row.attempt_count < row.config.retry_policy.max_attempts))
+                            && row.attempt_count < row.config.retry_policy().max_attempts))
             })
             .max_by(|(_, a), (_, b)| {
                 a.config
-                    .priority
-                    .cmp(&b.config.priority)
+                    .priority()
+                    .cmp(&b.config.priority())
                     .then_with(|| b.run_at_ms.cmp(&a.run_at_ms))
                     .then_with(|| b.created_seq.cmp(&a.created_seq))
             })
@@ -327,7 +328,7 @@ impl BackendTransaction for MemoryTransaction {
         row.state = TaskState::InProgress;
         row.attempt_count += 1;
         row.current_attempt = row.attempt_count;
-        row.lease_expires_at_ms = Some(now.saturating_add(duration_ms(row.config.heartbeat)?));
+        row.lease_expires_at_ms = Some(now.saturating_add(duration_ms(row.config.heartbeat())?));
         Ok(Some(ClaimedTask {
             id: row.id,
             queue_name: row.queue_name.clone(),
@@ -645,7 +646,7 @@ impl BackendTransaction for MemoryTransaction {
                 || !row.completed
                 || row
                     .created_at_ms
-                    .checked_add(duration_ms(row.config.ttl).unwrap_or(u64::MAX))
+                    .checked_add(duration_ms(row.config.ttl()).unwrap_or(u64::MAX))
                     .is_some_and(|expires| expires >= now)
         });
         Ok(())
@@ -665,7 +666,7 @@ fn terminalize_stale_exhausted(state: &mut State, queue_name: &str) -> Result<()
             && row
                 .lease_expires_at_ms
                 .is_some_and(|expires| expires <= now)
-            && row.attempt_count >= row.config.retry_policy.max_attempts
+            && row.attempt_count >= row.config.retry_policy().max_attempts
         {
             row.state = TaskState::Failed;
             row.completed = true;

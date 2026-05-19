@@ -42,6 +42,10 @@ pub enum Error {
     #[error(transparent)]
     Jiff(#[from] jiff::Error),
 
+    /// Invalid task configuration loaded from storage.
+    #[error(transparent)]
+    TaskConfig(#[from] task::ConfigError),
+
     /// Missing record.
     #[error("{0} not found")]
     NotFound(String),
@@ -238,7 +242,7 @@ impl BackendTransaction for PostgresTransaction<'_> {
         task: EnqueueTask,
     ) -> Result<TaskId, Self::Error> {
         let id = TaskId::new();
-        let delay = task.config.delay.checked_add(task.delay)?;
+        let delay = task.config.delay().checked_add(task.delay)?;
         sqlx::query(
             r#"
             insert into underway.task (
@@ -271,17 +275,17 @@ impl BackendTransaction for PostgresTransaction<'_> {
         .bind(id.as_uuid())
         .bind(queue_name)
         .bind(task.input)
-        .bind(pg_interval(task.config.timeout)?)
-        .bind(pg_interval(task.config.heartbeat)?)
-        .bind(pg_interval(task.config.ttl)?)
+        .bind(pg_interval(task.config.timeout())?)
+        .bind(pg_interval(task.config.heartbeat())?)
+        .bind(pg_interval(task.config.ttl())?)
         .bind(pg_interval(delay)?)
-        .bind(task.config.retry_policy.max_attempts)
-        .bind(task.config.retry_policy.initial_interval_ms)
-        .bind(task.config.retry_policy.max_interval_ms)
-        .bind(task.config.retry_policy.backoff_coefficient)
-        .bind(task.config.retry_policy.jitter_factor)
-        .bind(task.config.concurrency_key)
-        .bind(task.config.priority)
+        .bind(task.config.retry_policy().max_attempts)
+        .bind(task.config.retry_policy().initial_interval_ms)
+        .bind(task.config.retry_policy().max_interval_ms)
+        .bind(task.config.retry_policy().backoff_coefficient)
+        .bind(task.config.retry_policy().jitter_factor)
+        .bind(task.config.concurrency_key())
+        .bind(task.config.priority())
         .execute(&mut *self.inner)
         .await?;
         Ok(id)
@@ -966,21 +970,21 @@ fn claimed_task_from_row(row: sqlx::postgres::PgRow) -> Result<ClaimedTask, Erro
         id: TaskId::from_uuid(id),
         queue_name: row.try_get("task_queue_name")?,
         input: row.try_get("input")?,
-        config: TaskConfig {
-            retry_policy: task::RetryPolicy {
+        config: TaskConfig::builder()
+            .retry_policy(task::RetryPolicy {
                 max_attempts: row.try_get("retry_max_attempts")?,
                 initial_interval_ms: row.try_get("retry_initial_interval_ms")?,
                 max_interval_ms: row.try_get("retry_max_interval_ms")?,
                 backoff_coefficient: row.try_get("retry_backoff_coefficient")?,
                 jitter_factor: row.try_get("retry_jitter_factor")?,
-            },
-            timeout: span_from_interval(timeout),
-            ttl: span_from_interval(ttl),
-            delay: span_from_interval(delay),
-            heartbeat: span_from_interval(heartbeat),
-            concurrency_key: row.try_get("concurrency_key")?,
-            priority: row.try_get("priority")?,
-        },
+            })
+            .timeout(span_from_interval(timeout))
+            .ttl(span_from_interval(ttl))
+            .delay(span_from_interval(delay))
+            .heartbeat(span_from_interval(heartbeat))
+            .maybe_concurrency_key(row.try_get("concurrency_key")?)
+            .priority(row.try_get("priority")?)
+            .build()?,
         attempt_number: row.try_get("current_attempt")?,
     })
 }
