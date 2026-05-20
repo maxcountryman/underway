@@ -62,6 +62,23 @@ async fn scheduler_lease_drop_allows_reacquire(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+async fn concurrent_scheduler_lease_race_allows_one_winner(pool: PgPool) {
+    let backend = setup(pool).await;
+    let queue_name = format!("postgres-race-lease-{}", uuid::Uuid::new_v4());
+    let first_backend = backend.clone();
+    let second_backend = backend;
+    let (first, second) = tokio::join!(
+        first_backend.try_acquire_scheduler(&queue_name),
+        second_backend.try_acquire_scheduler(&queue_name),
+    );
+    let mut leases = [first.unwrap(), second.unwrap()];
+    assert_eq!(leases.iter().filter(|lease| lease.is_some()).count(), 1);
+    for lease in leases.iter_mut().flatten() {
+        lease.release().await.unwrap();
+    }
+}
+
+#[sqlx::test(migrations = false)]
 async fn satisfies_heartbeat_extends_task_lease_contract(pool: PgPool) {
     core_contracts::heartbeat_extends_task_lease(setup(pool).await, sleep_for)
         .await
@@ -85,6 +102,13 @@ async fn satisfies_delete_expired_removes_only_terminal_work_contract(pool: PgPo
 #[sqlx::test(migrations = false)]
 async fn satisfies_queue_ordering_and_retry_contract(pool: PgPool) {
     core_contracts::queue_ordering_and_retry(setup(pool).await)
+        .await
+        .unwrap();
+}
+
+#[sqlx::test(migrations = false)]
+async fn satisfies_concurrency_key_exclusivity_contract(pool: PgPool) {
+    core_contracts::concurrency_key_exclusivity(setup(pool).await)
         .await
         .unwrap();
 }

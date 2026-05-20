@@ -50,6 +50,17 @@ pub enum Error {
     /// Requested record was not found.
     #[error("{0} not found")]
     NotFound(String),
+
+    /// Active task already exists for a concurrency key.
+    #[error(
+        "active task already exists for concurrency key `{concurrency_key}` in queue `{queue}`"
+    )]
+    ConcurrencyKey {
+        /// Queue name.
+        queue: String,
+        /// Concurrency key.
+        concurrency_key: String,
+    },
 }
 
 /// Deterministic in-process backend.
@@ -307,6 +318,19 @@ impl BackendTransaction for MemoryTransaction {
         queue_name: &str,
         task: EnqueueTask,
     ) -> Result<TaskId, Self::Error> {
+        if let Some(concurrency_key) = task.config.concurrency_key() {
+            if self.state.tasks.values().any(|row| {
+                row.queue_name == queue_name
+                    && matches!(row.state, TaskState::Pending | TaskState::InProgress)
+                    && row.config.concurrency_key() == Some(concurrency_key)
+            }) {
+                return Err(Error::ConcurrencyKey {
+                    queue: queue_name.to_string(),
+                    concurrency_key: concurrency_key.to_string(),
+                });
+            }
+        }
+
         let id = TaskId::new();
         let delay_ms = duration_ms(task.config.delay().checked_add(task.delay)?)?;
         let row = TaskRow {
@@ -825,7 +849,7 @@ mod tests {
 
     use serde::{Deserialize, Serialize};
     use tokio::sync::Mutex as TokioMutex;
-    use underway_core::{BackendTransaction, Task, Transition, Workflow};
+    use underway_core::{Activity, BackendTransaction, InvokeActivity, Task, Transition, Workflow};
 
     use super::*;
 
@@ -888,6 +912,41 @@ mod tests {
             .map_err(|err| task::Error::Fatal(err.to_string()))?;
             Err(task::Error::Retryable("rollback".to_string()))
         }
+    }
+
+    struct LookupEmail;
+
+    impl Activity for LookupEmail {
+        const NAME: &'static str = "lookup-email";
+
+        type Input = i64;
+        type Output = String;
+
+        async fn execute(&self, input: Self::Input) -> activity::Result<Self::Output> {
+            Ok(format!("user-{input}@example.com"))
+        }
+    }
+
+    #[derive(Clone)]
+    struct TrackMetric {
+        seen: Arc<TokioMutex<Vec<String>>>,
+    }
+
+    impl Activity for TrackMetric {
+        const NAME: &'static str = "track-metric";
+
+        type Input = String;
+        type Output = ();
+
+        async fn execute(&self, input: Self::Input) -> activity::Result<Self::Output> {
+            self.seen.lock().await.push(input);
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    struct Signup {
+        user_id: i64,
     }
 
     #[tokio::test]
@@ -967,6 +1026,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_processes_activity_call_and_emit() {
+        let backend = MemoryBackend::new();
+        let resolved = Arc::new(TokioMutex::new(Vec::new()));
+        let tracked = Arc::new(TokioMutex::new(Vec::new()));
+        let workflow = Workflow::<MemoryBackend, Signup>::builder()
+            .state(resolved.clone())
+            .activity(LookupEmail)
+            .activity(TrackMetric {
+                seen: tracked.clone(),
+            })
+            .step(|mut cx, Signup { user_id }| async move {
+                let email = LookupEmail::call(&mut cx, &user_id).await?;
+                TrackMetric::emit(&mut cx, &email).await?;
+                cx.state.lock().await.push(email);
+                Transition::complete()
+            })
+            .name("runtime_processes_activity_call_and_emit")
+            .backend(backend)
+            .build()
+            .await
+            .unwrap();
+
+        workflow.enqueue(&Signup { user_id: 7 }).await.unwrap();
+        let runtime = workflow.runtime().start();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if resolved.lock().await.as_slice() == ["user-7@example.com"]
+                    && tracked.lock().await.as_slice() == ["user-7@example.com"]
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn satisfies_transaction_commit_and_rollback_contract() {
         underway_core::contracts::transaction_commit_and_rollback(MemoryBackend::new())
             .await
@@ -1012,6 +1113,13 @@ mod tests {
     #[tokio::test]
     async fn satisfies_queue_ordering_and_retry_contract() {
         underway_core::contracts::queue_ordering_and_retry(MemoryBackend::new())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn satisfies_concurrency_key_exclusivity_contract() {
+        underway_core::contracts::concurrency_key_exclusivity(MemoryBackend::new())
             .await
             .unwrap();
     }

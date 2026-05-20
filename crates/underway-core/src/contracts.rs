@@ -756,6 +756,104 @@ where
     Ok(())
 }
 
+/// Verifies active tasks with the same concurrency key are mutually exclusive.
+pub async fn concurrency_key_exclusivity<B>(backend: B) -> ContractResult
+where
+    B: backend::Backend,
+{
+    const CONTRACT: &str = "concurrency_key_exclusivity";
+
+    let queue_name = format!("contract-concurrency-{}", task::TaskId::new());
+    let config = task::TaskConfig::builder()
+        .concurrency_key("same-key")
+        .build()
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.create_queue(&queue_name, None)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.enqueue_task(
+        &queue_name,
+        backend::EnqueueTask {
+            input: serde_json::json!("first"),
+            config: config.clone(),
+            delay: Span::new(),
+        },
+    )
+    .await
+    .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let duplicate = tx
+        .enqueue_task(
+            &queue_name,
+            backend::EnqueueTask {
+                input: serde_json::json!("duplicate"),
+                config: config.clone(),
+                delay: Span::new(),
+            },
+        )
+        .await;
+    if duplicate.is_ok() {
+        return Err(violation(
+            CONTRACT,
+            "duplicate active concurrency key rejected",
+            "duplicate enqueue succeeded",
+        ));
+    }
+    tx.rollback()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let first = tx
+        .claim_task(&queue_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let first = expect_some(CONTRACT, first, "claim first keyed task")?;
+    let applied = tx
+        .mark_task_succeeded(&first)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    expect_applied(CONTRACT, applied)?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.enqueue_task(
+        &queue_name,
+        backend::EnqueueTask {
+            input: serde_json::json!("after-completion"),
+            config,
+            delay: Span::new(),
+        },
+    )
+    .await
+    .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    Ok(())
+}
+
 /// Verifies activity call idempotency, claiming, completion, and replay record
 /// loading.
 pub async fn activity_call_idempotency<B>(backend: B) -> ContractResult
