@@ -85,7 +85,7 @@ impl Backend for PostgresBackend {
         let mut conn = self.pool.acquire().await?;
         let key = format!("{queue_name}-scheduler");
         let acquired: bool =
-            sqlx::query_scalar::<_, bool>("select pg_try_advisory_lock(hashtext($1))")
+            sqlx::query_scalar("select pg_try_advisory_lock(hashtextextended($1, 0))")
                 .bind(&key)
                 .fetch_one(&mut *conn)
                 .await?;

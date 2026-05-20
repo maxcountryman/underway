@@ -15,10 +15,29 @@ impl RuntimeHandle {
 
     /// Waits for runtime loops to end.
     pub async fn wait(mut self) -> Result {
+        let mut first_error = None;
         while let Some(result) = self.workers.join_next().await {
-            result??;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    if first_error.is_none() {
+                        self.shutdown_token.cancel();
+                        first_error = Some(err);
+                    }
+                }
+                Err(err) => {
+                    if first_error.is_none() {
+                        self.shutdown_token.cancel();
+                        first_error = Some(Error::Join(err));
+                    }
+                }
+            }
         }
-        Ok(())
+        if let Some(err) = first_error {
+            Err(err)
+        } else {
+            Ok(())
+        }
     }
 }
 

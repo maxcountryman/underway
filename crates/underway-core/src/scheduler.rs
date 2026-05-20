@@ -41,51 +41,71 @@ where
 
     /// Runs the scheduler.
     pub async fn run(&self) -> Result {
-        let Some(mut lease) = self
-            .queue
-            .backend
-            .try_acquire_scheduler(&self.queue.name)
-            .await
-            .map_err(Error::backend)?
-        else {
-            return Ok(());
-        };
-
         let refresh = StdDuration::from_secs(5);
 
+        loop {
+            if self.shutdown_token.is_cancelled() {
+                return Ok(());
+            }
+
+            match self
+                .queue
+                .backend
+                .try_acquire_scheduler(&self.queue.name)
+                .await
+                .map_err(Error::backend)?
+            {
+                Some(mut lease) => {
+                    let result = self.run_with_lease(refresh).await;
+                    lease.release().await.map_err(Error::backend)?;
+                    result?;
+                }
+                None => {
+                    tokio::select! {
+                        _ = self.shutdown_token.cancelled() => return Ok(()),
+                        _ = sleep(refresh) => {}
+                    }
+                }
+            }
+        }
+    }
+
+    async fn run_with_lease(&self, refresh: StdDuration) -> Result {
         loop {
             let mut tx = self.queue.backend.begin().await.map_err(Error::backend)?;
             let schedule = self.queue.load_task_schedule(&mut tx).await?;
             tx.commit().await.map_err(Error::backend)?;
 
-            let Some(stored) = schedule else {
-                break;
-            };
-
-            let Some(next) = stored.schedule.iter().next() else {
-                sleep(refresh).await;
-                continue;
-            };
-
-            let tz = next.time_zone();
-            let now = Zoned::now().with_time_zone(tz.to_owned());
-            let until_next = next.duration_until(&now).unsigned_abs();
-            let should_dispatch = until_next <= refresh;
-            let wait_for = if should_dispatch { until_next } else { refresh };
-
-            tokio::select! {
-                _ = self.shutdown_token.cancelled() => break,
-                _ = sleep(wait_for) => {
-                    if should_dispatch {
-                        let input: T::Input = serde_json::from_value(stored.input.clone())?;
-                        self.queue.enqueue(&self.task, &input).await?;
+            if let Some(stored) = schedule {
+                let Some(next) = stored.schedule.iter().next() else {
+                    tokio::select! {
+                        _ = self.shutdown_token.cancelled() => return Ok(()),
+                        _ = sleep(refresh) => continue,
                     }
+                };
+
+                let tz = next.time_zone();
+                let now = Zoned::now().with_time_zone(tz.to_owned());
+                let until_next = next.duration_until(&now).unsigned_abs();
+                let should_dispatch = until_next <= refresh;
+                let wait_for = if should_dispatch { until_next } else { refresh };
+
+                tokio::select! {
+                    _ = self.shutdown_token.cancelled() => return Ok(()),
+                    _ = sleep(wait_for) => {
+                        if should_dispatch {
+                            let input: T::Input = serde_json::from_value(stored.input.clone())?;
+                            self.queue.enqueue(&self.task, &input).await?;
+                        }
+                    }
+                }
+            } else {
+                tokio::select! {
+                    _ = self.shutdown_token.cancelled() => return Ok(()),
+                    _ = sleep(refresh) => {}
                 }
             }
         }
-
-        lease.release().await.map_err(Error::backend)?;
-        Ok(())
     }
 }
 

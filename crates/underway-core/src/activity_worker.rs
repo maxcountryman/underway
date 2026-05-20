@@ -129,7 +129,7 @@ impl<B: backend::Backend> ActivityWorker<B> {
     }
 
     async fn drain_pending_calls(&self) -> Result {
-        while self.process_next_call().await?.is_some() {}
+        while !self.shutdown_token.is_cancelled() && self.process_next_call().await?.is_some() {}
         Ok(())
     }
 
