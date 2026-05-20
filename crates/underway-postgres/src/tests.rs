@@ -2,7 +2,11 @@ use std::time::Duration as StdDuration;
 
 use jiff::Span;
 use sqlx::PgPool;
-use underway_core::contracts as core_contracts;
+use underway_core::{
+    backend::{ApplyResult, Backend, BackendTransaction, EnqueueTask, SchedulerLease},
+    contracts as core_contracts,
+    task::TaskConfig,
+};
 
 use crate::PostgresBackend;
 
@@ -32,8 +36,38 @@ async fn satisfies_scheduler_lease_exclusivity_contract(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+async fn scheduler_lease_drop_allows_reacquire(pool: PgPool) {
+    let backend = setup(pool).await;
+    let queue_name = format!("postgres-drop-lease-{}", uuid::Uuid::new_v4());
+    let lease = backend
+        .try_acquire_scheduler(&queue_name)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(lease);
+
+    let mut reacquired = None;
+    for _ in 0..20 {
+        if let Some(lease) = backend.try_acquire_scheduler(&queue_name).await.unwrap() {
+            reacquired = Some(lease);
+            break;
+        }
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+    }
+    let mut reacquired = reacquired.unwrap();
+    reacquired.release().await.unwrap();
+}
+
+#[sqlx::test(migrations = false)]
 async fn satisfies_heartbeat_extends_task_lease_contract(pool: PgPool) {
     core_contracts::heartbeat_extends_task_lease(setup(pool).await, sleep_for)
+        .await
+        .unwrap();
+}
+
+#[sqlx::test(migrations = false)]
+async fn satisfies_concurrent_worker_claim_exclusivity_contract(pool: PgPool) {
+    core_contracts::concurrent_worker_claim_exclusivity(setup(pool).await)
         .await
         .unwrap();
 }
@@ -81,8 +115,68 @@ async fn satisfies_attempt_fencing_contract(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+async fn stale_task_transition_does_not_mutate_attempt_row(pool: PgPool) {
+    let backend = setup(pool.clone()).await;
+    let queue_name = format!("postgres-stale-attempt-{}", uuid::Uuid::new_v4());
+    let mut tx = backend.begin().await.unwrap();
+    tx.create_queue(&queue_name, None).await.unwrap();
+    tx.enqueue_task(
+        &queue_name,
+        EnqueueTask {
+            input: serde_json::json!("fenced"),
+            config: TaskConfig::builder().build().unwrap(),
+            delay: Span::new(),
+        },
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let mut tx = backend.begin().await.unwrap();
+    let first = tx.claim_task(&queue_name).await.unwrap().unwrap();
+    assert_eq!(
+        tx.retry_task(&first, Span::new()).await.unwrap(),
+        ApplyResult::Applied
+    );
+    tx.commit().await.unwrap();
+
+    let mut tx = backend.begin().await.unwrap();
+    let second = tx.claim_task(&queue_name).await.unwrap().unwrap();
+    assert_eq!(second.attempt_number, 2);
+    assert_eq!(
+        tx.mark_task_succeeded(&first).await.unwrap(),
+        ApplyResult::Stale
+    );
+    tx.commit().await.unwrap();
+
+    let state: String = sqlx::query_scalar(
+        r#"
+        select state::text
+        from underway.task_attempt
+        where task_queue_name = $1
+          and task_id = $2
+          and attempt_number = $3
+        "#,
+    )
+    .bind(&queue_name)
+    .bind(first.id.as_uuid())
+    .bind(first.attempt_number)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "failed");
+}
+
+#[sqlx::test(migrations = false)]
 async fn satisfies_dlq_move_contract(pool: PgPool) {
     core_contracts::dlq_move(setup(pool).await).await.unwrap();
+}
+
+#[sqlx::test(migrations = false)]
+async fn satisfies_failed_task_moves_to_claimable_dlq_contract(pool: PgPool) {
+    core_contracts::failed_task_moves_to_claimable_dlq(setup(pool).await)
+        .await
+        .unwrap();
 }
 
 #[sqlx::test(migrations = false)]
