@@ -114,20 +114,22 @@ where
     /// Processes the next available task.
     #[instrument(skip(self), fields(queue.name = self.queue.name), err)]
     pub async fn process_next_task(&self) -> Result<Option<task::TaskId>> {
-        let mut tx = self.queue.backend.begin().await.map_err(Error::backend)?;
-        let Some(claimed) = tx
+        let mut claim_tx = self.queue.backend.begin().await.map_err(Error::backend)?;
+        let Some(claimed) = claim_tx
             .claim_task(&self.queue.name)
             .await
             .map_err(Error::backend)?
         else {
-            tx.commit().await.map_err(Error::backend)?;
+            claim_tx.commit().await.map_err(Error::backend)?;
             return Ok(None);
         };
+        claim_tx.commit().await.map_err(Error::backend)?;
 
         let input: T::Input = serde_json::from_value(claimed.input.clone())?;
         let timeout: StdDuration = claimed.config.timeout().try_into()?;
         let heartbeat: StdDuration = claimed.config.heartbeat().try_into()?;
 
+        let mut tx = self.queue.backend.begin().await.map_err(Error::backend)?;
         let heartbeat_task = tokio::spawn({
             let backend = self.queue.backend.clone();
             let claimed = claimed.clone();
@@ -146,17 +148,15 @@ where
         let result = tokio::time::timeout(timeout, self.task.execute(&mut tx, input)).await;
         let task_id = claimed.id;
 
-        match result {
-            Ok(Ok(_)) => {
-                tx.mark_task_succeeded(&claimed)
-                    .await
-                    .map_err(Error::backend)?;
-            }
-            Ok(Err(task::Error::Suspended(_))) => {
-                tx.mark_task_waiting(&claimed)
-                    .await
-                    .map_err(Error::backend)?;
-            }
+        let applied = match result {
+            Ok(Ok(_)) => tx
+                .mark_task_succeeded(&claimed)
+                .await
+                .map_err(Error::backend)?,
+            Ok(Err(task::Error::Suspended(_))) => tx
+                .mark_task_waiting(&claimed)
+                .await
+                .map_err(Error::backend)?,
             Ok(Err(err)) => {
                 handle_task_error(
                     &mut tx,
@@ -165,7 +165,7 @@ where
                     &claimed.config.retry_policy(),
                     &err,
                 )
-                .await?;
+                .await?
             }
             Err(_) => {
                 let err = task::Error::TimedOut(timeout.try_into()?);
@@ -176,12 +176,16 @@ where
                     &claimed.config.retry_policy(),
                     &err,
                 )
-                .await?;
+                .await?
             }
-        }
+        };
 
         heartbeat_task.abort();
-        tx.commit().await.map_err(Error::backend)?;
+        if applied.applied() {
+            tx.commit().await.map_err(Error::backend)?;
+        } else {
+            tx.rollback().await.map_err(Error::backend)?;
+        }
 
         Ok(Some(task_id))
     }
@@ -193,38 +197,52 @@ async fn handle_task_error<B, T>(
     claimed: &backend::ClaimedTask,
     retry_policy: &task::RetryPolicy,
     err: &task::Error,
-) -> Result
+) -> Result<backend::ApplyResult>
 where
     B: backend::Backend,
     T: task::Task<B>,
 {
     if matches!(err, task::Error::Fatal(_)) {
-        tx.mark_task_failed(claimed).await.map_err(Error::backend)?;
-        if let Some(dlq_name) = &queue.dlq_name {
-            tx.move_task_to_dlq(claimed.id, &queue.name, dlq_name)
-                .await
-                .map_err(Error::backend)?;
-        }
-        return Ok(());
-    }
-
-    tx.record_task_failure(claimed, err)
-        .await
-        .map_err(Error::backend)?;
-
-    if claimed.attempt_number < retry_policy.max_attempts {
-        let delay = retry_policy.calculate_delay(claimed.attempt_number);
-        tx.retry_task(claimed, delay)
+        let applied = tx
+            .record_task_failure(claimed, err)
             .await
             .map_err(Error::backend)?;
-    } else {
-        tx.mark_task_failed(claimed).await.map_err(Error::backend)?;
-        if let Some(dlq_name) = &queue.dlq_name {
-            tx.move_task_to_dlq(claimed.id, &queue.name, dlq_name)
-                .await
-                .map_err(Error::backend)?;
+        if !applied.applied() {
+            return Ok(applied);
         }
+        if let Some(dlq_name) = &queue.dlq_name {
+            return tx
+                .move_task_to_dlq(claimed.id, &queue.name, dlq_name)
+                .await
+                .map_err(Error::backend);
+        }
+        return tx.mark_task_failed(claimed).await.map_err(Error::backend);
     }
 
-    Ok(())
+    let applied = tx
+        .record_task_failure(claimed, err)
+        .await
+        .map_err(Error::backend)?;
+    if !applied.applied() {
+        return Ok(applied);
+    }
+
+    if claimed.attempt_number < retry_policy.max_attempts {
+        return tx
+            .retry_task(
+                claimed,
+                retry_policy.calculate_delay(claimed.attempt_number),
+            )
+            .await
+            .map_err(Error::backend);
+    }
+
+    if let Some(dlq_name) = &queue.dlq_name {
+        return tx
+            .move_task_to_dlq(claimed.id, &queue.name, dlq_name)
+            .await
+            .map_err(Error::backend);
+    }
+
+    tx.mark_task_failed(claimed).await.map_err(Error::backend)
 }

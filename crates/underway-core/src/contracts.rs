@@ -4,7 +4,16 @@
 //! is enabled. Backend crates can enable that feature in dev-dependencies to
 //! validate semantic behavior without pulling contract code into normal builds.
 
-use std::{fmt::Debug, future::Future, result::Result as StdResult};
+use std::{
+    fmt::Debug,
+    future::Future,
+    result::Result as StdResult,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration as StdDuration,
+};
 
 use super::*;
 
@@ -100,6 +109,14 @@ fn expect_none_without_debug<T>(
         None => Ok(()),
         Some(_) => Err(violation(contract, expected, "some value")),
     }
+}
+
+fn expect_applied(contract: &'static str, actual: backend::ApplyResult) -> ContractResult {
+    expect_eq(contract, actual, backend::ApplyResult::Applied)
+}
+
+fn expect_stale(contract: &'static str, actual: backend::ApplyResult) -> ContractResult {
+    expect_eq(contract, actual, backend::ApplyResult::Stale)
 }
 
 fn default_task_config(contract: &'static str) -> ContractResult<task::TaskConfig> {
@@ -387,6 +404,91 @@ where
     tx.commit()
         .await
         .map_err(|err| backend_error(CONTRACT, err))?;
+
+    Ok(())
+}
+
+/// Verifies concurrent workers do not execute the same claimed task.
+pub async fn concurrent_worker_claim_exclusivity<B>(backend: B) -> ContractResult
+where
+    B: backend::Backend + Clone + Send + Sync + 'static,
+{
+    const CONTRACT: &str = "concurrent_worker_claim_exclusivity";
+
+    struct CountingTask {
+        executions: Arc<AtomicUsize>,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl<B> task::Task<B> for CountingTask
+    where
+        B: backend::Backend,
+    {
+        type Input = ();
+        type Output = ();
+
+        async fn execute(
+            &self,
+            _tx: &mut B::Transaction<'_>,
+            _input: Self::Input,
+        ) -> task::Result<Self::Output> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_waiters();
+            self.release.notified().await;
+            Ok(())
+        }
+    }
+
+    let executions = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let task_to_run = CountingTask {
+        executions: Arc::clone(&executions),
+        started: Arc::clone(&started),
+        release: Arc::clone(&release),
+    };
+    let queue_name = format!("contract-worker-{}", task::TaskId::new());
+    let queue: Arc<queue::Queue<B, CountingTask>> = Arc::new(
+        queue::Queue::<B, CountingTask>::builder()
+            .name(&queue_name)
+            .backend(backend)
+            .build()
+            .await
+            .map_err(|err| backend_error(CONTRACT, err))?,
+    );
+    queue
+        .enqueue(&task_to_run, &())
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    let worker = worker::Worker::new(queue, task_to_run);
+    let first_worker = worker.clone();
+    let second_worker = worker;
+    let release_control = async {
+        while executions.load(Ordering::SeqCst) == 0 {
+            tokio::time::timeout(StdDuration::from_secs(1), started.notified())
+                .await
+                .map_err(|err| backend_error(CONTRACT, err))?;
+        }
+
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        expect_eq(CONTRACT, executions.load(Ordering::SeqCst), 1)?;
+
+        release.notify_waiters();
+        Ok::<_, ContractError>(())
+    };
+    let (first_claim, second_claim, release_result) = tokio::join!(
+        first_worker.process_next_task(),
+        second_worker.process_next_task(),
+        release_control,
+    );
+    release_result?;
+    let first_claim = first_claim.map_err(|err| backend_error(CONTRACT, err))?;
+    let second_claim = second_claim.map_err(|err| backend_error(CONTRACT, err))?;
+    let claimed_count = usize::from(first_claim.is_some()) + usize::from(second_claim.is_some());
+    expect_eq(CONTRACT, claimed_count, 1)?;
+    expect_eq(CONTRACT, executions.load(Ordering::SeqCst), 1)?;
 
     Ok(())
 }
@@ -955,9 +1057,11 @@ where
         .await
         .map_err(|err| backend_error(CONTRACT, err))?;
     let first = expect_some(CONTRACT, first, "first claim")?;
-    tx.retry_task(&first, Span::new())
+    let applied = tx
+        .retry_task(&first, Span::new())
         .await
         .map_err(|err| backend_error(CONTRACT, err))?;
+    expect_applied(CONTRACT, applied)?;
     tx.commit()
         .await
         .map_err(|err| backend_error(CONTRACT, err))?;
@@ -973,7 +1077,11 @@ where
     let second = expect_some(CONTRACT, second, "second claim")?;
     expect_eq(CONTRACT, second.attempt_number, 2)?;
 
-    let _ = tx.mark_task_succeeded(&first).await;
+    let stale = tx
+        .mark_task_succeeded(&first)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    expect_stale(CONTRACT, stale)?;
     let duplicate = tx
         .claim_task(&queue_name)
         .await
@@ -984,12 +1092,16 @@ where
         "no duplicate claim after stale completion attempt",
     )?;
 
-    tx.record_task_failure(&second, &task::Error::Retryable("retry".to_string()))
+    let applied = tx
+        .record_task_failure(&second, &task::Error::Retryable("retry".to_string()))
         .await
         .map_err(|err| backend_error(CONTRACT, err))?;
-    tx.retry_task(&second, Span::new())
+    expect_applied(CONTRACT, applied)?;
+    let applied = tx
+        .retry_task(&second, Span::new())
         .await
         .map_err(|err| backend_error(CONTRACT, err))?;
+    expect_applied(CONTRACT, applied)?;
     tx.commit()
         .await
         .map_err(|err| backend_error(CONTRACT, err))?;
@@ -1042,9 +1154,11 @@ where
         )
         .await
         .map_err(|err| backend_error(CONTRACT, err))?;
-    tx.move_task_to_dlq(task_id, &queue_name, &dlq_name)
+    let applied = tx
+        .move_task_to_dlq(task_id, &queue_name, &dlq_name)
         .await
         .map_err(|err| backend_error(CONTRACT, err))?;
+    expect_applied(CONTRACT, applied)?;
     tx.commit()
         .await
         .map_err(|err| backend_error(CONTRACT, err))?;
@@ -1075,6 +1189,86 @@ where
     tx.mark_task_succeeded(&moved)
         .await
         .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    Ok(())
+}
+
+/// Verifies a failed task moved to a DLQ is pending, claimable work.
+pub async fn failed_task_moves_to_claimable_dlq<B>(backend: B) -> ContractResult
+where
+    B: backend::Backend,
+{
+    const CONTRACT: &str = "failed_task_moves_to_claimable_dlq";
+
+    let queue_name = format!("contract-failed-dlq-{}", task::TaskId::new());
+    let dlq_name = format!("{queue_name}-dead");
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.create_queue(&queue_name, Some(&dlq_name))
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.enqueue_task(
+        &queue_name,
+        backend::EnqueueTask {
+            input: serde_json::json!("failed-dead-letter"),
+            config: default_task_config(CONTRACT)?,
+            delay: Span::new(),
+        },
+    )
+    .await
+    .map_err(|err| backend_error(CONTRACT, err))?;
+    let claimed = tx
+        .claim_task(&queue_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let claimed = expect_some(CONTRACT, claimed, "claim task before failure")?;
+    let applied = tx
+        .record_task_failure(&claimed, &task::Error::Fatal("failed".to_string()))
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    expect_applied(CONTRACT, applied)?;
+    let applied = tx
+        .move_task_to_dlq(claimed.id, &queue_name, &dlq_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    expect_applied(CONTRACT, applied)?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let original = tx
+        .claim_task(&queue_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    expect_none(
+        CONTRACT,
+        original,
+        "no claim from source queue after failed DLQ move",
+    )?;
+    let moved = tx
+        .claim_task(&dlq_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let moved = expect_some(CONTRACT, moved, "failed task claim from DLQ")?;
+    expect_eq(
+        CONTRACT,
+        moved.input.clone(),
+        serde_json::json!("failed-dead-letter"),
+    )?;
+    let applied = tx
+        .mark_task_succeeded(&moved)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    expect_applied(CONTRACT, applied)?;
     tx.commit()
         .await
         .map_err(|err| backend_error(CONTRACT, err))?;
@@ -1248,13 +1442,15 @@ where
         .map_err(|err| backend_error(CONTRACT, err))?;
     let first = expect_some(CONTRACT, first, "first activity claim")?;
     expect_eq(CONTRACT, first.attempt_number, 1)?;
-    tx.retry_activity_call(
-        &first,
-        activity::Error::retryable("retry", "try again"),
-        100.milliseconds(),
-    )
-    .await
-    .map_err(|err| backend_error(CONTRACT, err))?;
+    let applied = tx
+        .retry_activity_call(
+            &first,
+            activity::Error::retryable("retry", "try again"),
+            100.milliseconds(),
+        )
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    expect_applied(CONTRACT, applied)?;
     tx.commit()
         .await
         .map_err(|err| backend_error(CONTRACT, err))?;
@@ -1290,12 +1486,16 @@ where
         .map_err(|err| backend_error(CONTRACT, err))?;
     let second = expect_some(CONTRACT, second, "second activity claim")?;
     expect_eq(CONTRACT, second.attempt_number, 2)?;
-    let _ = tx
+    let stale = tx
         .complete_activity_call(&first, serde_json::json!("stale"))
-        .await;
-    tx.complete_activity_call(&second, serde_json::json!({"ok": true}))
         .await
         .map_err(|err| backend_error(CONTRACT, err))?;
+    expect_stale(CONTRACT, stale)?;
+    let applied = tx
+        .complete_activity_call(&second, serde_json::json!({"ok": true}))
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    expect_applied(CONTRACT, applied)?;
     let records = tx
         .load_activity_calls(&queue_name, workflow_run_id, 0)
         .await

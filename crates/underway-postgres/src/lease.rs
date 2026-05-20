@@ -26,8 +26,10 @@ impl SchedulerLease for PostgresSchedulerLease<'_> {
 
 impl Drop for PostgresSchedulerLease<'_> {
     fn drop(&mut self) {
-        // The connection drop releases session advisory locks. Explicit release
-        // is still used on the normal path.
-        self.conn.take();
+        if let Some(mut conn) = self.conn.take() {
+            // Returning this connection to the pool would keep the session-level
+            // advisory lock held for the next borrower.
+            conn.close_on_drop();
+        }
     }
 }

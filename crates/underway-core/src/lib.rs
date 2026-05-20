@@ -22,8 +22,8 @@ use std::{
 
 pub use activity::{Activity, CallState as ActivityCallState, Error as ActivityError};
 pub use backend::{
-    ActivityCallRecord, Backend, BackendTransaction, ClaimedActivityCall, ClaimedTask, EnqueueTask,
-    SchedulerLease,
+    ActivityCallRecord, ApplyResult, Backend, BackendTransaction, ClaimedActivityCall, ClaimedTask,
+    EnqueueTask, SchedulerLease,
 };
 use jiff::{SignedDuration, Span, ToSpan, Zoned};
 use jiff_cron::{Schedule, ScheduleIterator};

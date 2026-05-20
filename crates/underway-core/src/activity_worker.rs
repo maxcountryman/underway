@@ -156,13 +156,18 @@ impl<B: backend::Backend> ActivityWorker<B> {
                 format!("No activity handler registered for `{}`", call.activity),
             );
             let mut tx = self.backend.begin().await.map_err(Error::backend)?;
-            tx.fail_activity_call(&call, err)
+            let applied = tx
+                .fail_activity_call(&call, err)
                 .await
                 .map_err(Error::backend)?;
-            tx.wake_workflow_task(&call.queue_name, call.workflow_run_id, call.step_index)
-                .await
-                .map_err(Error::backend)?;
-            tx.commit().await.map_err(Error::backend)?;
+            if applied.applied() {
+                tx.wake_workflow_task(&call.queue_name, call.workflow_run_id, call.step_index)
+                    .await
+                    .map_err(Error::backend)?;
+                tx.commit().await.map_err(Error::backend)?;
+            } else {
+                tx.rollback().await.map_err(Error::backend)?;
+            }
             return Ok(Some(call.id));
         };
 
@@ -170,18 +175,22 @@ impl<B: backend::Backend> ActivityWorker<B> {
         let result = tokio::time::timeout(timeout, handler.execute_json(call.input.clone())).await;
 
         let mut tx = self.backend.begin().await.map_err(Error::backend)?;
-        match result {
+        let applied = match result {
             Ok(Ok(output)) => {
-                tx.complete_activity_call(&call, output)
+                let applied = tx
+                    .complete_activity_call(&call, output)
                     .await
                     .map_err(Error::backend)?;
-                tx.wake_workflow_task(&call.queue_name, call.workflow_run_id, call.step_index)
-                    .await
-                    .map_err(Error::backend)?;
+                if applied.applied() {
+                    tx.wake_workflow_task(&call.queue_name, call.workflow_run_id, call.step_index)
+                        .await
+                        .map_err(Error::backend)?;
+                }
+                applied
             }
             Ok(Err(err)) => {
                 self.handle_activity_error(&mut tx, &call, handler.retry_policy(), err)
-                    .await?;
+                    .await?
             }
             Err(_) => {
                 let err = activity::Error::retryable(
@@ -189,10 +198,14 @@ impl<B: backend::Backend> ActivityWorker<B> {
                     format!("Activity `{}` timed out", handler.name()),
                 );
                 self.handle_activity_error(&mut tx, &call, handler.retry_policy(), err)
-                    .await?;
+                    .await?
             }
+        };
+        if applied.applied() {
+            tx.commit().await.map_err(Error::backend)?;
+        } else {
+            tx.rollback().await.map_err(Error::backend)?;
         }
-        tx.commit().await.map_err(Error::backend)?;
 
         Ok(Some(call.id))
     }
@@ -203,21 +216,23 @@ impl<B: backend::Backend> ActivityWorker<B> {
         call: &backend::ClaimedActivityCall,
         retry_policy: task::RetryPolicy,
         err: activity::Error,
-    ) -> Result {
+    ) -> Result<backend::ApplyResult> {
         if err.retryable && call.attempt_count < retry_policy.max_attempts {
-            let delay = retry_policy.calculate_delay(call.attempt_count);
-            tx.retry_activity_call(call, err, delay)
+            tx.retry_activity_call(call, err, retry_policy.calculate_delay(call.attempt_count))
                 .await
-                .map_err(Error::backend)?;
+                .map_err(Error::backend)
         } else {
-            tx.fail_activity_call(call, err)
+            let applied = tx
+                .fail_activity_call(call, err)
                 .await
                 .map_err(Error::backend)?;
-            tx.wake_workflow_task(&call.queue_name, call.workflow_run_id, call.step_index)
-                .await
-                .map_err(Error::backend)?;
+            if applied.applied() {
+                tx.wake_workflow_task(&call.queue_name, call.workflow_run_id, call.step_index)
+                    .await
+                    .map_err(Error::backend)?;
+            }
+            Ok(applied)
         }
-        Ok(())
     }
 
     fn activity_claim_specs(&self) -> Vec<String> {

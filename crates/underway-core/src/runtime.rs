@@ -8,8 +8,13 @@ pub struct RuntimeHandle {
 
 impl RuntimeHandle {
     /// Signals shutdown and waits for loops to end.
-    pub async fn shutdown(mut self) -> Result {
+    pub async fn shutdown(self) -> Result {
         self.shutdown_token.cancel();
+        self.wait().await
+    }
+
+    /// Waits for runtime loops to end.
+    pub async fn wait(mut self) -> Result {
         while let Some(result) = self.workers.join_next().await {
             result??;
         }
@@ -79,7 +84,7 @@ where
 
     /// Runs runtime loops.
     pub async fn run(&self) -> Result {
-        self.start().shutdown().await
+        self.start().wait().await
     }
 
     /// Starts runtime loops.
