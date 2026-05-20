@@ -557,7 +557,11 @@ pub trait Task<B: backend::Backend>: Send + Sync + 'static {
     /// Output payload.
     type Output: Serialize + Send + 'static;
 
-    /// Executes a task inside the backend transaction that claimed it.
+    /// Executes a task after its claim has been committed.
+    ///
+    /// Successful execution and durable suspension commit this transaction.
+    /// Retryable failures, fatal failures, and timeouts roll it back before
+    /// failure bookkeeping is recorded in a fresh transaction.
     fn execute(
         &self,
         tx: &mut B::Transaction<'_>,

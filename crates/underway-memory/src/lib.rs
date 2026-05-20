@@ -817,6 +817,34 @@ mod tests {
         }
     }
 
+    struct FailingSideEffectTask;
+
+    impl Task<MemoryBackend> for FailingSideEffectTask {
+        type Input = ();
+        type Output = ();
+
+        async fn execute(
+            &self,
+            tx: &mut <MemoryBackend as Backend>::Transaction<'_>,
+            _input: Self::Input,
+        ) -> task::Result<Self::Output> {
+            tx.create_queue("rolled_back_side_effects", None)
+                .await
+                .map_err(|err| task::Error::Fatal(err.to_string()))?;
+            tx.enqueue_task(
+                "rolled_back_side_effects",
+                underway_core::backend::EnqueueTask {
+                    input: serde_json::json!("side-effect"),
+                    config: TaskConfig::default(),
+                    delay: Span::new(),
+                },
+            )
+            .await
+            .map_err(|err| task::Error::Fatal(err.to_string()))?;
+            Err(task::Error::Retryable("rollback".to_string()))
+        }
+    }
+
     #[tokio::test]
     async fn queue_processes_task() {
         let backend = MemoryBackend::new();
@@ -870,6 +898,27 @@ mod tests {
 
         let tx = backend.begin().await.unwrap();
         tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn task_failure_rolls_back_execution_transaction_effects() {
+        let backend = MemoryBackend::new();
+        let queue = underway_core::Queue::builder()
+            .name("task_failure_rolls_back_execution_transaction_effects")
+            .backend(backend.clone())
+            .build()
+            .await
+            .unwrap();
+        let task = FailingSideEffectTask;
+        queue.enqueue(&task, &()).await.unwrap();
+
+        let worker = underway_core::Worker::new(Arc::new(queue), task);
+        assert!(worker.process_next_task().await.unwrap().is_some());
+
+        let mut tx = backend.begin().await.unwrap();
+        let side_effect = tx.claim_task("rolled_back_side_effects").await.unwrap();
+        tx.commit().await.unwrap();
+        assert!(side_effect.is_none());
     }
 
     #[tokio::test]

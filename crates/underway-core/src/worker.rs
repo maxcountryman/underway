@@ -1,5 +1,34 @@
 use super::*;
 
+struct HeartbeatGuard {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl HeartbeatGuard {
+    fn spawn<B>(backend: B, claimed: backend::ClaimedTask, heartbeat: StdDuration) -> Self
+    where
+        B: backend::Backend,
+    {
+        let handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(heartbeat);
+            interval.tick().await;
+            loop {
+                if let Err(err) = backend.record_heartbeat(&claimed).await {
+                    tracing::error!(%err, "failed to record heartbeat");
+                }
+                interval.tick().await;
+            }
+        });
+        Self { handle }
+    }
+}
+
+impl Drop for HeartbeatGuard {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 /// Worker for one task type.
 pub struct Worker<B, T>
 where
@@ -128,66 +157,74 @@ where
         let input: T::Input = serde_json::from_value(claimed.input.clone())?;
         let timeout: StdDuration = claimed.config.timeout().try_into()?;
         let heartbeat: StdDuration = claimed.config.heartbeat().try_into()?;
-
-        let mut tx = self.queue.backend.begin().await.map_err(Error::backend)?;
-        let heartbeat_task = tokio::spawn({
-            let backend = self.queue.backend.clone();
-            let claimed = claimed.clone();
-            async move {
-                let mut interval = tokio::time::interval(heartbeat);
-                interval.tick().await;
-                loop {
-                    if let Err(err) = backend.record_heartbeat(&claimed).await {
-                        tracing::error!(%err, "failed to record heartbeat");
-                    }
-                    interval.tick().await;
-                }
-            }
-        });
-
-        let result = tokio::time::timeout(timeout, self.task.execute(&mut tx, input)).await;
         let task_id = claimed.id;
 
-        let applied = match result {
-            Ok(Ok(_)) => tx
-                .mark_task_succeeded(&claimed)
-                .await
-                .map_err(Error::backend)?,
-            Ok(Err(task::Error::Suspended(_))) => tx
-                .mark_task_waiting(&claimed)
-                .await
-                .map_err(Error::backend)?,
+        let mut tx = self.queue.backend.begin().await.map_err(Error::backend)?;
+        let _heartbeat =
+            HeartbeatGuard::spawn(self.queue.backend.clone(), claimed.clone(), heartbeat);
+
+        let result = tokio::time::timeout(timeout, self.task.execute(&mut tx, input)).await;
+
+        match result {
+            Ok(Ok(_)) => {
+                let applied = tx
+                    .mark_task_succeeded(&claimed)
+                    .await
+                    .map_err(Error::backend)?;
+                finish_execution_transaction::<B>(tx, applied).await?;
+            }
+            Ok(Err(task::Error::Suspended(_))) => {
+                let applied = tx
+                    .mark_task_waiting(&claimed)
+                    .await
+                    .map_err(Error::backend)?;
+                finish_execution_transaction::<B>(tx, applied).await?;
+            }
             Ok(Err(err)) => {
-                handle_task_error(
-                    &mut tx,
-                    &self.queue,
-                    &claimed,
-                    &claimed.config.retry_policy(),
-                    &err,
-                )
-                .await?
+                tx.rollback().await.map_err(Error::backend)?;
+                finalize_task_error(&self.queue, &claimed, &err).await?;
             }
             Err(_) => {
                 let err = task::Error::TimedOut(timeout.try_into()?);
-                handle_task_error(
-                    &mut tx,
-                    &self.queue,
-                    &claimed,
-                    &claimed.config.retry_policy(),
-                    &err,
-                )
-                .await?
+                tx.rollback().await.map_err(Error::backend)?;
+                finalize_task_error(&self.queue, &claimed, &err).await?;
             }
-        };
-
-        heartbeat_task.abort();
-        if applied.applied() {
-            tx.commit().await.map_err(Error::backend)?;
-        } else {
-            tx.rollback().await.map_err(Error::backend)?;
         }
 
         Ok(Some(task_id))
+    }
+}
+
+async fn finish_execution_transaction<B>(
+    tx: B::Transaction<'_>,
+    applied: backend::ApplyResult,
+) -> Result
+where
+    B: backend::Backend,
+{
+    if applied.applied() {
+        tx.commit().await.map_err(Error::backend)
+    } else {
+        tx.rollback().await.map_err(Error::backend)
+    }
+}
+
+async fn finalize_task_error<B, T>(
+    queue: &queue::Queue<B, T>,
+    claimed: &backend::ClaimedTask,
+    err: &task::Error,
+) -> Result
+where
+    B: backend::Backend,
+    T: task::Task<B>,
+{
+    let mut tx = queue.backend.begin().await.map_err(Error::backend)?;
+    let applied =
+        handle_task_error(&mut tx, queue, claimed, &claimed.config.retry_policy(), err).await?;
+    if applied.applied() {
+        tx.commit().await.map_err(Error::backend)
+    } else {
+        tx.rollback().await.map_err(Error::backend)
     }
 }
 
@@ -245,4 +282,318 @@ where
     }
 
     tx.mark_task_failed(claimed).await.map_err(Error::backend)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        error::Error as StdError,
+        fmt,
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        },
+    };
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct TestError;
+
+    impl fmt::Display for TestError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("test backend transition failed")
+        }
+    }
+
+    impl StdError for TestError {}
+
+    #[derive(Clone, Default)]
+    struct TestBackend {
+        enqueued: Arc<AtomicBool>,
+        claimed: Arc<AtomicBool>,
+        heartbeats: Arc<AtomicUsize>,
+    }
+
+    impl TestBackend {
+        fn heartbeats(&self) -> usize {
+            self.heartbeats.load(Ordering::SeqCst)
+        }
+    }
+
+    struct TestTransaction {
+        backend: TestBackend,
+    }
+
+    struct TestSchedulerLease;
+
+    impl backend::SchedulerLease for TestSchedulerLease {
+        type Error = TestError;
+
+        async fn release(&mut self) -> StdResult<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    impl backend::Backend for TestBackend {
+        type Error = TestError;
+        type Transaction<'a> = TestTransaction;
+        type SchedulerLease<'a> = TestSchedulerLease;
+
+        async fn begin(&self) -> StdResult<Self::Transaction<'_>, Self::Error> {
+            Ok(TestTransaction {
+                backend: self.clone(),
+            })
+        }
+
+        async fn record_heartbeat(
+            &self,
+            _task: &backend::ClaimedTask,
+        ) -> StdResult<(), Self::Error> {
+            self.heartbeats.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn try_acquire_scheduler(
+            &self,
+            _queue_name: &str,
+        ) -> StdResult<Option<Self::SchedulerLease<'_>>, Self::Error> {
+            Ok(Some(TestSchedulerLease))
+        }
+    }
+
+    impl backend::BackendTransaction for TestTransaction {
+        type Error = TestError;
+
+        async fn commit(self) -> StdResult<(), Self::Error> {
+            Ok(())
+        }
+
+        async fn rollback(self) -> StdResult<(), Self::Error> {
+            Ok(())
+        }
+
+        async fn create_queue(
+            &mut self,
+            _name: &str,
+            _dlq_name: Option<&str>,
+        ) -> StdResult<(), Self::Error> {
+            Ok(())
+        }
+
+        async fn enqueue_task(
+            &mut self,
+            _queue_name: &str,
+            _task: backend::EnqueueTask,
+        ) -> StdResult<task::TaskId, Self::Error> {
+            self.backend.enqueued.store(true, Ordering::SeqCst);
+            Ok(task::TaskId::new())
+        }
+
+        async fn claim_task(
+            &mut self,
+            queue_name: &str,
+        ) -> StdResult<Option<backend::ClaimedTask>, Self::Error> {
+            if !self.backend.enqueued.load(Ordering::SeqCst)
+                || self.backend.claimed.swap(true, Ordering::SeqCst)
+            {
+                return Ok(None);
+            }
+
+            Ok(Some(backend::ClaimedTask {
+                id: task::TaskId::new(),
+                queue_name: queue_name.to_string(),
+                input: serde_json::json!(null),
+                config: task::TaskConfig::builder()
+                    .heartbeat(1.milliseconds())
+                    .timeout(1.second())
+                    .build()
+                    .expect("valid test task config"),
+                attempt_number: 1,
+            }))
+        }
+
+        async fn mark_task_succeeded(
+            &mut self,
+            _task: &backend::ClaimedTask,
+        ) -> StdResult<backend::ApplyResult, Self::Error> {
+            Err(TestError)
+        }
+
+        async fn mark_task_waiting(
+            &mut self,
+            _task: &backend::ClaimedTask,
+        ) -> StdResult<backend::ApplyResult, Self::Error> {
+            Ok(backend::ApplyResult::Stale)
+        }
+
+        async fn record_task_failure(
+            &mut self,
+            _task: &backend::ClaimedTask,
+            _error: &task::Error,
+        ) -> StdResult<backend::ApplyResult, Self::Error> {
+            Ok(backend::ApplyResult::Stale)
+        }
+
+        async fn retry_task(
+            &mut self,
+            _task: &backend::ClaimedTask,
+            _delay: Span,
+        ) -> StdResult<backend::ApplyResult, Self::Error> {
+            Ok(backend::ApplyResult::Stale)
+        }
+
+        async fn mark_task_failed(
+            &mut self,
+            _task: &backend::ClaimedTask,
+        ) -> StdResult<backend::ApplyResult, Self::Error> {
+            Ok(backend::ApplyResult::Stale)
+        }
+
+        async fn move_task_to_dlq(
+            &mut self,
+            _task_id: task::TaskId,
+            _from_queue: &str,
+            _dlq_name: &str,
+        ) -> StdResult<backend::ApplyResult, Self::Error> {
+            Ok(backend::ApplyResult::Stale)
+        }
+
+        async fn cancel_workflow(
+            &mut self,
+            _queue_name: &str,
+            _workflow_run_id: workflow::WorkflowRunId,
+        ) -> StdResult<bool, Self::Error> {
+            Ok(false)
+        }
+
+        async fn schedule_task(
+            &mut self,
+            _queue_name: &str,
+            _schedule: scheduler::ZonedSchedule,
+            _input: serde_json::Value,
+        ) -> StdResult<(), Self::Error> {
+            Ok(())
+        }
+
+        async fn unschedule_task(&mut self, _queue_name: &str) -> StdResult<(), Self::Error> {
+            Ok(())
+        }
+
+        async fn load_task_schedule(
+            &mut self,
+            _queue_name: &str,
+        ) -> StdResult<Option<backend::StoredSchedule>, Self::Error> {
+            Ok(None)
+        }
+
+        async fn load_activity_calls(
+            &mut self,
+            _queue_name: &str,
+            _workflow_run_id: workflow::WorkflowRunId,
+            _step_index: usize,
+        ) -> StdResult<Vec<backend::ActivityCallRecord>, Self::Error> {
+            Ok(Vec::new())
+        }
+
+        async fn record_activity_call(
+            &mut self,
+            _queue_name: &str,
+            _workflow_run_id: workflow::WorkflowRunId,
+            _step_index: usize,
+            _command: backend::ActivityCallCommand,
+        ) -> StdResult<(), Self::Error> {
+            Ok(())
+        }
+
+        async fn claim_activity_call(
+            &mut self,
+            _queue_name: &str,
+            _activities: &[String],
+        ) -> StdResult<Option<backend::ClaimedActivityCall>, Self::Error> {
+            Ok(None)
+        }
+
+        async fn complete_activity_call(
+            &mut self,
+            _call: &backend::ClaimedActivityCall,
+            _output: serde_json::Value,
+        ) -> StdResult<backend::ApplyResult, Self::Error> {
+            Ok(backend::ApplyResult::Stale)
+        }
+
+        async fn retry_activity_call(
+            &mut self,
+            _call: &backend::ClaimedActivityCall,
+            _error: activity::Error,
+            _delay: Span,
+        ) -> StdResult<backend::ApplyResult, Self::Error> {
+            Ok(backend::ApplyResult::Stale)
+        }
+
+        async fn fail_activity_call(
+            &mut self,
+            _call: &backend::ClaimedActivityCall,
+            _error: activity::Error,
+        ) -> StdResult<backend::ApplyResult, Self::Error> {
+            Ok(backend::ApplyResult::Stale)
+        }
+
+        async fn wake_workflow_task(
+            &mut self,
+            _queue_name: &str,
+            _workflow_run_id: workflow::WorkflowRunId,
+            _step_index: usize,
+        ) -> StdResult<(), Self::Error> {
+            Ok(())
+        }
+
+        async fn delete_expired(&mut self) -> StdResult<u64, Self::Error> {
+            Ok(0)
+        }
+    }
+
+    struct SuccessfulTask;
+
+    impl task::Task<TestBackend> for SuccessfulTask {
+        type Input = ();
+        type Output = ();
+
+        async fn execute(
+            &self,
+            _tx: &mut <TestBackend as backend::Backend>::Transaction<'_>,
+            _input: Self::Input,
+        ) -> task::Result<Self::Output> {
+            Ok(())
+        }
+
+        fn config(&self) -> task::ConfigResult {
+            task::TaskConfig::builder()
+                .heartbeat(1.milliseconds())
+                .timeout(1.second())
+                .build()
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_stops_when_finalization_errors() {
+        let backend = TestBackend::default();
+        let queue = Arc::new(
+            queue::Queue::builder()
+                .name("heartbeat_stops_when_finalization_errors")
+                .backend(backend.clone())
+                .build()
+                .await
+                .unwrap(),
+        );
+        let task = SuccessfulTask;
+        queue.enqueue(&task, &()).await.unwrap();
+
+        let worker = Worker::new(queue, task);
+        worker.process_next_task().await.unwrap_err();
+        let heartbeats_after_error = backend.heartbeats();
+
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
+        assert_eq!(backend.heartbeats(), heartbeats_after_error);
+    }
 }
