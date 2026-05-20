@@ -659,17 +659,21 @@ impl BackendTransaction for PostgresTransaction<'_> {
         Ok(())
     }
 
-    async fn delete_expired(&mut self) -> Result<(), Self::Error> {
-        sqlx::query(
+    async fn delete_expired(&mut self) -> Result<u64, Self::Error> {
+        let result = sqlx::query(
             r#"
             delete from underway.task
-            where state != 'in_progress'::underway.task_state
+            where state in (
+                'succeeded'::underway.task_state,
+                'cancelled'::underway.task_state,
+                'failed'::underway.task_state
+            )
               and created_at + ttl < now()
             "#,
         )
         .execute(&mut *self.inner)
         .await?;
-        Ok(())
+        Ok(result.rows_affected())
     }
 }
 

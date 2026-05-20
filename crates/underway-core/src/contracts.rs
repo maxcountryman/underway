@@ -91,6 +91,17 @@ where
     }
 }
 
+fn expect_none_without_debug<T>(
+    contract: &'static str,
+    value: Option<T>,
+    expected: &'static str,
+) -> ContractResult {
+    match value {
+        None => Ok(()),
+        Some(_) => Err(violation(contract, expected, "some value")),
+    }
+}
+
 fn default_task_config(contract: &'static str) -> ContractResult<task::TaskConfig> {
     task::TaskConfig::builder()
         .build()
@@ -109,6 +120,35 @@ fn task_config_with_short_heartbeat(contract: &'static str) -> ContractResult<ta
         .map_err(|err| backend_error(contract, err))
 }
 
+fn task_config_with_ttl(
+    contract: &'static str,
+    ttl: Span,
+    priority: i32,
+) -> ContractResult<task::TaskConfig> {
+    task::TaskConfig::builder()
+        .ttl(ttl)
+        .priority(priority)
+        .build()
+        .map_err(|err| backend_error(contract, err))
+}
+
+fn task_config_with_heartbeat(
+    contract: &'static str,
+    heartbeat: Span,
+    priority: i32,
+) -> ContractResult<task::TaskConfig> {
+    let retry_policy = task::RetryPolicy {
+        max_attempts: 3,
+        ..task::RetryPolicy::default()
+    };
+    task::TaskConfig::builder()
+        .retry_policy(retry_policy)
+        .heartbeat(heartbeat)
+        .priority(priority)
+        .build()
+        .map_err(|err| backend_error(contract, err))
+}
+
 fn workflow_input(
     workflow_run_id: workflow::WorkflowRunId,
     step_index: usize,
@@ -118,6 +158,378 @@ fn workflow_input(
         "step_input": {},
         "workflow_run_id": workflow_run_id.to_string(),
     })
+}
+
+/// Verifies rolled-back changes are not visible and committed changes are
+/// visible.
+pub async fn transaction_commit_and_rollback<B>(backend: B) -> ContractResult
+where
+    B: backend::Backend,
+{
+    const CONTRACT: &str = "transaction_commit_and_rollback";
+
+    let rolled_back_queue = format!("contract-rollback-{}", task::TaskId::new());
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.create_queue(&rolled_back_queue, None)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.enqueue_task(
+        &rolled_back_queue,
+        backend::EnqueueTask {
+            input: serde_json::json!("rolled-back"),
+            config: default_task_config(CONTRACT)?,
+            delay: Span::new(),
+        },
+    )
+    .await
+    .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.rollback()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let rolled_back = tx
+        .claim_task(&rolled_back_queue)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    expect_none(
+        CONTRACT,
+        rolled_back,
+        "no task from rolled-back transaction",
+    )?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    let committed_queue = format!("contract-commit-{}", task::TaskId::new());
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.create_queue(&committed_queue, None)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.enqueue_task(
+        &committed_queue,
+        backend::EnqueueTask {
+            input: serde_json::json!("committed"),
+            config: default_task_config(CONTRACT)?,
+            delay: Span::new(),
+        },
+    )
+    .await
+    .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let committed = tx
+        .claim_task(&committed_queue)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let committed = expect_some(CONTRACT, committed, "task from committed transaction")?;
+    expect_eq(
+        CONTRACT,
+        committed.input.clone(),
+        serde_json::json!("committed"),
+    )?;
+    tx.mark_task_succeeded(&committed)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    Ok(())
+}
+
+/// Verifies scheduler leases are exclusive until release.
+pub async fn scheduler_lease_exclusivity<B>(backend: B) -> ContractResult
+where
+    B: backend::Backend,
+{
+    const CONTRACT: &str = "scheduler_lease_exclusivity";
+
+    let queue_name = format!("contract-scheduler-{}", task::TaskId::new());
+    let mut first = backend
+        .try_acquire_scheduler(&queue_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let mut first = expect_some(CONTRACT, first.take(), "first scheduler lease")?;
+
+    let second = backend
+        .try_acquire_scheduler(&queue_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    expect_none_without_debug(CONTRACT, second, "no second scheduler lease while held")?;
+
+    first
+        .release()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    let mut reacquired = backend
+        .try_acquire_scheduler(&queue_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let mut reacquired = expect_some(CONTRACT, reacquired.take(), "scheduler lease after release")?;
+    reacquired
+        .release()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    Ok(())
+}
+
+/// Verifies heartbeats extend the active task lease.
+pub async fn heartbeat_extends_task_lease<B, Advance, AdvanceFuture, AdvanceError>(
+    backend: B,
+    mut advance: Advance,
+) -> ContractResult
+where
+    B: backend::Backend,
+    Advance: FnMut(Span) -> AdvanceFuture,
+    AdvanceFuture: Future<Output = StdResult<(), AdvanceError>>,
+    AdvanceError: Display,
+{
+    const CONTRACT: &str = "heartbeat_extends_task_lease";
+
+    let queue_name = format!("contract-heartbeat-{}", task::TaskId::new());
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.create_queue(&queue_name, None)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.enqueue_task(
+        &queue_name,
+        backend::EnqueueTask {
+            input: serde_json::json!("heartbeat"),
+            config: task_config_with_heartbeat(CONTRACT, 500.milliseconds(), 0)?,
+            delay: Span::new(),
+        },
+    )
+    .await
+    .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let claimed = tx
+        .claim_task(&queue_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let claimed = expect_some(CONTRACT, claimed, "initial task claim")?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    advance(100.milliseconds())
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    backend
+        .record_heartbeat(&claimed)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    advance(200.milliseconds())
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let before_extended_expiry = tx
+        .claim_task(&queue_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    expect_none(
+        CONTRACT,
+        before_extended_expiry,
+        "no reclaim before heartbeat-extended lease expires",
+    )?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    advance(350.milliseconds())
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let reclaimed = tx
+        .claim_task(&queue_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let reclaimed = expect_some(CONTRACT, reclaimed, "reclaim after extended lease expires")?;
+    expect_eq(CONTRACT, reclaimed.attempt_number, 2)?;
+    tx.mark_task_succeeded(&reclaimed)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    Ok(())
+}
+
+/// Verifies expired terminal work is deleted while expired live work remains
+/// available to progress.
+pub async fn delete_expired_removes_only_terminal_work<B, Advance, AdvanceFuture, AdvanceError>(
+    backend: B,
+    mut advance: Advance,
+) -> ContractResult
+where
+    B: backend::Backend,
+    Advance: FnMut(Span) -> AdvanceFuture,
+    AdvanceFuture: Future<Output = StdResult<(), AdvanceError>>,
+    AdvanceError: Display,
+{
+    const CONTRACT: &str = "delete_expired_removes_only_terminal_work";
+
+    let queue_name = format!("contract-delete-expired-{}", task::TaskId::new());
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.create_queue(&queue_name, None)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.enqueue_task(
+        &queue_name,
+        backend::EnqueueTask {
+            input: serde_json::json!("terminal"),
+            config: task_config_with_ttl(CONTRACT, 100.milliseconds(), 30)?,
+            delay: Span::new(),
+        },
+    )
+    .await
+    .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.enqueue_task(
+        &queue_name,
+        backend::EnqueueTask {
+            input: serde_json::json!("in-progress"),
+            config: task_config_with_heartbeat(CONTRACT, 100.milliseconds(), 20)?
+                .into_builder()
+                .ttl(100.milliseconds())
+                .build()
+                .map_err(|err| backend_error(CONTRACT, err))?,
+            delay: Span::new(),
+        },
+    )
+    .await
+    .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.enqueue_task(
+        &queue_name,
+        backend::EnqueueTask {
+            input: serde_json::json!("pending"),
+            config: task_config_with_ttl(CONTRACT, 100.milliseconds(), 10)?,
+            delay: Span::new(),
+        },
+    )
+    .await
+    .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let terminal = tx
+        .claim_task(&queue_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let terminal = expect_some(CONTRACT, terminal, "terminal task claim")?;
+    expect_eq(
+        CONTRACT,
+        terminal.input.clone(),
+        serde_json::json!("terminal"),
+    )?;
+    tx.mark_task_succeeded(&terminal)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    let in_progress = tx
+        .claim_task(&queue_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let in_progress = expect_some(CONTRACT, in_progress, "in-progress task claim")?;
+    expect_eq(
+        CONTRACT,
+        in_progress.input.clone(),
+        serde_json::json!("in-progress"),
+    )?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    advance(150.milliseconds())
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let deleted = tx
+        .delete_expired()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    expect_eq(CONTRACT, deleted, 1)?;
+
+    let reclaimed = tx
+        .claim_task(&queue_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let reclaimed = expect_some(CONTRACT, reclaimed, "expired in-progress task remains")?;
+    expect_eq(
+        CONTRACT,
+        reclaimed.input.clone(),
+        serde_json::json!("in-progress"),
+    )?;
+    expect_eq(CONTRACT, reclaimed.attempt_number, 2)?;
+    tx.mark_task_succeeded(&reclaimed)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    let pending = tx
+        .claim_task(&queue_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let pending = expect_some(CONTRACT, pending, "expired pending task remains")?;
+    expect_eq(
+        CONTRACT,
+        pending.input.clone(),
+        serde_json::json!("pending"),
+    )?;
+    tx.mark_task_succeeded(&pending)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    Ok(())
 }
 
 /// Verifies priority ordering, FIFO ordering within equal priority, retry, and

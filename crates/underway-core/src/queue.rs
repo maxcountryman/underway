@@ -265,7 +265,7 @@ where
 /// Runs deletion clean up once.
 pub async fn run_deletion_once<B: backend::Backend>(backend: &B) -> Result {
     let mut tx = backend.begin().await.map_err(Error::backend)?;
-    tx.delete_expired().await.map_err(Error::backend)?;
+    let _ = tx.delete_expired().await.map_err(Error::backend)?;
     tx.commit().await.map_err(Error::backend)?;
     Ok(())
 }

@@ -255,8 +255,8 @@ pub trait BackendTransaction: Send {
         step_index: usize,
     ) -> impl Future<Output = StdResult<(), Self::Error>> + Send;
 
-    /// Deletes expired terminal tasks.
-    fn delete_expired(&mut self) -> impl Future<Output = StdResult<(), Self::Error>> + Send;
+    /// Deletes expired terminal tasks and returns how many were removed.
+    fn delete_expired(&mut self) -> impl Future<Output = StdResult<u64, Self::Error>> + Send;
 }
 
 /// Durable backend.

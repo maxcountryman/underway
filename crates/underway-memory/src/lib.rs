@@ -76,7 +76,7 @@ impl MemoryBackend {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct State {
     now_ms: u64,
     sequence: u64,
@@ -139,7 +139,9 @@ struct ActivityCallRow {
 /// Memory transaction.
 pub struct MemoryTransaction {
     backend: MemoryBackend,
-    finished: bool,
+    state: State,
+    task_changed: bool,
+    activity_changed: bool,
 }
 
 /// Memory scheduler lease.
@@ -176,9 +178,12 @@ impl Backend for MemoryBackend {
     type SchedulerLease<'a> = MemorySchedulerLease;
 
     async fn begin(&self) -> Result<Self::Transaction<'_>, Self::Error> {
+        let state = self.state()?.clone();
         Ok(MemoryTransaction {
             backend: self.clone(),
-            finished: false,
+            state,
+            task_changed: false,
+            activity_changed: false,
         })
     }
 
@@ -240,13 +245,30 @@ impl Backend for MemoryBackend {
 impl BackendTransaction for MemoryTransaction {
     type Error = Error;
 
-    async fn commit(mut self) -> Result<(), Self::Error> {
-        self.finished = true;
+    async fn commit(self) -> Result<(), Self::Error> {
+        let MemoryTransaction {
+            backend,
+            mut state,
+            task_changed,
+            activity_changed,
+        } = self;
+        {
+            let mut shared = backend.state()?;
+            state.now_ms = state.now_ms.max(shared.now_ms);
+            state.sequence = state.sequence.max(shared.sequence);
+            state.scheduler_locks = shared.scheduler_locks.clone();
+            *shared = state;
+        }
+        if task_changed {
+            backend.task_notify.notify_waiters();
+        }
+        if activity_changed {
+            backend.activity_notify.notify_waiters();
+        }
         Ok(())
     }
 
-    async fn rollback(mut self) -> Result<(), Self::Error> {
-        self.finished = true;
+    async fn rollback(self) -> Result<(), Self::Error> {
         Ok(())
     }
 
@@ -255,16 +277,18 @@ impl BackendTransaction for MemoryTransaction {
         name: &str,
         dlq_name: Option<&str>,
     ) -> Result<(), Self::Error> {
-        let mut state = self.backend.state()?;
-        state.queues.entry(name.to_string()).or_insert(QueueRow {
-            dlq_name: dlq_name.map(ToOwned::to_owned),
-        });
+        self.state
+            .queues
+            .entry(name.to_string())
+            .or_insert(QueueRow {
+                dlq_name: dlq_name.map(ToOwned::to_owned),
+            });
         if let Some(dlq_name) = dlq_name {
-            state
+            self.state
                 .queues
                 .entry(dlq_name.to_string())
                 .or_insert(QueueRow { dlq_name: None });
-            if let Some(queue) = state.queues.get_mut(name) {
+            if let Some(queue) = self.state.queues.get_mut(name) {
                 queue.dlq_name = Some(dlq_name.to_string());
             }
         }
@@ -276,7 +300,6 @@ impl BackendTransaction for MemoryTransaction {
         queue_name: &str,
         task: EnqueueTask,
     ) -> Result<TaskId, Self::Error> {
-        let mut state = self.backend.state()?;
         let id = TaskId::new();
         let delay_ms = duration_ms(task.config.delay().checked_add(task.delay)?)?;
         let row = TaskRow {
@@ -287,24 +310,24 @@ impl BackendTransaction for MemoryTransaction {
             config: task.config,
             attempt_count: 0,
             current_attempt: 0,
-            run_at_ms: state.now_ms.saturating_add(delay_ms),
+            run_at_ms: self.state.now_ms.saturating_add(delay_ms),
             lease_expires_at_ms: None,
-            created_at_ms: state.now_ms,
-            created_seq: state.next_sequence(),
+            created_at_ms: self.state.now_ms,
+            created_seq: self.state.next_sequence(),
             completed: false,
             last_error: None,
         };
-        state.tasks.insert((queue_name.to_string(), id), row);
-        self.backend.task_notify.notify_waiters();
+        self.state.tasks.insert((queue_name.to_string(), id), row);
+        self.task_changed = true;
         Ok(id)
     }
 
     async fn claim_task(&mut self, queue_name: &str) -> Result<Option<ClaimedTask>, Self::Error> {
-        let mut state = self.backend.state()?;
-        let now = state.now_ms;
-        terminalize_stale_exhausted(&mut state, queue_name)?;
+        let now = self.state.now_ms;
+        terminalize_stale_exhausted(&mut self.state, queue_name)?;
 
-        let selected = state
+        let selected = self
+            .state
             .tasks
             .iter()
             .filter(|((queue, _), row)| {
@@ -328,7 +351,8 @@ impl BackendTransaction for MemoryTransaction {
         let Some(key) = selected else {
             return Ok(None);
         };
-        let row = state
+        let row = self
+            .state
             .tasks
             .get_mut(&key)
             .ok_or_else(|| Error::NotFound("task".to_string()))?;
@@ -336,6 +360,7 @@ impl BackendTransaction for MemoryTransaction {
         row.attempt_count += 1;
         row.current_attempt = row.attempt_count;
         row.lease_expires_at_ms = Some(now.saturating_add(duration_ms(row.config.heartbeat())?));
+        self.task_changed = true;
         Ok(Some(ClaimedTask {
             id: row.id,
             queue_name: row.queue_name.clone(),
@@ -346,20 +371,24 @@ impl BackendTransaction for MemoryTransaction {
     }
 
     async fn mark_task_succeeded(&mut self, task: &ClaimedTask) -> Result<(), Self::Error> {
-        update_claimed_task(&self.backend, task, |row| {
+        update_claimed_task(&mut self.state, task, |row| {
             row.state = TaskState::Succeeded;
             row.completed = true;
             row.lease_expires_at_ms = None;
             Ok(())
-        })
+        })?;
+        self.task_changed = true;
+        Ok(())
     }
 
     async fn mark_task_waiting(&mut self, task: &ClaimedTask) -> Result<(), Self::Error> {
-        update_claimed_task(&self.backend, task, |row| {
+        update_claimed_task(&mut self.state, task, |row| {
             row.state = TaskState::Waiting;
             row.lease_expires_at_ms = None;
             Ok(())
-        })
+        })?;
+        self.task_changed = true;
+        Ok(())
     }
 
     async fn record_task_failure(
@@ -367,30 +396,33 @@ impl BackendTransaction for MemoryTransaction {
         task: &ClaimedTask,
         error: &task::Error,
     ) -> Result<(), Self::Error> {
-        update_claimed_task(&self.backend, task, |row| {
+        update_claimed_task(&mut self.state, task, |row| {
             row.last_error = Some(error.to_string());
             Ok(())
-        })
+        })?;
+        self.task_changed = true;
+        Ok(())
     }
 
     async fn retry_task(&mut self, task: &ClaimedTask, delay: Span) -> Result<(), Self::Error> {
-        let mut state = self.backend.state()?;
-        let now = state.now_ms;
-        let row = claimed_task_row(&mut state, task)?;
+        let now = self.state.now_ms;
+        let row = claimed_task_row(&mut self.state, task)?;
         row.state = TaskState::Pending;
         row.run_at_ms = now.saturating_add(duration_ms(delay)?);
         row.lease_expires_at_ms = None;
-        self.backend.task_notify.notify_waiters();
+        self.task_changed = true;
         Ok(())
     }
 
     async fn mark_task_failed(&mut self, task: &ClaimedTask) -> Result<(), Self::Error> {
-        update_claimed_task(&self.backend, task, |row| {
+        update_claimed_task(&mut self.state, task, |row| {
             row.state = TaskState::Failed;
             row.completed = true;
             row.lease_expires_at_ms = None;
             Ok(())
-        })
+        })?;
+        self.task_changed = true;
+        Ok(())
     }
 
     async fn move_task_to_dlq(
@@ -399,14 +431,17 @@ impl BackendTransaction for MemoryTransaction {
         from_queue: &str,
         dlq_name: &str,
     ) -> Result<(), Self::Error> {
-        let mut state = self.backend.state()?;
         let key = (from_queue.to_string(), task_id);
-        let mut row = state
+        let mut row = self
+            .state
             .tasks
             .remove(&key)
             .ok_or_else(|| Error::NotFound("task".to_string()))?;
         row.queue_name = dlq_name.to_string();
-        state.tasks.insert((dlq_name.to_string(), task_id), row);
+        self.state
+            .tasks
+            .insert((dlq_name.to_string(), task_id), row);
+        self.task_changed = true;
         Ok(())
     }
 
@@ -415,9 +450,8 @@ impl BackendTransaction for MemoryTransaction {
         queue_name: &str,
         workflow_run_id: WorkflowRunId,
     ) -> Result<bool, Self::Error> {
-        let mut state = self.backend.state()?;
         let mut cancelled = false;
-        for ((queue, _), row) in state.tasks.iter_mut() {
+        for ((queue, _), row) in &mut self.state.tasks {
             if queue == queue_name
                 && row.state == TaskState::Pending
                 && workflow_run_id_from_input(&row.input) == Some(workflow_run_id)
@@ -426,6 +460,9 @@ impl BackendTransaction for MemoryTransaction {
                 row.completed = true;
                 cancelled = true;
             }
+        }
+        if cancelled {
+            self.task_changed = true;
         }
         Ok(cancelled)
     }
@@ -436,16 +473,14 @@ impl BackendTransaction for MemoryTransaction {
         schedule: ZonedSchedule,
         input: serde_json::Value,
     ) -> Result<(), Self::Error> {
-        let mut state = self.backend.state()?;
-        state
+        self.state
             .schedules
             .insert(queue_name.to_string(), StoredSchedule { schedule, input });
         Ok(())
     }
 
     async fn unschedule_task(&mut self, queue_name: &str) -> Result<(), Self::Error> {
-        let mut state = self.backend.state()?;
-        state.schedules.remove(queue_name);
+        self.state.schedules.remove(queue_name);
         Ok(())
     }
 
@@ -453,8 +488,7 @@ impl BackendTransaction for MemoryTransaction {
         &mut self,
         queue_name: &str,
     ) -> Result<Option<StoredSchedule>, Self::Error> {
-        let state = self.backend.state()?;
-        Ok(state.schedules.get(queue_name).cloned())
+        Ok(self.state.schedules.get(queue_name).cloned())
     }
 
     async fn load_activity_calls(
@@ -463,8 +497,8 @@ impl BackendTransaction for MemoryTransaction {
         workflow_run_id: WorkflowRunId,
         step_index: usize,
     ) -> Result<Vec<ActivityCallRecord>, Self::Error> {
-        let state = self.backend.state()?;
-        Ok(state
+        Ok(self
+            .state
             .activity_calls
             .values()
             .filter(|call| {
@@ -490,14 +524,13 @@ impl BackendTransaction for MemoryTransaction {
         step_index: usize,
         command: ActivityCallCommand,
     ) -> Result<(), Self::Error> {
-        let mut state = self.backend.state()?;
         let key = (
             queue_name.to_string(),
             workflow_run_id,
             step_index,
             command.call_key.clone(),
         );
-        if state.activity_call_keys.contains_key(&key) {
+        if self.state.activity_call_keys.contains_key(&key) {
             return Ok(());
         }
 
@@ -514,14 +547,14 @@ impl BackendTransaction for MemoryTransaction {
             error: None,
             state: CallState::Pending,
             attempt_count: 0,
-            available_at_ms: state.now_ms,
+            available_at_ms: self.state.now_ms,
             lease_expires_at_ms: None,
             timeout: command.timeout,
-            created_seq: state.next_sequence(),
+            created_seq: self.state.next_sequence(),
         };
-        state.activity_call_keys.insert(key, id);
-        state.activity_calls.insert(id, row);
-        self.backend.activity_notify.notify_waiters();
+        self.state.activity_call_keys.insert(key, id);
+        self.state.activity_calls.insert(id, row);
+        self.activity_changed = true;
         Ok(())
     }
 
@@ -530,9 +563,9 @@ impl BackendTransaction for MemoryTransaction {
         queue_name: &str,
         activities: &[String],
     ) -> Result<Option<ClaimedActivityCall>, Self::Error> {
-        let mut state = self.backend.state()?;
-        let now = state.now_ms;
-        let selected = state
+        let now = self.state.now_ms;
+        let selected = self
+            .state
             .activity_calls
             .iter()
             .filter(|(_, call)| {
@@ -551,7 +584,8 @@ impl BackendTransaction for MemoryTransaction {
             return Ok(None);
         };
 
-        let call = state
+        let call = self
+            .state
             .activity_calls
             .get_mut(&id)
             .ok_or_else(|| Error::NotFound("activity call".to_string()))?;
@@ -561,6 +595,7 @@ impl BackendTransaction for MemoryTransaction {
             now.saturating_add(duration_ms(call.timeout)?)
                 .saturating_add(30_000),
         );
+        self.activity_changed = true;
 
         Ok(Some(ClaimedActivityCall {
             id: call.id,
@@ -580,11 +615,11 @@ impl BackendTransaction for MemoryTransaction {
         call: &ClaimedActivityCall,
         output: serde_json::Value,
     ) -> Result<(), Self::Error> {
-        let mut state = self.backend.state()?;
-        let row = claimed_activity_row(&mut state, call)?;
+        let row = claimed_activity_row(&mut self.state, call)?;
         row.state = CallState::Succeeded;
         row.output = Some(output);
         row.lease_expires_at_ms = None;
+        self.activity_changed = true;
         Ok(())
     }
 
@@ -594,14 +629,13 @@ impl BackendTransaction for MemoryTransaction {
         error: activity::Error,
         delay: Span,
     ) -> Result<(), Self::Error> {
-        let mut state = self.backend.state()?;
-        let now = state.now_ms;
-        let row = claimed_activity_row(&mut state, call)?;
+        let now = self.state.now_ms;
+        let row = claimed_activity_row(&mut self.state, call)?;
         row.state = CallState::Pending;
         row.error = Some(serde_json::to_value(error)?);
         row.available_at_ms = now.saturating_add(duration_ms(delay)?);
         row.lease_expires_at_ms = None;
-        self.backend.activity_notify.notify_waiters();
+        self.activity_changed = true;
         Ok(())
     }
 
@@ -610,11 +644,11 @@ impl BackendTransaction for MemoryTransaction {
         call: &ClaimedActivityCall,
         error: activity::Error,
     ) -> Result<(), Self::Error> {
-        let mut state = self.backend.state()?;
-        let row = claimed_activity_row(&mut state, call)?;
+        let row = claimed_activity_row(&mut self.state, call)?;
         row.state = CallState::Failed;
         row.error = Some(serde_json::to_value(error)?);
         row.lease_expires_at_ms = None;
+        self.activity_changed = true;
         Ok(())
     }
 
@@ -624,9 +658,9 @@ impl BackendTransaction for MemoryTransaction {
         workflow_run_id: WorkflowRunId,
         step_index: usize,
     ) -> Result<(), Self::Error> {
-        let mut state = self.backend.state()?;
-        let now = state.now_ms;
-        for ((queue, _), row) in state.tasks.iter_mut() {
+        let now = self.state.now_ms;
+        let mut changed = false;
+        for ((queue, _), row) in &mut self.state.tasks {
             if queue == queue_name
                 && row.state == TaskState::Waiting
                 && workflow_run_id_from_input(&row.input) == Some(workflow_run_id)
@@ -639,16 +673,19 @@ impl BackendTransaction for MemoryTransaction {
                 row.state = TaskState::Pending;
                 row.run_at_ms = now;
                 row.lease_expires_at_ms = None;
+                changed = true;
             }
         }
-        self.backend.task_notify.notify_waiters();
+        if changed {
+            self.task_changed = true;
+        }
         Ok(())
     }
 
-    async fn delete_expired(&mut self) -> Result<(), Self::Error> {
-        let mut state = self.backend.state()?;
-        let now = state.now_ms;
-        state.tasks.retain(|_, row| {
+    async fn delete_expired(&mut self) -> Result<u64, Self::Error> {
+        let now = self.state.now_ms;
+        let before = self.state.tasks.len();
+        self.state.tasks.retain(|_, row| {
             row.state == TaskState::InProgress
                 || !row.completed
                 || row
@@ -656,7 +693,11 @@ impl BackendTransaction for MemoryTransaction {
                     .checked_add(duration_ms(row.config.ttl()).unwrap_or(u64::MAX))
                     .is_some_and(|expires| expires >= now)
         });
-        Ok(())
+        let deleted = before.saturating_sub(self.state.tasks.len()) as u64;
+        if deleted > 0 {
+            self.task_changed = true;
+        }
+        Ok(deleted)
     }
 }
 
@@ -684,12 +725,11 @@ fn terminalize_stale_exhausted(state: &mut State, queue_name: &str) -> Result<()
 }
 
 fn update_claimed_task(
-    backend: &MemoryBackend,
+    state: &mut State,
     task: &ClaimedTask,
     f: impl FnOnce(&mut TaskRow) -> Result<(), Error>,
 ) -> Result<(), Error> {
-    let mut state = backend.state()?;
-    let row = claimed_task_row(&mut state, task)?;
+    let row = claimed_task_row(state, task)?;
     f(row)
 }
 
@@ -825,6 +865,42 @@ mod tests {
 
         let tx = backend.begin().await.unwrap();
         tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn satisfies_transaction_commit_and_rollback_contract() {
+        underway_core::contracts::transaction_commit_and_rollback(MemoryBackend::new())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn satisfies_scheduler_lease_exclusivity_contract() {
+        underway_core::contracts::scheduler_lease_exclusivity(MemoryBackend::new())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn satisfies_heartbeat_extends_task_lease_contract() {
+        let backend = MemoryBackend::new();
+        underway_core::contracts::heartbeat_extends_task_lease(
+            backend.clone(),
+            advance_clock(backend),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn satisfies_delete_expired_removes_only_terminal_work_contract() {
+        let backend = MemoryBackend::new();
+        underway_core::contracts::delete_expired_removes_only_terminal_work(
+            backend.clone(),
+            advance_clock(backend),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

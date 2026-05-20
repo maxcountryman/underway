@@ -18,6 +18,34 @@ async fn sleep_for(span: Span) -> Result<(), jiff::Error> {
 }
 
 #[sqlx::test(migrations = false)]
+async fn satisfies_transaction_commit_and_rollback_contract(pool: PgPool) {
+    core_contracts::transaction_commit_and_rollback(setup(pool).await)
+        .await
+        .unwrap();
+}
+
+#[sqlx::test(migrations = false)]
+async fn satisfies_scheduler_lease_exclusivity_contract(pool: PgPool) {
+    core_contracts::scheduler_lease_exclusivity(setup(pool).await)
+        .await
+        .unwrap();
+}
+
+#[sqlx::test(migrations = false)]
+async fn satisfies_heartbeat_extends_task_lease_contract(pool: PgPool) {
+    core_contracts::heartbeat_extends_task_lease(setup(pool).await, sleep_for)
+        .await
+        .unwrap();
+}
+
+#[sqlx::test(migrations = false)]
+async fn satisfies_delete_expired_removes_only_terminal_work_contract(pool: PgPool) {
+    core_contracts::delete_expired_removes_only_terminal_work(setup(pool).await, sleep_for)
+        .await
+        .unwrap();
+}
+
+#[sqlx::test(migrations = false)]
 async fn satisfies_queue_ordering_and_retry_contract(pool: PgPool) {
     core_contracts::queue_ordering_and_retry(setup(pool).await)
         .await
