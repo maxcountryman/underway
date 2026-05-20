@@ -39,7 +39,7 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D rustdoc::broken-intra-doc-links"
         run: |
-          cargo doc --all-features --no-deps
+          cargo doc --workspace --all-features --no-deps
 
   test-docs:
     needs: check
@@ -53,7 +53,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run doc tests
         run: |
-          cargo test --all-features --doc
+          cargo test --workspace --all-features --doc
+
+  package:
+    needs: check
+    runs-on: ubuntu-latest
+    env:
+      SQLX_OFFLINE: true
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - name: Check package manifests
+        run: |
+          cargo package -p underway-core
 
   test-lib:
     needs: check

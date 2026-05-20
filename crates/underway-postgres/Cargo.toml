@@ -17,5 +17,5 @@ sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-underway-core = { path = "../underway-core" }
+underway-core = { version = "0.2.0", path = "../underway-core" }
 uuid.workspace = true

@@ -1,5 +1,29 @@
 # Unreleased
 
+- Breaking: Split storage-independent semantics into `underway-core`, with
+  `underway-memory` for deterministic tests/local development and
+  `underway-postgres` for the durable Postgres backend. The `underway` crate is
+  now a facade with optional backend reexports.
+- Breaking: Queue, workflow, worker, scheduler, and runtime builders now accept
+  explicit backends via `.backend(...)`; Postgres migrations are run through
+  `PostgresBackend::run_migrations`.
+- Breaking: Task failure semantics now roll back the user execution transaction
+  for retryable, fatal, and timeout outcomes, then record retry/DLQ/final
+  failure in a fresh backend transaction. Successful and suspended workflow
+  tasks still commit the execution transaction with their final transition.
+- Add: Shared backend contracts now cover ordering, retry/backoff, delayed
+  availability, stale lease reclaim, attempt fencing, DLQ claimability,
+  transaction visibility, scheduler leases, heartbeat extension, expired-work
+  deletion, activity idempotency/replay, activity stale exhaustion, workflow
+  wait/resume, and concurrency-key exclusivity.
+- Add: Backend transition methods report `ApplyResult::Applied` or
+  `ApplyResult::Stale` where attempt fencing determines whether a transition
+  took effect.
+- Add: Release packaging now records versioned dependencies between split
+  crates; publish `underway-core`, then `underway-memory` and
+  `underway-postgres`, then the `underway` facade. SQLx query metadata remains
+  scoped to `underway-postgres`; Postgres correctness is covered by live
+  backend contract and integration tests.
 - Breaking: Remove `workflow::Context::tx`; step contexts no longer expose a worker transaction directly
 - Breaking: Workflow activities are now registered on `Workflow::builder()` before steps
 - Breaking: Remove manual activity keys; operation identity is now derived from workflow run ID, step index, and per-step operation order

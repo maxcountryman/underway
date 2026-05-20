@@ -14,8 +14,8 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-underway-core = { path = "../underway-core" }
+underway-core = { version = "0.2.0", path = "../underway-core" }
 uuid.workspace = true
 
 [dev-dependencies]
-underway-core = { path = "../underway-core", features = ["contracts"] }
+underway-core = { version = "0.2.0", path = "../underway-core", features = ["contracts"] }
