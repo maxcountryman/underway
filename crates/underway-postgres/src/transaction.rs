@@ -543,11 +543,69 @@ impl BackendTransaction for PostgresTransaction<'_> {
         queue_name: &str,
         activities: &[String],
     ) -> Result<Option<ClaimedActivityCall>, Self::Error> {
+        let exhausted_error = serde_json::to_value(activity::Error::fatal(
+            "activity_attempts_exhausted",
+            "Activity lease expired and retry policy was exhausted.",
+        ))?;
         let row = sqlx::query(
             r#"
-            with next_call as (
+            with stale_exhausted as (
+                select
+                    c.id,
+                    c.task_queue_name,
+                    c.workflow_run_id,
+                    c.step_index,
+                    c.attempt_count
+                from underway.activity_call c
+                where c.task_queue_name = $1
+                  and c.activity = any($2::text[])
+                  and c.state = 'in_progress'::underway.activity_call_state
+                  and c.lease_expires_at is not null
+                  and c.lease_expires_at <= now()
+                  and c.attempt_count >= c.max_attempts
+                for update skip locked
+            ),
+            finalized_exhausted_attempts as (
+                update underway.activity_call_attempt a
+                set state = 'failed'::underway.activity_call_state,
+                    error = coalesce(a.error, $3),
+                    updated_at = now(),
+                    completed_at = now()
+                from stale_exhausted se
+                where a.activity_call_id = se.id
+                  and a.attempt_number = se.attempt_count
+                  and a.state = 'in_progress'::underway.activity_call_state
+            ),
+            failed_exhausted as (
+                update underway.activity_call c
+                set state = 'failed'::underway.activity_call_state,
+                    error = $3,
+                    updated_at = now(),
+                    completed_at = now(),
+                    lease_expires_at = null
+                from stale_exhausted se
+                where c.id = se.id
+                returning c.task_queue_name, c.workflow_run_id, c.step_index
+            ),
+            woken_workflows as (
+                update underway.task t
+                set state = 'pending'::underway.task_state,
+                    run_at = now(),
+                    lease_expires_at = null,
+                    updated_at = now()
+                from failed_exhausted f
+                where t.task_queue_name = f.task_queue_name
+                  and t.state = 'waiting'::underway.task_state
+                  and (t.input->>'workflow_run_id')::uuid = f.workflow_run_id
+                  and (t.input->>'step_index')::integer = f.step_index
+            ),
+            recovered as (
+                select count(*) from failed_exhausted
+            ),
+            next_call as (
                 select c.id
                 from underway.activity_call c
+                cross join recovered
                 where c.task_queue_name = $1
                   and c.activity = any($2::text[])
                   and (
@@ -556,6 +614,7 @@ impl BackendTransaction for PostgresTransaction<'_> {
                         c.state = 'in_progress'::underway.activity_call_state
                         and c.lease_expires_at is not null
                         and c.lease_expires_at <= now()
+                        and c.attempt_count < c.max_attempts
                     )
                   )
                 order by c.available_at, c.created_at, c.id
@@ -582,6 +641,26 @@ impl BackendTransaction for PostgresTransaction<'_> {
                     c.input,
                     c.attempt_count
             ),
+            finalized_previous_attempt as (
+                update underway.activity_call_attempt a
+                set state = 'failed'::underway.activity_call_state,
+                    error = coalesce(
+                        a.error,
+                        jsonb_build_object(
+                            'code', 'activity_lease_reclaimed',
+                            'message', 'Activity lease expired and was reclaimed by another worker.',
+                            'retryable', true,
+                            'details', null
+                        )
+                    ),
+                    updated_at = now(),
+                    completed_at = now()
+                from claimed c
+                where c.attempt_count > 1
+                  and a.activity_call_id = c.id
+                  and a.attempt_number = c.attempt_count - 1
+                  and a.state = 'in_progress'::underway.activity_call_state
+            ),
             attempt as (
                 insert into underway.activity_call_attempt (
                     activity_call_id,
@@ -606,6 +685,7 @@ impl BackendTransaction for PostgresTransaction<'_> {
         )
         .bind(queue_name)
         .bind(activities)
+        .bind(exhausted_error)
         .fetch_optional(&mut *self.inner)
         .await?;
 

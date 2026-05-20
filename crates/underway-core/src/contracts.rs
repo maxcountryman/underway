@@ -1514,6 +1514,117 @@ where
     Ok(())
 }
 
+/// Verifies exhausted stale activity calls fail and wake waiting workflow work.
+pub async fn activity_stale_exhaustion_wakes_workflow<B, Advance, AdvanceFuture, AdvanceError>(
+    backend: B,
+    mut advance: Advance,
+) -> ContractResult
+where
+    B: backend::Backend,
+    Advance: FnMut(Span) -> AdvanceFuture,
+    AdvanceFuture: Future<Output = StdResult<(), AdvanceError>>,
+    AdvanceError: Display,
+{
+    const CONTRACT: &str = "activity_stale_exhaustion_wakes_workflow";
+
+    let queue_name = format!("contract-activity-exhausted-{}", task::TaskId::new());
+    let workflow_run_id = workflow::WorkflowRunId::new();
+    let retry_policy = task::RetryPolicy {
+        max_attempts: 1,
+        ..task::RetryPolicy::default()
+    };
+    let command = backend::ActivityCallCommand {
+        call_key: "activity:0:0".to_string(),
+        activity: "activity".to_string(),
+        input: serde_json::json!({"stale": true}),
+        timeout: 1.milliseconds(),
+        retry_policy,
+    };
+
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.create_queue(&queue_name, None)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.enqueue_task(
+        &queue_name,
+        backend::EnqueueTask {
+            input: workflow_input(workflow_run_id, 0),
+            config: default_task_config(CONTRACT)?,
+            delay: Span::new(),
+        },
+    )
+    .await
+    .map_err(|err| backend_error(CONTRACT, err))?;
+    let workflow_task = tx
+        .claim_task(&queue_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let workflow_task = expect_some(CONTRACT, workflow_task, "workflow task claim")?;
+    let applied = tx
+        .mark_task_waiting(&workflow_task)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    expect_applied(CONTRACT, applied)?;
+    tx.record_activity_call(&queue_name, workflow_run_id, 0, command)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let first = tx
+        .claim_activity_call(&queue_name, &["activity".to_string()])
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let first = expect_some(CONTRACT, first, "first activity claim")?;
+    expect_eq(CONTRACT, first.attempt_number, 1)?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    advance(31.seconds())
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    let mut tx = backend
+        .begin()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let exhausted = tx
+        .claim_activity_call(&queue_name, &["activity".to_string()])
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    expect_none(
+        CONTRACT,
+        exhausted,
+        "no reclaim after activity max attempts",
+    )?;
+    let records = tx
+        .load_activity_calls(&queue_name, workflow_run_id, 0)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    expect_eq(CONTRACT, records.len(), 1)?;
+    expect_eq(CONTRACT, records[0].state, activity::CallState::Failed)?;
+    let resumed = tx
+        .claim_task(&queue_name)
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+    let resumed = expect_some(CONTRACT, resumed, "workflow task woken by activity failure")?;
+    expect_eq(CONTRACT, resumed.attempt_number, 2)?;
+    tx.commit()
+        .await
+        .map_err(|err| backend_error(CONTRACT, err))?;
+
+    Ok(())
+}
+
 /// Verifies waiting workflow tasks can be woken for the exact run and step.
 pub async fn workflow_wait_and_resume<B>(backend: B) -> ContractResult
 where

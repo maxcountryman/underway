@@ -133,6 +133,7 @@ struct ActivityCallRow {
     available_at_ms: u64,
     lease_expires_at_ms: Option<u64>,
     timeout: Span,
+    retry_policy: task::RetryPolicy,
     created_seq: u64,
 }
 
@@ -567,6 +568,7 @@ impl BackendTransaction for MemoryTransaction {
             available_at_ms: self.state.now_ms,
             lease_expires_at_ms: None,
             timeout: command.timeout,
+            retry_policy: command.retry_policy,
             created_seq: self.state.next_sequence(),
         };
         self.state.activity_call_keys.insert(key, id);
@@ -581,6 +583,39 @@ impl BackendTransaction for MemoryTransaction {
         activities: &[String],
     ) -> Result<Option<ClaimedActivityCall>, Self::Error> {
         let now = self.state.now_ms;
+        let mut exhausted = Vec::new();
+        for call in self.state.activity_calls.values_mut() {
+            if call.queue_name == queue_name
+                && activities.iter().any(|activity| activity == &call.activity)
+                && call.state == CallState::InProgress
+                && call
+                    .lease_expires_at_ms
+                    .is_some_and(|expires| expires <= now)
+                && call.attempt_count >= call.retry_policy.max_attempts
+            {
+                call.state = CallState::Failed;
+                call.error = Some(serde_json::to_value(activity::Error::fatal(
+                    "activity_attempts_exhausted",
+                    "Activity lease expired and retry policy was exhausted.",
+                ))?);
+                call.lease_expires_at_ms = None;
+                exhausted.push((call.workflow_run_id, call.step_index));
+            }
+        }
+        if !exhausted.is_empty() {
+            self.activity_changed = true;
+            for (workflow_run_id, step_index) in exhausted {
+                if wake_waiting_workflow_task(
+                    &mut self.state,
+                    queue_name,
+                    workflow_run_id,
+                    step_index,
+                ) {
+                    self.task_changed = true;
+                }
+            }
+        }
+
         let selected = self
             .state
             .activity_calls
@@ -592,7 +627,8 @@ impl BackendTransaction for MemoryTransaction {
                         || (call.state == CallState::InProgress
                             && call
                                 .lease_expires_at_ms
-                                .is_some_and(|expires| expires <= now)))
+                                .is_some_and(|expires| expires <= now)
+                            && call.attempt_count < call.retry_policy.max_attempts))
             })
             .min_by_key(|(_, call)| (call.available_at_ms, call.created_seq, call.id))
             .map(|(id, _)| *id);
@@ -681,25 +717,7 @@ impl BackendTransaction for MemoryTransaction {
         workflow_run_id: WorkflowRunId,
         step_index: usize,
     ) -> Result<(), Self::Error> {
-        let now = self.state.now_ms;
-        let mut changed = false;
-        for ((queue, _), row) in &mut self.state.tasks {
-            if queue == queue_name
-                && row.state == TaskState::Waiting
-                && workflow_run_id_from_input(&row.input) == Some(workflow_run_id)
-                && row
-                    .input
-                    .get("step_index")
-                    .and_then(serde_json::Value::as_u64)
-                    == Some(step_index as u64)
-            {
-                row.state = TaskState::Pending;
-                row.run_at_ms = now;
-                row.lease_expires_at_ms = None;
-                changed = true;
-            }
-        }
-        if changed {
+        if wake_waiting_workflow_task(&mut self.state, queue_name, workflow_run_id, step_index) {
             self.task_changed = true;
         }
         Ok(())
@@ -745,6 +763,33 @@ fn terminalize_stale_exhausted(state: &mut State, queue_name: &str) -> Result<()
         }
     }
     Ok(())
+}
+
+fn wake_waiting_workflow_task(
+    state: &mut State,
+    queue_name: &str,
+    workflow_run_id: WorkflowRunId,
+    step_index: usize,
+) -> bool {
+    let now = state.now_ms;
+    let mut changed = false;
+    for ((queue, _), row) in &mut state.tasks {
+        if queue == queue_name
+            && row.state == TaskState::Waiting
+            && workflow_run_id_from_input(&row.input) == Some(workflow_run_id)
+            && row
+                .input
+                .get("step_index")
+                .and_then(serde_json::Value::as_u64)
+                == Some(step_index as u64)
+        {
+            row.state = TaskState::Pending;
+            row.run_at_ms = now;
+            row.lease_expires_at_ms = None;
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn claimed_task_row<'a>(state: &'a mut State, task: &ClaimedTask) -> Option<&'a mut TaskRow> {
@@ -1036,6 +1081,17 @@ mod tests {
     async fn satisfies_activity_retry_and_replay_fencing_contract() {
         let backend = MemoryBackend::new();
         underway_core::contracts::activity_retry_and_replay_fencing(
+            backend.clone(),
+            advance_clock(backend),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn satisfies_activity_stale_exhaustion_wakes_workflow_contract() {
+        let backend = MemoryBackend::new();
+        underway_core::contracts::activity_stale_exhaustion_wakes_workflow(
             backend.clone(),
             advance_clock(backend),
         )
