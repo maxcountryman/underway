@@ -1,0 +1,27 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            insert into underway.task (\n              id,\n              task_queue_name,\n              input,\n              timeout,\n              heartbeat,\n              ttl,\n              delay,\n              run_at,\n              retry_policy,\n              concurrency_key,\n              priority\n            ) values (\n              $1,\n              $2,\n              $3,\n              $4,\n              $5,\n              $6,\n              $7,\n              now() + $7,\n              row($8, $9, $10, $11, $12)::underway.task_retry_policy,\n              $13,\n              $14\n            )\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Jsonb",
+        "Interval",
+        "Interval",
+        "Interval",
+        "Interval",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Float8",
+        "Float8",
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "91eee972966da9d72a36000dd0ca21ffe34cfaa552659eaefd7b5818c7d2469e"
+}

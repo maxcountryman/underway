@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        update underway.task\n        set updated_at = now()\n        where id = $1\n          and task_queue_name = $2\n          and current_attempt = $3\n          and state = 'in_progress'::underway.task_state\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "42cecdba941c018948b8d4db64298f3419e4d1cf029ffa3f17da71ce9f04a459"
+}

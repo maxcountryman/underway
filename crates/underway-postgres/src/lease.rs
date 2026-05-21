@@ -15,10 +15,12 @@ impl SchedulerLease for PostgresSchedulerLease<'_> {
 
     async fn release(&mut self) -> Result<(), Self::Error> {
         if let Some(mut conn) = self.conn.take() {
-            sqlx::query("select pg_advisory_unlock(hashtextextended($1, 0))")
-                .bind(&self.key)
-                .execute(&mut *conn)
-                .await?;
+            sqlx::query_scalar!(
+                r#"select pg_advisory_unlock(hashtextextended($1, 0)) as "unlocked!""#,
+                &self.key,
+            )
+            .fetch_one(&mut *conn)
+            .await?;
         }
         Ok(())
     }

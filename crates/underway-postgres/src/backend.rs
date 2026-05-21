@@ -34,10 +34,10 @@ impl PostgresBackend {
     /// Runs Underway migrations in the `underway` schema.
     pub async fn run_migrations(&self) -> Result<(), Error> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query("create schema if not exists underway;")
+        sqlx::query!("create schema if not exists underway;")
             .execute(&mut *tx)
             .await?;
-        sqlx::query("set local search_path to underway;")
+        sqlx::query!("set local search_path to underway;")
             .execute(&mut *tx)
             .await?;
         MIGRATOR.run(&mut *tx).await?;
@@ -58,7 +58,7 @@ impl Backend for PostgresBackend {
     }
 
     async fn record_heartbeat(&self, task: &ClaimedTask) -> Result<(), Self::Error> {
-        sqlx::query(
+        sqlx::query!(
             r#"
             update underway.task
             set updated_at = now(),
@@ -69,10 +69,10 @@ impl Backend for PostgresBackend {
               and current_attempt = $3
               and state = 'in_progress'::underway.task_state
             "#,
+            task.id.as_uuid(),
+            &task.queue_name,
+            task.attempt_number,
         )
-        .bind(task.id.as_uuid())
-        .bind(&task.queue_name)
-        .bind(task.attempt_number)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -84,11 +84,12 @@ impl Backend for PostgresBackend {
     ) -> Result<Option<Self::SchedulerLease<'_>>, Self::Error> {
         let mut conn = self.pool.acquire().await?;
         let key = format!("{queue_name}-scheduler");
-        let acquired: bool =
-            sqlx::query_scalar("select pg_try_advisory_lock(hashtextextended($1, 0))")
-                .bind(&key)
-                .fetch_one(&mut *conn)
-                .await?;
+        let acquired = sqlx::query_scalar!(
+            r#"select pg_try_advisory_lock(hashtextextended($1, 0)) as "acquired!""#,
+            &key,
+        )
+        .fetch_one(&mut *conn)
+        .await?;
 
         if !acquired {
             return Ok(None);

@@ -15,9 +15,6 @@ mod lease;
 mod rows;
 mod transaction;
 
-#[cfg(all(test, feature = "contracts"))]
-mod tests;
-
 pub use backend::PostgresBackend;
 pub use error::Error;
 pub use lease::PostgresSchedulerLease;

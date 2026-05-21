@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            delete from underway.task\n            where state in (\n                'succeeded'::underway.task_state,\n                'cancelled'::underway.task_state,\n                'failed'::underway.task_state\n            )\n              and created_at + ttl < now()\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "b6dee5d31bb988a6c221c86bd936d9902b8c66c0992fc467ab42961be7036374"
+}

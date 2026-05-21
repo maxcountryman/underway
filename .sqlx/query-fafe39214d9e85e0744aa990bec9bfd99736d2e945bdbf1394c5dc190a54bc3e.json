@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            insert into underway.activity_call (\n                id,\n                task_queue_name,\n                workflow_run_id,\n                step_index,\n                call_key,\n                activity,\n                input,\n                timeout_ms,\n                max_attempts,\n                state\n            ) values (\n                $1,\n                $2,\n                $3,\n                $4,\n                $5,\n                $6,\n                $7,\n                $8,\n                $9,\n                'pending'::underway.activity_call_state\n            )\n            on conflict (task_queue_name, workflow_run_id, step_index, call_key) do nothing\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Uuid",
+        "Int4",
+        "Text",
+        "Text",
+        "Jsonb",
+        "Int4",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "fafe39214d9e85e0744aa990bec9bfd99736d2e945bdbf1394c5dc190a54bc3e"
+}

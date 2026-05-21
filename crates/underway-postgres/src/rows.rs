@@ -1,10 +1,7 @@
 use std::time::Duration;
 
 use jiff::{Span, ToSpan};
-use sqlx::{
-    postgres::{types::PgInterval, PgRow},
-    Row,
-};
+use sqlx::postgres::types::PgInterval;
 use underway_core::{
     activity::CallState,
     backend::{ActivityCallRecord, ClaimedActivityCall, ClaimedTask},
@@ -15,61 +12,94 @@ use uuid::Uuid;
 
 use crate::Error;
 
-pub(crate) fn claimed_task_from_row(row: PgRow) -> Result<ClaimedTask, Error> {
-    let id: Uuid = row.try_get("id")?;
-    let timeout: PgInterval = row.try_get("timeout")?;
-    let heartbeat: PgInterval = row.try_get("heartbeat")?;
-    let ttl: PgInterval = row.try_get("ttl")?;
-    let delay: PgInterval = row.try_get("delay")?;
+pub(crate) struct ClaimedTaskRow {
+    pub(crate) id: Uuid,
+    pub(crate) task_queue_name: String,
+    pub(crate) input: serde_json::Value,
+    pub(crate) timeout: PgInterval,
+    pub(crate) heartbeat: PgInterval,
+    pub(crate) ttl: PgInterval,
+    pub(crate) delay: PgInterval,
+    pub(crate) retry_max_attempts: i32,
+    pub(crate) retry_initial_interval_ms: i32,
+    pub(crate) retry_max_interval_ms: i32,
+    pub(crate) retry_backoff_coefficient: f64,
+    pub(crate) retry_jitter_factor: f64,
+    pub(crate) concurrency_key: Option<String>,
+    pub(crate) priority: i32,
+    pub(crate) current_attempt: i32,
+}
+
+pub(crate) fn claimed_task_from_row(row: ClaimedTaskRow) -> Result<ClaimedTask, Error> {
     Ok(ClaimedTask {
-        id: TaskId::from_uuid(id),
-        queue_name: row.try_get("task_queue_name")?,
-        input: row.try_get("input")?,
+        id: TaskId::from_uuid(row.id),
+        queue_name: row.task_queue_name,
+        input: row.input,
         config: TaskConfig::builder()
             .retry_policy(task::RetryPolicy {
-                max_attempts: row.try_get("retry_max_attempts")?,
-                initial_interval_ms: row.try_get("retry_initial_interval_ms")?,
-                max_interval_ms: row.try_get("retry_max_interval_ms")?,
-                backoff_coefficient: row.try_get("retry_backoff_coefficient")?,
-                jitter_factor: row.try_get("retry_jitter_factor")?,
+                max_attempts: row.retry_max_attempts,
+                initial_interval_ms: row.retry_initial_interval_ms,
+                max_interval_ms: row.retry_max_interval_ms,
+                backoff_coefficient: row.retry_backoff_coefficient,
+                jitter_factor: row.retry_jitter_factor,
             })
-            .timeout(span_from_interval(timeout))
-            .ttl(span_from_interval(ttl))
-            .delay(span_from_interval(delay))
-            .heartbeat(span_from_interval(heartbeat))
-            .maybe_concurrency_key(row.try_get("concurrency_key")?)
-            .priority(row.try_get("priority")?)
+            .timeout(span_from_interval(row.timeout))
+            .ttl(span_from_interval(row.ttl))
+            .delay(span_from_interval(row.delay))
+            .heartbeat(span_from_interval(row.heartbeat))
+            .maybe_concurrency_key(row.concurrency_key)
+            .priority(row.priority)
             .build()?,
-        attempt_number: row.try_get("current_attempt")?,
+        attempt_number: row.current_attempt,
     })
 }
 
-pub(crate) fn activity_record_from_row(row: PgRow) -> Result<ActivityCallRecord, Error> {
-    let state: String = row.try_get("state")?;
+pub(crate) struct ActivityRecordRow {
+    pub(crate) call_key: String,
+    pub(crate) activity: String,
+    pub(crate) input: serde_json::Value,
+    pub(crate) output: Option<serde_json::Value>,
+    pub(crate) error: Option<serde_json::Value>,
+    pub(crate) state: String,
+}
+
+pub(crate) fn activity_record_from_row(
+    row: ActivityRecordRow,
+) -> Result<ActivityCallRecord, Error> {
     Ok(ActivityCallRecord {
-        call_key: row.try_get("call_key")?,
-        activity: row.try_get("activity")?,
-        input: row.try_get("input")?,
-        output: row.try_get("output")?,
-        error: row.try_get("error")?,
-        state: call_state(&state)?,
+        call_key: row.call_key,
+        activity: row.activity,
+        input: row.input,
+        output: row.output,
+        error: row.error,
+        state: call_state(&row.state)?,
     })
 }
 
-pub(crate) fn claimed_activity_from_row(row: PgRow) -> Result<ClaimedActivityCall, Error> {
-    let workflow_run_id: Uuid = row.try_get("workflow_run_id")?;
-    let step_index: i32 = row.try_get("step_index")?;
-    let attempt_count: i32 = row.try_get("attempt_count")?;
+pub(crate) struct ClaimedActivityRow {
+    pub(crate) id: Uuid,
+    pub(crate) task_queue_name: String,
+    pub(crate) workflow_run_id: Uuid,
+    pub(crate) step_index: i32,
+    pub(crate) call_key: String,
+    pub(crate) activity: String,
+    pub(crate) input: serde_json::Value,
+    pub(crate) attempt_count: i32,
+}
+
+pub(crate) fn claimed_activity_from_row(
+    row: ClaimedActivityRow,
+) -> Result<ClaimedActivityCall, Error> {
     Ok(ClaimedActivityCall {
-        id: row.try_get("id")?,
-        queue_name: row.try_get("task_queue_name")?,
-        workflow_run_id: WorkflowRunId::from_uuid(workflow_run_id),
-        step_index: step_index as usize,
-        call_key: row.try_get("call_key")?,
-        activity: row.try_get("activity")?,
-        input: row.try_get("input")?,
-        attempt_count,
-        attempt_number: attempt_count,
+        id: row.id,
+        queue_name: row.task_queue_name,
+        workflow_run_id: WorkflowRunId::from_uuid(row.workflow_run_id),
+        step_index: row.step_index as usize,
+        call_key: row.call_key,
+        activity: row.activity,
+        input: row.input,
+        attempt_count: row.attempt_count,
+        attempt_number: row.attempt_count,
     })
 }
 

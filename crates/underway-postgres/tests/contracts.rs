@@ -1,3 +1,5 @@
+#![cfg(feature = "contracts")]
+
 use std::time::Duration as StdDuration;
 
 use jiff::Span;
@@ -11,8 +13,7 @@ use underway_core::{
     task::{RetryPolicy, TaskConfig},
     WorkflowRunId,
 };
-
-use crate::PostgresBackend;
+use underway_postgres::PostgresBackend;
 
 async fn setup(pool: PgPool) -> PostgresBackend {
     let backend = PostgresBackend::from_pool(pool);
@@ -26,6 +27,7 @@ async fn sleep_for(span: Span) -> Result<(), jiff::Error> {
 }
 
 #[sqlx::test(migrations = false)]
+#[ignore = "requires live Postgres"]
 async fn satisfies_transaction_commit_and_rollback_contract(pool: PgPool) {
     core_contracts::transaction_commit_and_rollback(setup(pool).await)
         .await
@@ -33,6 +35,7 @@ async fn satisfies_transaction_commit_and_rollback_contract(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+#[ignore = "requires live Postgres"]
 async fn satisfies_scheduler_lease_exclusivity_contract(pool: PgPool) {
     core_contracts::scheduler_lease_exclusivity(setup(pool).await)
         .await
@@ -40,6 +43,7 @@ async fn satisfies_scheduler_lease_exclusivity_contract(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+#[ignore = "requires live Postgres"]
 async fn scheduler_lease_drop_allows_reacquire(pool: PgPool) {
     let backend = setup(pool).await;
     let queue_name = format!("postgres-drop-lease-{}", uuid::Uuid::new_v4());
@@ -63,6 +67,7 @@ async fn scheduler_lease_drop_allows_reacquire(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+#[ignore = "requires live Postgres"]
 async fn concurrent_scheduler_lease_race_allows_one_winner(pool: PgPool) {
     let backend = setup(pool).await;
     let queue_name = format!("postgres-race-lease-{}", uuid::Uuid::new_v4());
@@ -80,6 +85,7 @@ async fn concurrent_scheduler_lease_race_allows_one_winner(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+#[ignore = "requires live Postgres"]
 async fn satisfies_heartbeat_extends_task_lease_contract(pool: PgPool) {
     core_contracts::heartbeat_extends_task_lease(setup(pool).await, sleep_for)
         .await
@@ -87,6 +93,7 @@ async fn satisfies_heartbeat_extends_task_lease_contract(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+#[ignore = "requires live Postgres"]
 async fn satisfies_concurrent_worker_claim_exclusivity_contract(pool: PgPool) {
     core_contracts::concurrent_worker_claim_exclusivity(setup(pool).await)
         .await
@@ -94,6 +101,7 @@ async fn satisfies_concurrent_worker_claim_exclusivity_contract(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+#[ignore = "requires live Postgres"]
 async fn satisfies_delete_expired_removes_only_terminal_work_contract(pool: PgPool) {
     core_contracts::delete_expired_removes_only_terminal_work(setup(pool).await, sleep_for)
         .await
@@ -101,6 +109,7 @@ async fn satisfies_delete_expired_removes_only_terminal_work_contract(pool: PgPo
 }
 
 #[sqlx::test(migrations = false)]
+#[ignore = "requires live Postgres"]
 async fn satisfies_queue_ordering_and_retry_contract(pool: PgPool) {
     core_contracts::queue_ordering_and_retry(setup(pool).await)
         .await
@@ -108,6 +117,7 @@ async fn satisfies_queue_ordering_and_retry_contract(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+#[ignore = "requires live Postgres"]
 async fn satisfies_concurrency_key_exclusivity_contract(pool: PgPool) {
     core_contracts::concurrency_key_exclusivity(setup(pool).await)
         .await
@@ -115,6 +125,7 @@ async fn satisfies_concurrency_key_exclusivity_contract(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+#[ignore = "requires live Postgres"]
 async fn satisfies_activity_call_idempotency_contract(pool: PgPool) {
     core_contracts::activity_call_idempotency(setup(pool).await)
         .await
@@ -122,6 +133,7 @@ async fn satisfies_activity_call_idempotency_contract(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+#[ignore = "requires live Postgres"]
 async fn satisfies_delayed_availability_contract(pool: PgPool) {
     core_contracts::delayed_availability(setup(pool).await, sleep_for)
         .await
@@ -129,6 +141,7 @@ async fn satisfies_delayed_availability_contract(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+#[ignore = "requires live Postgres"]
 async fn satisfies_retry_delay_and_stale_lease_reclaim_contract(pool: PgPool) {
     core_contracts::retry_delay_and_stale_lease_reclaim(setup(pool).await, sleep_for)
         .await
@@ -136,6 +149,7 @@ async fn satisfies_retry_delay_and_stale_lease_reclaim_contract(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+#[ignore = "requires live Postgres"]
 async fn satisfies_attempt_fencing_contract(pool: PgPool) {
     core_contracts::attempt_fencing(setup(pool).await)
         .await
@@ -143,6 +157,7 @@ async fn satisfies_attempt_fencing_contract(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+#[ignore = "requires live Postgres"]
 async fn stale_task_transition_does_not_mutate_attempt_row(pool: PgPool) {
     let backend = setup(pool.clone()).await;
     let queue_name = format!("postgres-stale-attempt-{}", uuid::Uuid::new_v4());
@@ -196,11 +211,13 @@ async fn stale_task_transition_does_not_mutate_attempt_row(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+#[ignore = "requires live Postgres"]
 async fn satisfies_dlq_move_contract(pool: PgPool) {
     core_contracts::dlq_move(setup(pool).await).await.unwrap();
 }
 
 #[sqlx::test(migrations = false)]
+#[ignore = "requires live Postgres"]
 async fn satisfies_failed_task_moves_to_claimable_dlq_contract(pool: PgPool) {
     core_contracts::failed_task_moves_to_claimable_dlq(setup(pool).await)
         .await
@@ -208,6 +225,7 @@ async fn satisfies_failed_task_moves_to_claimable_dlq_contract(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+#[ignore = "requires live Postgres"]
 async fn satisfies_schedule_round_trip_contract(pool: PgPool) {
     core_contracts::schedule_round_trip(setup(pool).await)
         .await
@@ -215,6 +233,7 @@ async fn satisfies_schedule_round_trip_contract(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+#[ignore = "requires live Postgres"]
 async fn satisfies_cancellation_contract(pool: PgPool) {
     core_contracts::cancellation(setup(pool).await)
         .await
@@ -222,6 +241,7 @@ async fn satisfies_cancellation_contract(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+#[ignore = "requires live Postgres"]
 async fn satisfies_activity_retry_and_replay_fencing_contract(pool: PgPool) {
     core_contracts::activity_retry_and_replay_fencing(setup(pool).await, sleep_for)
         .await
@@ -229,6 +249,7 @@ async fn satisfies_activity_retry_and_replay_fencing_contract(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+#[ignore = "requires live Postgres"]
 async fn stale_activity_reclaim_finalizes_previous_attempt(pool: PgPool) {
     let backend = setup(pool.clone()).await;
     let queue_name = format!("postgres-stale-activity-{}", uuid::Uuid::new_v4());
@@ -295,6 +316,7 @@ async fn stale_activity_reclaim_finalizes_previous_attempt(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+#[ignore = "requires live Postgres"]
 async fn exhausted_stale_activity_fails_and_wakes_workflow(pool: PgPool) {
     let backend = setup(pool.clone()).await;
     let queue_name = format!("postgres-exhausted-activity-{}", uuid::Uuid::new_v4());
@@ -389,6 +411,7 @@ async fn exhausted_stale_activity_fails_and_wakes_workflow(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+#[ignore = "requires live Postgres"]
 async fn satisfies_workflow_wait_and_resume_contract(pool: PgPool) {
     core_contracts::workflow_wait_and_resume(setup(pool).await)
         .await

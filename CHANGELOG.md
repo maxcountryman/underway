@@ -24,6 +24,9 @@
   `underway-postgres`, then the `underway` facade. SQLx query metadata remains
   scoped to `underway-postgres`; Postgres correctness is covered by live
   backend contract and integration tests.
+- Fix: Restore SQLx offline builds for Postgres queries with checked query
+  metadata, and move live Postgres contract coverage into an explicit ignored
+  integration test target.
 - Breaking: Remove `workflow::Context::tx`; step contexts no longer expose a worker transaction directly
 - Breaking: Workflow activities are now registered on `Workflow::builder()` before steps
 - Breaking: Remove manual activity keys; operation identity is now derived from workflow run ID, step index, and per-step operation order

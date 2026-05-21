@@ -1,0 +1,66 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            with stale_exhausted as (\n                select\n                    c.id,\n                    c.task_queue_name,\n                    c.workflow_run_id,\n                    c.step_index,\n                    c.attempt_count\n                from underway.activity_call c\n                where c.task_queue_name = $1\n                  and c.activity = any($2::text[])\n                  and c.state = 'in_progress'::underway.activity_call_state\n                  and c.lease_expires_at is not null\n                  and c.lease_expires_at <= now()\n                  and c.attempt_count >= c.max_attempts\n                for update skip locked\n            ),\n            finalized_exhausted_attempts as (\n                update underway.activity_call_attempt a\n                set state = 'failed'::underway.activity_call_state,\n                    error = coalesce(a.error, $3),\n                    updated_at = now(),\n                    completed_at = now()\n                from stale_exhausted se\n                where a.activity_call_id = se.id\n                  and a.attempt_number = se.attempt_count\n                  and a.state = 'in_progress'::underway.activity_call_state\n            ),\n            failed_exhausted as (\n                update underway.activity_call c\n                set state = 'failed'::underway.activity_call_state,\n                    error = $3,\n                    updated_at = now(),\n                    completed_at = now(),\n                    lease_expires_at = null\n                from stale_exhausted se\n                where c.id = se.id\n                returning c.task_queue_name, c.workflow_run_id, c.step_index\n            ),\n            woken_workflows as (\n                update underway.task t\n                set state = 'pending'::underway.task_state,\n                    run_at = now(),\n                    lease_expires_at = null,\n                    updated_at = now()\n                from failed_exhausted f\n                where t.task_queue_name = f.task_queue_name\n                  and t.state = 'waiting'::underway.task_state\n                  and (t.input->>'workflow_run_id')::uuid = f.workflow_run_id\n                  and (t.input->>'step_index')::integer = f.step_index\n            ),\n            recovered as (\n                select count(*) from failed_exhausted\n            ),\n            next_call as (\n                select c.id\n                from underway.activity_call c\n                cross join recovered\n                where c.task_queue_name = $1\n                  and c.activity = any($2::text[])\n                  and (\n                    (c.state = 'pending'::underway.activity_call_state and c.available_at <= now())\n                    or (\n                        c.state = 'in_progress'::underway.activity_call_state\n                        and c.lease_expires_at is not null\n                        and c.lease_expires_at <= now()\n                        and c.attempt_count < c.max_attempts\n                    )\n                  )\n                order by c.available_at, c.created_at, c.id\n                limit 1\n                for update skip locked\n            ),\n            claimed as (\n                update underway.activity_call c\n                set state = 'in_progress'::underway.activity_call_state,\n                    attempt_count = c.attempt_count + 1,\n                    updated_at = now(),\n                    started_at = now(),\n                    lease_expires_at =\n                        now() + ((c.timeout_ms::bigint + 30000) * interval '1 millisecond')\n                from next_call\n                where c.id = next_call.id\n                returning\n                    c.id,\n                    c.task_queue_name,\n                    c.workflow_run_id,\n                    c.step_index,\n                    c.call_key,\n                    c.activity,\n                    c.input,\n                    c.attempt_count\n            ),\n            finalized_previous_attempt as (\n                update underway.activity_call_attempt a\n                set state = 'failed'::underway.activity_call_state,\n                    error = coalesce(\n                        a.error,\n                        jsonb_build_object(\n                            'code', 'activity_lease_reclaimed',\n                            'message', 'Activity lease expired and was reclaimed by another worker.',\n                            'retryable', true,\n                            'details', null\n                        )\n                    ),\n                    updated_at = now(),\n                    completed_at = now()\n                from claimed c\n                where c.attempt_count > 1\n                  and a.activity_call_id = c.id\n                  and a.attempt_number = c.attempt_count - 1\n                  and a.state = 'in_progress'::underway.activity_call_state\n            ),\n            attempt as (\n                insert into underway.activity_call_attempt (\n                    activity_call_id,\n                    attempt_number,\n                    state\n                )\n                select\n                    claimed.id,\n                    claimed.attempt_count,\n                    'in_progress'::underway.activity_call_state\n                from claimed\n                on conflict (activity_call_id, attempt_number)\n                do update set\n                    state = 'in_progress'::underway.activity_call_state,\n                    error = null,\n                    started_at = now(),\n                    updated_at = now(),\n                    completed_at = null\n            )\n            select\n                id as \"id!: Uuid\",\n                task_queue_name,\n                workflow_run_id as \"workflow_run_id!: Uuid\",\n                step_index,\n                call_key,\n                activity,\n                input,\n                attempt_count\n            from claimed\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!: Uuid",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "task_queue_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "workflow_run_id!: Uuid",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "step_index",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "call_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "activity",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "input",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 7,
+        "name": "attempt_count",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "TextArray",
+        "Jsonb"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "20bab8056060b7051564b485dc297690fdbb41ec6461fda2777694ec2eeedd81"
+}

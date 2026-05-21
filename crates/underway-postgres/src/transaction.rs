@@ -1,5 +1,5 @@
 use jiff::Span;
-use sqlx::{Postgres, Row, Transaction};
+use sqlx::{Postgres, Transaction};
 use underway_core::{
     activity,
     backend::{
@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::{
     rows::{
         activity_record_from_row, claimed_activity_from_row, claimed_task_from_row,
-        duration_ms_i32, pg_interval,
+        duration_ms_i32, pg_interval, ActivityRecordRow, ClaimedActivityRow, ClaimedTaskRow,
     },
     Error,
 };
@@ -43,38 +43,38 @@ impl BackendTransaction for PostgresTransaction<'_> {
         name: &str,
         dlq_name: Option<&str>,
     ) -> Result<(), Self::Error> {
-        sqlx::query(
+        sqlx::query!(
             r#"
             insert into underway.task_queue (name)
             values ($1)
             on conflict do nothing
             "#,
+            name,
         )
-        .bind(name)
         .execute(&mut *self.inner)
         .await?;
 
         if let Some(dlq_name) = dlq_name {
-            sqlx::query(
+            sqlx::query!(
                 r#"
                 insert into underway.task_queue (name)
                 values ($1)
                 on conflict do nothing
                 "#,
+                dlq_name,
             )
-            .bind(dlq_name)
             .execute(&mut *self.inner)
             .await?;
 
-            sqlx::query(
+            sqlx::query!(
                 r#"
                 update underway.task_queue
                 set dlq_name = $2
                 where name = $1
                 "#,
+                name,
+                dlq_name,
             )
-            .bind(name)
-            .bind(dlq_name)
             .execute(&mut *self.inner)
             .await?;
         }
@@ -89,7 +89,15 @@ impl BackendTransaction for PostgresTransaction<'_> {
     ) -> Result<TaskId, Self::Error> {
         let id = TaskId::new();
         let delay = task.config.delay().checked_add(task.delay)?;
-        sqlx::query(
+        let input = task.input;
+        let timeout = pg_interval(task.config.timeout())?;
+        let heartbeat = pg_interval(task.config.heartbeat())?;
+        let ttl = pg_interval(task.config.ttl())?;
+        let delay = pg_interval(delay)?;
+        let retry_policy = task.config.retry_policy();
+        let concurrency_key = task.config.concurrency_key();
+        let priority = task.config.priority();
+        sqlx::query!(
             r#"
             insert into underway.task (
               id,
@@ -117,21 +125,21 @@ impl BackendTransaction for PostgresTransaction<'_> {
               $14
             )
             "#,
+            id.as_uuid(),
+            queue_name,
+            input,
+            timeout,
+            heartbeat,
+            ttl,
+            delay,
+            retry_policy.max_attempts,
+            retry_policy.initial_interval_ms,
+            retry_policy.max_interval_ms,
+            retry_policy.backoff_coefficient,
+            retry_policy.jitter_factor,
+            concurrency_key,
+            priority,
         )
-        .bind(id.as_uuid())
-        .bind(queue_name)
-        .bind(task.input)
-        .bind(pg_interval(task.config.timeout())?)
-        .bind(pg_interval(task.config.heartbeat())?)
-        .bind(pg_interval(task.config.ttl())?)
-        .bind(pg_interval(delay)?)
-        .bind(task.config.retry_policy().max_attempts)
-        .bind(task.config.retry_policy().initial_interval_ms)
-        .bind(task.config.retry_policy().max_interval_ms)
-        .bind(task.config.retry_policy().backoff_coefficient)
-        .bind(task.config.retry_policy().jitter_factor)
-        .bind(task.config.concurrency_key())
-        .bind(task.config.priority())
         .execute(&mut *self.inner)
         .await?;
         Ok(id)
@@ -140,7 +148,8 @@ impl BackendTransaction for PostgresTransaction<'_> {
     async fn claim_task(&mut self, queue_name: &str) -> Result<Option<ClaimedTask>, Self::Error> {
         fail_stale_exhausted(&mut self.inner, queue_name).await?;
 
-        let row = sqlx::query(
+        let row = sqlx::query_as!(
+            ClaimedTaskRow,
             r#"
             with available_task as (
                 select id
@@ -225,10 +234,26 @@ impl BackendTransaction for PostgresTransaction<'_> {
                     updated_at = now(),
                     completed_at = null
             )
-            select * from claimed
+            select
+                id as "id!: Uuid",
+                task_queue_name,
+                input,
+                timeout,
+                heartbeat,
+                ttl,
+                delay,
+                retry_max_attempts as "retry_max_attempts!: i32",
+                retry_initial_interval_ms as "retry_initial_interval_ms!: i32",
+                retry_max_interval_ms as "retry_max_interval_ms!: i32",
+                retry_backoff_coefficient as "retry_backoff_coefficient!: f64",
+                retry_jitter_factor as "retry_jitter_factor!: f64",
+                concurrency_key,
+                priority,
+                current_attempt
+            from claimed
             "#,
+            queue_name,
         )
-        .bind(queue_name)
         .fetch_optional(&mut *self.inner)
         .await?;
 
@@ -293,7 +318,8 @@ impl BackendTransaction for PostgresTransaction<'_> {
         task: &ClaimedTask,
         delay: Span,
     ) -> Result<TransitionResult, Self::Error> {
-        let result = sqlx::query(
+        let delay = pg_interval(delay)?;
+        let result = sqlx::query!(
             r#"
             update underway.task
             set state = 'pending'::underway.task_state,
@@ -306,11 +332,11 @@ impl BackendTransaction for PostgresTransaction<'_> {
               and current_attempt = $4
               and state = 'in_progress'::underway.task_state
             "#,
+            task.id.as_uuid(),
+            delay,
+            &task.queue_name,
+            task.attempt_number,
         )
-        .bind(task.id.as_uuid())
-        .bind(pg_interval(delay)?)
-        .bind(&task.queue_name)
-        .bind(task.attempt_number)
         .execute(&mut *self.inner)
         .await?;
         let transition = apply_result(result.rows_affected());
@@ -345,7 +371,7 @@ impl BackendTransaction for PostgresTransaction<'_> {
         from_queue: &str,
         dlq_name: &str,
     ) -> Result<TransitionResult, Self::Error> {
-        let moved = sqlx::query_scalar::<_, i64>(
+        let moved = sqlx::query_scalar!(
             r#"
             with moved_task as (
                 update underway.task
@@ -376,12 +402,12 @@ impl BackendTransaction for PostgresTransaction<'_> {
                   and task_queue_name = $3
                   and exists (select 1 from moved_task)
             )
-            select count(*)::bigint from moved_task
+            select count(*)::bigint as "moved!" from moved_task
             "#,
+            task_id.as_uuid(),
+            dlq_name,
+            from_queue,
         )
-        .bind(task_id.as_uuid())
-        .bind(dlq_name)
-        .bind(from_queue)
         .fetch_one(&mut *self.inner)
         .await?;
         Ok(apply_result(moved as u64))
@@ -392,7 +418,7 @@ impl BackendTransaction for PostgresTransaction<'_> {
         queue_name: &str,
         workflow_run_id: WorkflowRunId,
     ) -> Result<bool, Self::Error> {
-        let result = sqlx::query(
+        let result = sqlx::query!(
             r#"
             update underway.task
             set state = 'cancelled'::underway.task_state,
@@ -403,9 +429,9 @@ impl BackendTransaction for PostgresTransaction<'_> {
               and state = 'pending'::underway.task_state
               and (input->>'workflow_run_id')::uuid = $2
             "#,
+            queue_name,
+            workflow_run_id.as_uuid(),
         )
-        .bind(queue_name)
-        .bind(workflow_run_id.as_uuid())
         .execute(&mut *self.inner)
         .await?;
         Ok(result.rows_affected() > 0)
@@ -417,7 +443,7 @@ impl BackendTransaction for PostgresTransaction<'_> {
         schedule: ZonedSchedule,
         input: serde_json::Value,
     ) -> Result<(), Self::Error> {
-        sqlx::query(
+        sqlx::query!(
             r#"
             insert into underway.task_schedule (
               task_queue_name,
@@ -430,21 +456,23 @@ impl BackendTransaction for PostgresTransaction<'_> {
                 timezone = excluded.timezone,
                 input = excluded.input
             "#,
+            queue_name,
+            schedule.cron_expr(),
+            schedule.iana_name(),
+            input,
         )
-        .bind(queue_name)
-        .bind(schedule.cron_expr())
-        .bind(schedule.iana_name())
-        .bind(input)
         .execute(&mut *self.inner)
         .await?;
         Ok(())
     }
 
     async fn unschedule_task(&mut self, queue_name: &str) -> Result<(), Self::Error> {
-        sqlx::query("delete from underway.task_schedule where task_queue_name = $1")
-            .bind(queue_name)
-            .execute(&mut *self.inner)
-            .await?;
+        sqlx::query!(
+            "delete from underway.task_schedule where task_queue_name = $1",
+            queue_name,
+        )
+        .execute(&mut *self.inner)
+        .await?;
         Ok(())
     }
 
@@ -452,21 +480,24 @@ impl BackendTransaction for PostgresTransaction<'_> {
         &mut self,
         queue_name: &str,
     ) -> Result<Option<StoredSchedule>, Self::Error> {
-        let row = sqlx::query(
-            "select schedule, timezone, input from underway.task_schedule where task_queue_name = \
-             $1",
+        let row = sqlx::query!(
+            r#"
+            select schedule, timezone, input as "input!: serde_json::Value"
+            from underway.task_schedule
+            where task_queue_name = $1
+            "#,
+            queue_name,
         )
-        .bind(queue_name)
         .fetch_optional(&mut *self.inner)
         .await?;
 
         row.map(|row| {
-            let schedule: String = row.try_get("schedule")?;
-            let timezone: String = row.try_get("timezone")?;
-            let input: serde_json::Value = row.try_get("input")?;
-            let schedule = ZonedSchedule::new(&schedule, &timezone)
+            let schedule = ZonedSchedule::new(&row.schedule, &row.timezone)
                 .map_err(|err| Error::NotFound(err.to_string()))?;
-            Ok(StoredSchedule { schedule, input })
+            Ok(StoredSchedule {
+                schedule,
+                input: row.input,
+            })
         })
         .transpose()
     }
@@ -477,18 +508,25 @@ impl BackendTransaction for PostgresTransaction<'_> {
         workflow_run_id: WorkflowRunId,
         step_index: usize,
     ) -> Result<Vec<ActivityCallRecord>, Self::Error> {
-        let rows = sqlx::query(
+        let rows = sqlx::query_as!(
+            ActivityRecordRow,
             r#"
-            select call_key, activity, input, output, error, state::text as state
+            select
+                call_key,
+                activity,
+                input,
+                output,
+                error,
+                state::text as "state!: String"
             from underway.activity_call
             where task_queue_name = $1
               and workflow_run_id = $2
               and step_index = $3
             "#,
+            queue_name,
+            workflow_run_id.as_uuid(),
+            step_index as i32,
         )
-        .bind(queue_name)
-        .bind(workflow_run_id.as_uuid())
-        .bind(step_index as i32)
         .fetch_all(&mut *self.inner)
         .await?;
 
@@ -502,7 +540,8 @@ impl BackendTransaction for PostgresTransaction<'_> {
         step_index: usize,
         command: ActivityCallCommand,
     ) -> Result<(), Self::Error> {
-        sqlx::query(
+        let timeout_ms = duration_ms_i32(command.timeout)?;
+        sqlx::query!(
             r#"
             insert into underway.activity_call (
                 id,
@@ -529,16 +568,16 @@ impl BackendTransaction for PostgresTransaction<'_> {
             )
             on conflict (task_queue_name, workflow_run_id, step_index, call_key) do nothing
             "#,
+            Uuid::new_v4(),
+            queue_name,
+            workflow_run_id.as_uuid(),
+            step_index as i32,
+            command.call_key,
+            command.activity,
+            command.input,
+            timeout_ms,
+            command.retry_policy.max_attempts,
         )
-        .bind(Uuid::new_v4())
-        .bind(queue_name)
-        .bind(workflow_run_id.as_uuid())
-        .bind(step_index as i32)
-        .bind(command.call_key)
-        .bind(command.activity)
-        .bind(command.input)
-        .bind(duration_ms_i32(command.timeout)?)
-        .bind(command.retry_policy.max_attempts)
         .execute(&mut *self.inner)
         .await?;
         Ok(())
@@ -553,7 +592,8 @@ impl BackendTransaction for PostgresTransaction<'_> {
             "activity_attempts_exhausted",
             "Activity lease expired and retry policy was exhausted.",
         ))?;
-        let row = sqlx::query(
+        let row = sqlx::query_as!(
+            ClaimedActivityRow,
             r#"
             with stale_exhausted as (
                 select
@@ -686,12 +726,21 @@ impl BackendTransaction for PostgresTransaction<'_> {
                     updated_at = now(),
                     completed_at = null
             )
-            select * from claimed
+            select
+                id as "id!: Uuid",
+                task_queue_name,
+                workflow_run_id as "workflow_run_id!: Uuid",
+                step_index,
+                call_key,
+                activity,
+                input,
+                attempt_count
+            from claimed
             "#,
+            queue_name,
+            activities,
+            exhausted_error,
         )
-        .bind(queue_name)
-        .bind(activities)
-        .bind(exhausted_error)
         .fetch_optional(&mut *self.inner)
         .await?;
 
@@ -703,7 +752,7 @@ impl BackendTransaction for PostgresTransaction<'_> {
         call: &ClaimedActivityCall,
         output: serde_json::Value,
     ) -> Result<TransitionResult, Self::Error> {
-        let result = sqlx::query(
+        let result = sqlx::query!(
             r#"
             update underway.activity_call
             set state = 'succeeded'::underway.activity_call_state,
@@ -716,10 +765,10 @@ impl BackendTransaction for PostgresTransaction<'_> {
               and state = 'in_progress'::underway.activity_call_state
               and attempt_count = $3
             "#,
+            call.id,
+            output,
+            call.attempt_count,
         )
-        .bind(call.id)
-        .bind(output)
-        .bind(call.attempt_count)
         .execute(&mut *self.inner)
         .await?;
         let transition = apply_result(result.rows_affected());
@@ -740,7 +789,8 @@ impl BackendTransaction for PostgresTransaction<'_> {
         delay: Span,
     ) -> Result<TransitionResult, Self::Error> {
         let error = serde_json::to_value(error)?;
-        let result = sqlx::query(
+        let delay = pg_interval(delay)?;
+        let result = sqlx::query!(
             r#"
             update underway.activity_call
             set state = 'pending'::underway.activity_call_state,
@@ -753,11 +803,11 @@ impl BackendTransaction for PostgresTransaction<'_> {
               and state = 'in_progress'::underway.activity_call_state
               and attempt_count = $3
             "#,
+            call.id,
+            error.clone(),
+            call.attempt_count,
+            delay,
         )
-        .bind(call.id)
-        .bind(error.clone())
-        .bind(call.attempt_count)
-        .bind(pg_interval(delay)?)
         .execute(&mut *self.inner)
         .await?;
         let transition = apply_result(result.rows_affected());
@@ -777,7 +827,7 @@ impl BackendTransaction for PostgresTransaction<'_> {
         error: activity::Error,
     ) -> Result<TransitionResult, Self::Error> {
         let error = serde_json::to_value(error)?;
-        let result = sqlx::query(
+        let result = sqlx::query!(
             r#"
             update underway.activity_call
             set state = 'failed'::underway.activity_call_state,
@@ -790,10 +840,10 @@ impl BackendTransaction for PostgresTransaction<'_> {
               and state = 'in_progress'::underway.activity_call_state
               and attempt_count = $3
             "#,
+            call.id,
+            error.clone(),
+            call.attempt_count,
         )
-        .bind(call.id)
-        .bind(error.clone())
-        .bind(call.attempt_count)
         .execute(&mut *self.inner)
         .await?;
         let transition = apply_result(result.rows_affected());
@@ -813,7 +863,7 @@ impl BackendTransaction for PostgresTransaction<'_> {
         workflow_run_id: WorkflowRunId,
         step_index: usize,
     ) -> Result<(), Self::Error> {
-        sqlx::query(
+        sqlx::query!(
             r#"
             update underway.task
             set state = 'pending'::underway.task_state,
@@ -825,17 +875,17 @@ impl BackendTransaction for PostgresTransaction<'_> {
               and (input->>'workflow_run_id')::uuid = $2
               and (input->>'step_index')::integer = $3
             "#,
+            queue_name,
+            workflow_run_id.as_uuid(),
+            step_index as i32,
         )
-        .bind(queue_name)
-        .bind(workflow_run_id.as_uuid())
-        .bind(step_index as i32)
         .execute(&mut *self.inner)
         .await?;
         Ok(())
     }
 
     async fn delete_expired(&mut self) -> Result<u64, Self::Error> {
-        let result = sqlx::query(
+        let result = sqlx::query!(
             r#"
             delete from underway.task
             where state in (
@@ -856,7 +906,7 @@ async fn fail_stale_exhausted(
     tx: &mut Transaction<'_, Postgres>,
     queue_name: &str,
 ) -> Result<(), Error> {
-    sqlx::query(
+    sqlx::query!(
         r#"
         with stale_exhausted as (
             select t.id, t.current_attempt
@@ -892,8 +942,8 @@ async fn fail_stale_exhausted(
         where t.task_queue_name = $1
           and t.id = se.id
         "#,
+        queue_name,
     )
-    .bind(queue_name)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -906,28 +956,93 @@ async fn update_task_attempt_state(
     completed: bool,
     error: Option<String>,
 ) -> Result<TransitionResult, Error> {
-    let completed_at = if completed { "now()" } else { "completed_at" };
-    let sql = format!(
-        r#"
-        update underway.task_attempt
-        set state = $3::underway.task_state,
-            updated_at = now(),
-            completed_at = {completed_at},
-            error_message = coalesce($5, error_message)
-        where task_id = $1
-          and task_queue_name = $2
-          and attempt_number = $4
-          and state = 'in_progress'::underway.task_state
-        "#
-    );
-    let result = sqlx::query(&sql)
-        .bind(task.id.as_uuid())
-        .bind(&task.queue_name)
-        .bind(state)
-        .bind(task.attempt_number)
-        .bind(error)
-        .execute(&mut **tx)
-        .await?;
+    let result = match (state, completed) {
+        ("succeeded", true) => {
+            sqlx::query!(
+                r#"
+                update underway.task_attempt
+                set state = 'succeeded'::underway.task_state,
+                    updated_at = now(),
+                    completed_at = now(),
+                    error_message = coalesce($4, error_message)
+                where task_id = $1
+                  and task_queue_name = $2
+                  and attempt_number = $3
+                  and state = 'in_progress'::underway.task_state
+                "#,
+                task.id.as_uuid(),
+                &task.queue_name,
+                task.attempt_number,
+                error,
+            )
+            .execute(&mut **tx)
+            .await?
+        }
+        ("waiting", false) => {
+            sqlx::query!(
+                r#"
+                update underway.task_attempt
+                set state = 'waiting'::underway.task_state,
+                    updated_at = now(),
+                    completed_at = completed_at,
+                    error_message = coalesce($4, error_message)
+                where task_id = $1
+                  and task_queue_name = $2
+                  and attempt_number = $3
+                  and state = 'in_progress'::underway.task_state
+                "#,
+                task.id.as_uuid(),
+                &task.queue_name,
+                task.attempt_number,
+                error,
+            )
+            .execute(&mut **tx)
+            .await?
+        }
+        ("in_progress", false) => {
+            sqlx::query!(
+                r#"
+                update underway.task_attempt
+                set state = 'in_progress'::underway.task_state,
+                    updated_at = now(),
+                    completed_at = completed_at,
+                    error_message = coalesce($4, error_message)
+                where task_id = $1
+                  and task_queue_name = $2
+                  and attempt_number = $3
+                  and state = 'in_progress'::underway.task_state
+                "#,
+                task.id.as_uuid(),
+                &task.queue_name,
+                task.attempt_number,
+                error,
+            )
+            .execute(&mut **tx)
+            .await?
+        }
+        ("failed", true) => {
+            sqlx::query!(
+                r#"
+                update underway.task_attempt
+                set state = 'failed'::underway.task_state,
+                    updated_at = now(),
+                    completed_at = now(),
+                    error_message = coalesce($4, error_message)
+                where task_id = $1
+                  and task_queue_name = $2
+                  and attempt_number = $3
+                  and state = 'in_progress'::underway.task_state
+                "#,
+                task.id.as_uuid(),
+                &task.queue_name,
+                task.attempt_number,
+                error,
+            )
+            .execute(&mut **tx)
+            .await?
+        }
+        _ => return Err(Error::NotFound(format!("task attempt state `{state}`"))),
+    };
     Ok(apply_result(result.rows_affected()))
 }
 
@@ -937,27 +1052,69 @@ async fn update_task_state(
     state: &str,
     completed: bool,
 ) -> Result<TransitionResult, Error> {
-    let completed_at = if completed { "now()" } else { "completed_at" };
-    let sql = format!(
-        r#"
-        update underway.task
-        set state = $2::underway.task_state,
-            updated_at = now(),
-            completed_at = {completed_at},
-            lease_expires_at = null
-        where id = $1
-          and task_queue_name = $3
-          and current_attempt = $4
-          and state = 'in_progress'::underway.task_state
-        "#
-    );
-    let result = sqlx::query(&sql)
-        .bind(task.id.as_uuid())
-        .bind(state)
-        .bind(&task.queue_name)
-        .bind(task.attempt_number)
-        .execute(&mut **tx)
-        .await?;
+    let result = match (state, completed) {
+        ("succeeded", true) => {
+            sqlx::query!(
+                r#"
+                update underway.task
+                set state = 'succeeded'::underway.task_state,
+                    updated_at = now(),
+                    completed_at = now(),
+                    lease_expires_at = null
+                where id = $1
+                  and task_queue_name = $2
+                  and current_attempt = $3
+                  and state = 'in_progress'::underway.task_state
+                "#,
+                task.id.as_uuid(),
+                &task.queue_name,
+                task.attempt_number,
+            )
+            .execute(&mut **tx)
+            .await?
+        }
+        ("waiting", false) => {
+            sqlx::query!(
+                r#"
+                update underway.task
+                set state = 'waiting'::underway.task_state,
+                    updated_at = now(),
+                    completed_at = completed_at,
+                    lease_expires_at = null
+                where id = $1
+                  and task_queue_name = $2
+                  and current_attempt = $3
+                  and state = 'in_progress'::underway.task_state
+                "#,
+                task.id.as_uuid(),
+                &task.queue_name,
+                task.attempt_number,
+            )
+            .execute(&mut **tx)
+            .await?
+        }
+        ("failed", true) => {
+            sqlx::query!(
+                r#"
+                update underway.task
+                set state = 'failed'::underway.task_state,
+                    updated_at = now(),
+                    completed_at = now(),
+                    lease_expires_at = null
+                where id = $1
+                  and task_queue_name = $2
+                  and current_attempt = $3
+                  and state = 'in_progress'::underway.task_state
+                "#,
+                task.id.as_uuid(),
+                &task.queue_name,
+                task.attempt_number,
+            )
+            .execute(&mut **tx)
+            .await?
+        }
+        _ => return Err(Error::NotFound(format!("task state `{state}`"))),
+    };
     Ok(apply_result(result.rows_affected()))
 }
 
@@ -967,24 +1124,51 @@ async fn update_activity_attempt(
     state: &str,
     error: Option<serde_json::Value>,
 ) -> Result<TransitionResult, Error> {
-    let result = sqlx::query(
-        r#"
-        update underway.activity_call_attempt
-        set state = $3::underway.activity_call_state,
-            error = coalesce($4, error),
-            updated_at = now(),
-            completed_at = now()
-        where activity_call_id = $1
-          and attempt_number = $2
-          and state = 'in_progress'::underway.activity_call_state
-        "#,
-    )
-    .bind(call.id)
-    .bind(call.attempt_number)
-    .bind(state)
-    .bind(error)
-    .execute(&mut **tx)
-    .await?;
+    let result = match state {
+        "succeeded" => {
+            sqlx::query!(
+                r#"
+                update underway.activity_call_attempt
+                set state = 'succeeded'::underway.activity_call_state,
+                    error = coalesce($3, error),
+                    updated_at = now(),
+                    completed_at = now()
+                where activity_call_id = $1
+                  and attempt_number = $2
+                  and state = 'in_progress'::underway.activity_call_state
+                "#,
+                call.id,
+                call.attempt_number,
+                error,
+            )
+            .execute(&mut **tx)
+            .await?
+        }
+        "failed" => {
+            sqlx::query!(
+                r#"
+                update underway.activity_call_attempt
+                set state = 'failed'::underway.activity_call_state,
+                    error = coalesce($3, error),
+                    updated_at = now(),
+                    completed_at = now()
+                where activity_call_id = $1
+                  and attempt_number = $2
+                  and state = 'in_progress'::underway.activity_call_state
+                "#,
+                call.id,
+                call.attempt_number,
+                error,
+            )
+            .execute(&mut **tx)
+            .await?
+        }
+        _ => {
+            return Err(Error::NotFound(format!(
+                "activity call attempt state `{state}`"
+            )))
+        }
+    };
     Ok(apply_result(result.rows_affected()))
 }
 
@@ -992,7 +1176,7 @@ async fn touch_claimed_task(
     tx: &mut Transaction<'_, Postgres>,
     task: &ClaimedTask,
 ) -> Result<TransitionResult, Error> {
-    let result = sqlx::query(
+    let result = sqlx::query!(
         r#"
         update underway.task
         set updated_at = now()
@@ -1001,10 +1185,10 @@ async fn touch_claimed_task(
           and current_attempt = $3
           and state = 'in_progress'::underway.task_state
         "#,
+        task.id.as_uuid(),
+        &task.queue_name,
+        task.attempt_number,
     )
-    .bind(task.id.as_uuid())
-    .bind(&task.queue_name)
-    .bind(task.attempt_number)
     .execute(&mut **tx)
     .await?;
     Ok(apply_result(result.rows_affected()))

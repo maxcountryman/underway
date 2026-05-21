@@ -1,24 +1,28 @@
 # Repository Guidelines
 
 ## Project Overview
-- Underway is a Rust 2021 library for durable background workflows on Postgres.
+- Underway is a Rust 2021 library for durable background workflows with pluggable backends.
 - Core concepts: tasks, queues, workers, schedulers, and workflows (workflows wrap tasks).
 - Public APIs are documented and linted; clippy warnings are treated as errors.
 
 ## Project Structure
-- src/ contains library modules: workflow, queue, worker, scheduler, task.
+- src/ contains the facade crate.
+- crates/underway-core contains backend-neutral workflow semantics.
+- crates/underway-memory contains the deterministic in-process backend.
+- crates/underway-postgres contains the durable Postgres backend.
 - examples/ contains standalone crates with their own Cargo.toml files.
-- migrations/ holds SQL migrations executed by `underway::run_migrations`.
+- crates/underway-postgres/migrations/ holds SQL migrations executed by `PostgresBackend::run_migrations`.
 - .sqlx/ stores SQLX query metadata for offline builds.
 - docker-compose.yaml provides a local Postgres service.
 
 ## Build, Lint, Test, Docs
 - `cargo build` builds the library crate.
 - `cargo build --all-features` matches CI feature coverage.
-- `cargo test` runs unit, doc, and integration tests (DB required for sqlx::test).
+- `SQLX_OFFLINE=true cargo test --workspace --all-features --lib` runs default offline library tests.
+- `cargo test` runs non-ignored unit, doc, and integration tests using checked SQLX metadata.
+- `cargo test -p underway-postgres --all-features --test contracts -- --ignored` runs live Postgres contracts.
 - `cargo test --lib <test_name>` runs a single unit test by name.
 - `cargo test --lib task_execution_success -- --nocapture` (single test example).
-- `cargo test --lib sanity_check_run_migrations -- --nocapture` (sqlx::test example).
 - `cargo test --doc --all-features` runs doc tests only (CI uses this).
 - `cargo clippy --all --all-targets --all-features -- -Dwarnings` (CI).
 - `cargo +nightly fmt --all` formats code (nightly rustfmt required).
@@ -29,8 +33,9 @@
 
 ### CI parity checks
 - CI installs the nightly toolchain for rustfmt/clippy.
-- CI sets `SQLX_OFFLINE=true` for clippy and doc builds.
-- CI runs `cargo test --workspace --all-features --lib` for library tests.
+- CI sets `SQLX_OFFLINE=true` for clippy, docs, and default lib tests.
+- CI runs `cargo test --workspace --all-features --lib` without Postgres.
+- CI runs ignored `underway-postgres` contract tests in a dedicated Postgres job.
 - Doc tests are run separately with `cargo test --all-features --doc`.
 
 ### Single-test recipes
@@ -51,15 +56,16 @@ cargo test --doc Workflow
 - `cargo install sqlx-cli --no-default-features --features native-tls,postgres`.
 - `cargo sqlx database setup` creates the DB and runs migrations.
 - `SQLX_OFFLINE=true` allows clippy/docs with cached .sqlx data.
-- Update SQLX metadata after query changes: `cargo sqlx prepare`.
-- If offline metadata is stale, rerun `cargo sqlx prepare` with DATABASE_URL set.
+- Update SQLX metadata after query changes: `cargo sqlx prepare --workspace -- --workspace --all-features --all-targets`.
+- Check SQLX metadata freshness with `cargo sqlx prepare --workspace --check -- --workspace --all-features --all-targets`.
+- If offline metadata is stale, rerun prepare with DATABASE_URL set.
 
 ### Database test quickstart
 ```bash
 export DATABASE_URL=postgres://postgres:postgres@localhost:5432/underway
 docker-compose up -d postgres
 cargo sqlx database setup
-cargo test --lib
+cargo test -p underway-postgres --all-features --test contracts -- --ignored
 ```
 
 ## Coding Style
@@ -106,14 +112,16 @@ cargo test --lib
 ### SQLX and Database Usage
 - Prefer `sqlx::query!`, `query_as!`, and `query_scalar!` macros.
 - Use raw string literals (`r#"..."#`) for SQL blocks.
-- Cast custom types in queries (TaskId, RetryPolicy, enums) as shown in src.
-- Keep `.sqlx/` metadata updated via `cargo sqlx prepare`.
-- Tests using `#[sqlx::test]` require a live database.
+- Keep `underway-core` free of SQLX dependencies and map Postgres rows to core types in `underway-postgres`.
+- Prefer primitive SQLX macro boundaries (Uuid, String, JSON, integer, PgInterval) over binding core newtypes.
+- Cast custom Postgres enums and composites inside SQL literals; avoid binding enum/composite values directly.
+- Keep `.sqlx/` metadata updated via workspace `cargo sqlx prepare`.
+- Tests using `#[sqlx::test]` require a live database and should stay in ignored Postgres integration tests.
 
 ### Migrations and schema
-- Add migrations in `migrations/` and keep them reversible when possible.
-- Library users rely on `underway::run_migrations`; update docs if schema changes.
-- After editing SQL or migrations, refresh SQLX metadata (`cargo sqlx prepare`).
+- Add migrations in `crates/underway-postgres/migrations/` and keep them reversible when possible.
+- Library users rely on `PostgresBackend::run_migrations`; update docs if schema changes.
+- After editing SQL or migrations, refresh SQLX metadata with the workspace prepare command.
 
 ### Documentation
 - Crate enables `#![warn(missing_docs)]`; public items must have `///` docs.
@@ -123,7 +131,7 @@ cargo test --lib
 
 ## Testing Guidelines
 - Tests live in `mod tests` blocks within source files.
-- Use `#[tokio::test]` for async tests and `#[sqlx::test]` for DB tests.
+- Use `#[tokio::test]` for async unit tests and ignored `#[sqlx::test]` integration tests for live Postgres contracts.
 - Keep test names descriptive and snake_case.
 - Prefer small, focused tests near the code they exercise.
 

@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                update underway.task_attempt\n                set state = 'succeeded'::underway.task_state,\n                    updated_at = now(),\n                    completed_at = now(),\n                    error_message = coalesce($4, error_message)\n                where task_id = $1\n                  and task_queue_name = $2\n                  and attempt_number = $3\n                  and state = 'in_progress'::underway.task_state\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Int4",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "120c9016300df2891253179d62e3f87b841ee927ef7e313485cc2f6bd9d5a313"
+}

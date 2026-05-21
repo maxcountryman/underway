@@ -72,6 +72,20 @@ jobs:
   test-lib:
     needs: check
     runs-on: ubuntu-latest
+    env:
+      SQLX_OFFLINE: true
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          rustup toolchain install nightly --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - name: Run lib tests
+        run: |
+          cargo test --workspace --all-features --lib
+
+  postgres-contracts:
+    needs: check
+    runs-on: ubuntu-latest
     container: rust
     services:
       postgres:
@@ -93,7 +107,14 @@ jobs:
       - uses: actions/checkout@v4
       - run: |
           rustup toolchain install nightly --profile minimal
+          cargo install sqlx-cli --no-default-features --features native-tls,postgres
       - uses: Swatinem/rust-cache@v2
-      - name: Run lib tests
+      - name: Prepare database
         run: |
-          cargo test --workspace --all-features --lib
+          cargo sqlx database setup
+      - name: Check SQLx metadata
+        run: |
+          cargo sqlx prepare --workspace --check -- --workspace --all-features --all-targets
+      - name: Run Postgres contracts
+        run: |
+          cargo test -p underway-postgres --all-features --test contracts -- --ignored

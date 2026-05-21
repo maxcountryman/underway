@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                update underway.task_queue\n                set dlq_name = $2\n                where name = $1\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "eece273d7379838deba8843a8653e4267c7327c3070673ea83251c2c82cfb996"
+}

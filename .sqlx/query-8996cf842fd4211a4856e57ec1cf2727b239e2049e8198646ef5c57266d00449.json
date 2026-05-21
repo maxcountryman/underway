@@ -1,0 +1,106 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            with available_task as (\n                select id\n                from underway.task\n                where task_queue_name = $1\n                  and (\n                    (state = 'pending'::underway.task_state and run_at <= now())\n                    or (\n                        state = 'in_progress'::underway.task_state\n                        and lease_expires_at is not null\n                        and lease_expires_at <= now()\n                        and attempt_count < (retry_policy).max_attempts\n                    )\n                  )\n                order by priority desc, run_at, created_at, id\n                limit 1\n                for update skip locked\n            ),\n            claimed as (\n                update underway.task t\n                set state = 'in_progress'::underway.task_state,\n                    run_at = now(),\n                    last_attempt_at = now(),\n                    last_heartbeat_at = now(),\n                    attempt_count = t.attempt_count + 1,\n                    current_attempt = t.attempt_count + 1,\n                    lease_expires_at = now() + t.heartbeat\n                from available_task\n                where t.task_queue_name = $1\n                  and t.id = available_task.id\n                returning\n                    t.id,\n                    t.task_queue_name,\n                    t.input,\n                    t.timeout,\n                    t.heartbeat,\n                    t.ttl,\n                    t.delay,\n                    (t.retry_policy).max_attempts as retry_max_attempts,\n                    (t.retry_policy).initial_interval_ms as retry_initial_interval_ms,\n                    (t.retry_policy).max_interval_ms as retry_max_interval_ms,\n                    (t.retry_policy).backoff_coefficient as retry_backoff_coefficient,\n                    (t.retry_policy).jitter_factor as retry_jitter_factor,\n                    t.concurrency_key,\n                    t.priority,\n                    t.current_attempt\n            ),\n            finalized_previous_attempt as (\n                update underway.task_attempt ta\n                set state = 'failed'::underway.task_state,\n                    updated_at = now(),\n                    completed_at = now(),\n                    error_message = coalesce(\n                        ta.error_message,\n                        'Task lease expired and was reclaimed by another worker.'\n                    )\n                from claimed c\n                where c.current_attempt > 1\n                  and ta.task_id = c.id\n                  and ta.task_queue_name = c.task_queue_name\n                  and ta.attempt_number = c.current_attempt - 1\n                  and ta.state = 'in_progress'::underway.task_state\n            ),\n            upsert_current_attempt as (\n                insert into underway.task_attempt (\n                    task_id,\n                    task_queue_name,\n                    state,\n                    attempt_number\n                )\n                select\n                    c.id,\n                    c.task_queue_name,\n                    'in_progress'::underway.task_state,\n                    c.current_attempt\n                from claimed c\n                on conflict (task_queue_name, task_id, attempt_number)\n                do update\n                set state = excluded.state,\n                    error_message = null,\n                    started_at = now(),\n                    updated_at = now(),\n                    completed_at = null\n            )\n            select\n                id as \"id!: Uuid\",\n                task_queue_name,\n                input,\n                timeout,\n                heartbeat,\n                ttl,\n                delay,\n                retry_max_attempts as \"retry_max_attempts!: i32\",\n                retry_initial_interval_ms as \"retry_initial_interval_ms!: i32\",\n                retry_max_interval_ms as \"retry_max_interval_ms!: i32\",\n                retry_backoff_coefficient as \"retry_backoff_coefficient!: f64\",\n                retry_jitter_factor as \"retry_jitter_factor!: f64\",\n                concurrency_key,\n                priority,\n                current_attempt\n            from claimed\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!: Uuid",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "task_queue_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "input",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 3,
+        "name": "timeout",
+        "type_info": "Interval"
+      },
+      {
+        "ordinal": 4,
+        "name": "heartbeat",
+        "type_info": "Interval"
+      },
+      {
+        "ordinal": 5,
+        "name": "ttl",
+        "type_info": "Interval"
+      },
+      {
+        "ordinal": 6,
+        "name": "delay",
+        "type_info": "Interval"
+      },
+      {
+        "ordinal": 7,
+        "name": "retry_max_attempts!: i32",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 8,
+        "name": "retry_initial_interval_ms!: i32",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 9,
+        "name": "retry_max_interval_ms!: i32",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 10,
+        "name": "retry_backoff_coefficient!: f64",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 11,
+        "name": "retry_jitter_factor!: f64",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 12,
+        "name": "concurrency_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 13,
+        "name": "priority",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 14,
+        "name": "current_attempt",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      null,
+      null,
+      null,
+      null,
+      null,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "8996cf842fd4211a4856e57ec1cf2727b239e2049e8198646ef5c57266d00449"
+}

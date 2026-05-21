@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "create schema if not exists underway;",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "03c2ac38e6ec2801eed7e5b19076eafcc589f32e2424460b0c345e6c477a1b28"
+}

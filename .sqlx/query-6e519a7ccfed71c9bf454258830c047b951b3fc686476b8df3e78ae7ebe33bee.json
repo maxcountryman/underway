@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                update underway.activity_call_attempt\n                set state = 'failed'::underway.activity_call_state,\n                    error = coalesce($3, error),\n                    updated_at = now(),\n                    completed_at = now()\n                where activity_call_id = $1\n                  and attempt_number = $2\n                  and state = 'in_progress'::underway.activity_call_state\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6e519a7ccfed71c9bf454258830c047b951b3fc686476b8df3e78ae7ebe33bee"
+}

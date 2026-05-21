@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            with moved_task as (\n                update underway.task\n                set task_queue_name = $2,\n                    state = 'pending'::underway.task_state,\n                    run_at = now(),\n                    updated_at = now(),\n                    completed_at = null,\n                    lease_expires_at = null\n                where id = $1 and task_queue_name = $3\n                returning id\n            ),\n            moved_attempts as (\n                update underway.task_attempt\n                set task_queue_name = $2,\n                    state = case\n                        when state = 'in_progress'::underway.task_state\n                        then 'failed'::underway.task_state\n                        else state\n                    end,\n                    updated_at = now(),\n                    completed_at = case\n                        when state = 'in_progress'::underway.task_state\n                        then now()\n                        else completed_at\n                    end\n                where task_id = $1\n                  and task_queue_name = $3\n                  and exists (select 1 from moved_task)\n            )\n            select count(*)::bigint as \"moved!\" from moved_task\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "moved!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "3e80132cf0c66fc4426db24593f67acba3db13cd55dfec1fa7183710f49b7ccd"
+}

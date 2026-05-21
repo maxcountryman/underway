@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            update underway.task\n            set state = 'cancelled'::underway.task_state,\n                updated_at = now(),\n                completed_at = now(),\n                lease_expires_at = null\n            where task_queue_name = $1\n              and state = 'pending'::underway.task_state\n              and (input->>'workflow_run_id')::uuid = $2\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "408b3ad2d0d5e5ac9f7b3ca936af30d82f78a13c50e00162a2b6baac4eafdf7a"
+}
