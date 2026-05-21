@@ -1,4 +1,4 @@
-# Unreleased
+# 0.3.0
 
 - Breaking: Split storage-independent semantics into `underway-core`, with
   `underway-memory` for deterministic tests/local development and
@@ -16,9 +16,9 @@
   transaction visibility, scheduler leases, heartbeat extension, expired-work
   deletion, activity idempotency/replay, activity stale exhaustion, workflow
   wait/resume, and concurrency-key exclusivity.
-- Add: Backend transition methods report `ApplyResult::Applied` or
-  `ApplyResult::Stale` where attempt fencing determines whether a transition
-  took effect.
+- Add: Backend transition methods report `TransitionResult::Applied` or
+  `TransitionResult::Stale` where attempt fencing determines whether a
+  transition took effect.
 - Add: Release packaging now records versioned dependencies between split
   crates; publish `underway-core`, then `underway-memory` and
   `underway-postgres`, then the `underway` facade. SQLx query metadata remains

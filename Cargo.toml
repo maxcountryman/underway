@@ -11,7 +11,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/maxcountryman/underway"
@@ -54,6 +54,6 @@ memory = ["dep:underway-memory"]
 postgres = ["dep:underway-postgres"]
 
 [dependencies]
-underway-core = { version = "0.2.0", path = "crates/underway-core" }
-underway-memory = { version = "0.2.0", path = "crates/underway-memory", optional = true }
-underway-postgres = { version = "0.2.0", path = "crates/underway-postgres", optional = true }
+underway-core = { version = "0.3.0", path = "crates/underway-core" }
+underway-memory = { version = "0.3.0", path = "crates/underway-memory", optional = true }
+underway-postgres = { version = "0.3.0", path = "crates/underway-postgres", optional = true }

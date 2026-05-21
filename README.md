@@ -232,18 +232,19 @@ use underway::{MemoryBackend, Transition, Workflow};
 #[derive(Deserialize, Serialize)]
 struct Input;
 
-# async fn example() -> Result<(), Box<dyn std::error::Error>> {
-let backend = MemoryBackend::new();
-let workflow = Workflow::<MemoryBackend, Input>::builder()
-    .step(|_cx, _input: Input| async move { Transition::complete() })
-    .name("test-workflow")
-    .backend(backend)
-    .build()
-    .await?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let backend = MemoryBackend::new();
+    let workflow = Workflow::<MemoryBackend, Input>::builder()
+        .step(|_cx, _input: Input| async move { Transition::complete() })
+        .name("test-workflow")
+        .backend(backend)
+        .build()
+        .await?;
 
-workflow.enqueue(&Input).await?;
-# Ok(())
-# }
+    workflow.enqueue(&Input).await?;
+    Ok(())
+}
 ```
 
 ## Getting Help

@@ -5,7 +5,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-documentation.workspace = true
+documentation = "https://docs.rs/underway-postgres"
 
 [features]
 contracts = ["underway-core/contracts"]
@@ -17,5 +17,5 @@ sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-underway-core = { version = "0.2.0", path = "../underway-core" }
+underway-core = { version = "0.3.0", path = "../underway-core" }
 uuid.workspace = true
