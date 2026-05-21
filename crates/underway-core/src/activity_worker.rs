@@ -160,7 +160,7 @@ impl<B: backend::Backend> ActivityWorker<B> {
                 .fail_activity_call(&call, err)
                 .await
                 .map_err(Error::backend)?;
-            if applied.applied() {
+            if applied.is_applied() {
                 tx.wake_workflow_task(&call.queue_name, call.workflow_run_id, call.step_index)
                     .await
                     .map_err(Error::backend)?;
@@ -181,7 +181,7 @@ impl<B: backend::Backend> ActivityWorker<B> {
                     .complete_activity_call(&call, output)
                     .await
                     .map_err(Error::backend)?;
-                if applied.applied() {
+                if applied.is_applied() {
                     tx.wake_workflow_task(&call.queue_name, call.workflow_run_id, call.step_index)
                         .await
                         .map_err(Error::backend)?;
@@ -201,7 +201,7 @@ impl<B: backend::Backend> ActivityWorker<B> {
                     .await?
             }
         };
-        if applied.applied() {
+        if applied.is_applied() {
             tx.commit().await.map_err(Error::backend)?;
         } else {
             tx.rollback().await.map_err(Error::backend)?;
@@ -216,7 +216,7 @@ impl<B: backend::Backend> ActivityWorker<B> {
         call: &backend::ClaimedActivityCall,
         retry_policy: task::RetryPolicy,
         err: activity::Error,
-    ) -> Result<backend::ApplyResult> {
+    ) -> Result<backend::TransitionResult> {
         if err.retryable && call.attempt_count < retry_policy.max_attempts {
             tx.retry_activity_call(call, err, retry_policy.calculate_delay(call.attempt_count))
                 .await
@@ -226,7 +226,7 @@ impl<B: backend::Backend> ActivityWorker<B> {
                 .fail_activity_call(call, err)
                 .await
                 .map_err(Error::backend)?;
-            if applied.applied() {
+            if applied.is_applied() {
                 tx.wake_workflow_task(&call.queue_name, call.workflow_run_id, call.step_index)
                     .await
                     .map_err(Error::backend)?;

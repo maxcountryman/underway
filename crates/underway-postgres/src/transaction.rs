@@ -3,8 +3,8 @@ use sqlx::{Postgres, Row, Transaction};
 use underway_core::{
     activity,
     backend::{
-        ActivityCallCommand, ActivityCallRecord, ApplyResult, BackendTransaction,
-        ClaimedActivityCall, ClaimedTask, EnqueueTask, StoredSchedule,
+        ActivityCallCommand, ActivityCallRecord, BackendTransaction, ClaimedActivityCall,
+        ClaimedTask, EnqueueTask, StoredSchedule, TransitionResult,
     },
     scheduler::ZonedSchedule,
     task::{self, TaskId},
@@ -238,38 +238,41 @@ impl BackendTransaction for PostgresTransaction<'_> {
     async fn mark_task_succeeded(
         &mut self,
         task: &ClaimedTask,
-    ) -> Result<ApplyResult, Self::Error> {
-        let applied = update_task_state(&mut self.inner, task, "succeeded", true).await?;
-        if !applied.applied() {
-            return Ok(applied);
+    ) -> Result<TransitionResult, Self::Error> {
+        let transition = update_task_state(&mut self.inner, task, "succeeded", true).await?;
+        if !transition.is_applied() {
+            return Ok(transition);
         }
         ensure_applied(
             update_task_attempt_state(&mut self.inner, task, "succeeded", true, None).await?,
             "task attempt",
         )?;
-        Ok(ApplyResult::Applied)
+        Ok(TransitionResult::Applied)
     }
 
-    async fn mark_task_waiting(&mut self, task: &ClaimedTask) -> Result<ApplyResult, Self::Error> {
-        let applied = update_task_state(&mut self.inner, task, "waiting", false).await?;
-        if !applied.applied() {
-            return Ok(applied);
+    async fn mark_task_waiting(
+        &mut self,
+        task: &ClaimedTask,
+    ) -> Result<TransitionResult, Self::Error> {
+        let transition = update_task_state(&mut self.inner, task, "waiting", false).await?;
+        if !transition.is_applied() {
+            return Ok(transition);
         }
         ensure_applied(
             update_task_attempt_state(&mut self.inner, task, "waiting", false, None).await?,
             "task attempt",
         )?;
-        Ok(ApplyResult::Applied)
+        Ok(TransitionResult::Applied)
     }
 
     async fn record_task_failure(
         &mut self,
         task: &ClaimedTask,
         error: &task::Error,
-    ) -> Result<ApplyResult, Self::Error> {
-        let applied = touch_claimed_task(&mut self.inner, task).await?;
-        if !applied.applied() {
-            return Ok(applied);
+    ) -> Result<TransitionResult, Self::Error> {
+        let transition = touch_claimed_task(&mut self.inner, task).await?;
+        if !transition.is_applied() {
+            return Ok(transition);
         }
         ensure_applied(
             update_task_attempt_state(
@@ -282,14 +285,14 @@ impl BackendTransaction for PostgresTransaction<'_> {
             .await?,
             "task attempt",
         )?;
-        Ok(ApplyResult::Applied)
+        Ok(TransitionResult::Applied)
     }
 
     async fn retry_task(
         &mut self,
         task: &ClaimedTask,
         delay: Span,
-    ) -> Result<ApplyResult, Self::Error> {
+    ) -> Result<TransitionResult, Self::Error> {
         let result = sqlx::query(
             r#"
             update underway.task
@@ -310,27 +313,30 @@ impl BackendTransaction for PostgresTransaction<'_> {
         .bind(task.attempt_number)
         .execute(&mut *self.inner)
         .await?;
-        let applied = apply_result(result.rows_affected());
-        if !applied.applied() {
-            return Ok(applied);
+        let transition = apply_result(result.rows_affected());
+        if !transition.is_applied() {
+            return Ok(transition);
         }
         ensure_applied(
             update_task_attempt_state(&mut self.inner, task, "failed", true, None).await?,
             "task attempt",
         )?;
-        Ok(ApplyResult::Applied)
+        Ok(TransitionResult::Applied)
     }
 
-    async fn mark_task_failed(&mut self, task: &ClaimedTask) -> Result<ApplyResult, Self::Error> {
-        let applied = update_task_state(&mut self.inner, task, "failed", true).await?;
-        if !applied.applied() {
-            return Ok(applied);
+    async fn mark_task_failed(
+        &mut self,
+        task: &ClaimedTask,
+    ) -> Result<TransitionResult, Self::Error> {
+        let transition = update_task_state(&mut self.inner, task, "failed", true).await?;
+        if !transition.is_applied() {
+            return Ok(transition);
         }
         ensure_applied(
             update_task_attempt_state(&mut self.inner, task, "failed", true, None).await?,
             "task attempt",
         )?;
-        Ok(ApplyResult::Applied)
+        Ok(TransitionResult::Applied)
     }
 
     async fn move_task_to_dlq(
@@ -338,7 +344,7 @@ impl BackendTransaction for PostgresTransaction<'_> {
         task_id: TaskId,
         from_queue: &str,
         dlq_name: &str,
-    ) -> Result<ApplyResult, Self::Error> {
+    ) -> Result<TransitionResult, Self::Error> {
         let moved = sqlx::query_scalar::<_, i64>(
             r#"
             with moved_task as (
@@ -696,7 +702,7 @@ impl BackendTransaction for PostgresTransaction<'_> {
         &mut self,
         call: &ClaimedActivityCall,
         output: serde_json::Value,
-    ) -> Result<ApplyResult, Self::Error> {
+    ) -> Result<TransitionResult, Self::Error> {
         let result = sqlx::query(
             r#"
             update underway.activity_call
@@ -716,15 +722,15 @@ impl BackendTransaction for PostgresTransaction<'_> {
         .bind(call.attempt_count)
         .execute(&mut *self.inner)
         .await?;
-        let applied = apply_result(result.rows_affected());
-        if !applied.applied() {
-            return Ok(applied);
+        let transition = apply_result(result.rows_affected());
+        if !transition.is_applied() {
+            return Ok(transition);
         }
         ensure_applied(
             update_activity_attempt(&mut self.inner, call, "succeeded", None).await?,
             "activity call attempt",
         )?;
-        Ok(ApplyResult::Applied)
+        Ok(TransitionResult::Applied)
     }
 
     async fn retry_activity_call(
@@ -732,7 +738,7 @@ impl BackendTransaction for PostgresTransaction<'_> {
         call: &ClaimedActivityCall,
         error: activity::Error,
         delay: Span,
-    ) -> Result<ApplyResult, Self::Error> {
+    ) -> Result<TransitionResult, Self::Error> {
         let error = serde_json::to_value(error)?;
         let result = sqlx::query(
             r#"
@@ -754,22 +760,22 @@ impl BackendTransaction for PostgresTransaction<'_> {
         .bind(pg_interval(delay)?)
         .execute(&mut *self.inner)
         .await?;
-        let applied = apply_result(result.rows_affected());
-        if !applied.applied() {
-            return Ok(applied);
+        let transition = apply_result(result.rows_affected());
+        if !transition.is_applied() {
+            return Ok(transition);
         }
         ensure_applied(
             update_activity_attempt(&mut self.inner, call, "failed", Some(error)).await?,
             "activity call attempt",
         )?;
-        Ok(ApplyResult::Applied)
+        Ok(TransitionResult::Applied)
     }
 
     async fn fail_activity_call(
         &mut self,
         call: &ClaimedActivityCall,
         error: activity::Error,
-    ) -> Result<ApplyResult, Self::Error> {
+    ) -> Result<TransitionResult, Self::Error> {
         let error = serde_json::to_value(error)?;
         let result = sqlx::query(
             r#"
@@ -790,15 +796,15 @@ impl BackendTransaction for PostgresTransaction<'_> {
         .bind(call.attempt_count)
         .execute(&mut *self.inner)
         .await?;
-        let applied = apply_result(result.rows_affected());
-        if !applied.applied() {
-            return Ok(applied);
+        let transition = apply_result(result.rows_affected());
+        if !transition.is_applied() {
+            return Ok(transition);
         }
         ensure_applied(
             update_activity_attempt(&mut self.inner, call, "failed", Some(error)).await?,
             "activity call attempt",
         )?;
-        Ok(ApplyResult::Applied)
+        Ok(TransitionResult::Applied)
     }
 
     async fn wake_workflow_task(
@@ -899,7 +905,7 @@ async fn update_task_attempt_state(
     state: &str,
     completed: bool,
     error: Option<String>,
-) -> Result<ApplyResult, Error> {
+) -> Result<TransitionResult, Error> {
     let completed_at = if completed { "now()" } else { "completed_at" };
     let sql = format!(
         r#"
@@ -930,7 +936,7 @@ async fn update_task_state(
     task: &ClaimedTask,
     state: &str,
     completed: bool,
-) -> Result<ApplyResult, Error> {
+) -> Result<TransitionResult, Error> {
     let completed_at = if completed { "now()" } else { "completed_at" };
     let sql = format!(
         r#"
@@ -960,7 +966,7 @@ async fn update_activity_attempt(
     call: &ClaimedActivityCall,
     state: &str,
     error: Option<serde_json::Value>,
-) -> Result<ApplyResult, Error> {
+) -> Result<TransitionResult, Error> {
     let result = sqlx::query(
         r#"
         update underway.activity_call_attempt
@@ -985,7 +991,7 @@ async fn update_activity_attempt(
 async fn touch_claimed_task(
     tx: &mut Transaction<'_, Postgres>,
     task: &ClaimedTask,
-) -> Result<ApplyResult, Error> {
+) -> Result<TransitionResult, Error> {
     let result = sqlx::query(
         r#"
         update underway.task
@@ -1004,16 +1010,16 @@ async fn touch_claimed_task(
     Ok(apply_result(result.rows_affected()))
 }
 
-fn apply_result(rows_affected: u64) -> ApplyResult {
+fn apply_result(rows_affected: u64) -> TransitionResult {
     if rows_affected == 0 {
-        ApplyResult::Stale
+        TransitionResult::Stale
     } else {
-        ApplyResult::Applied
+        TransitionResult::Applied
     }
 }
 
-fn ensure_applied(applied: ApplyResult, name: &str) -> Result<(), Error> {
-    if applied.applied() {
+fn ensure_applied(transition: TransitionResult, name: &str) -> Result<(), Error> {
+    if transition.is_applied() {
         Ok(())
     } else {
         Err(Error::NotFound(name.to_string()))

@@ -16,6 +16,7 @@ use std::{
 };
 
 use super::*;
+use crate::backend::TransitionResult;
 
 /// Result type for backend contract checks.
 pub type ContractResult<T = ()> = StdResult<T, ContractError>;
@@ -111,12 +112,12 @@ fn expect_none_without_debug<T>(
     }
 }
 
-fn expect_applied(contract: &'static str, actual: backend::ApplyResult) -> ContractResult {
-    expect_eq(contract, actual, backend::ApplyResult::Applied)
+fn expect_applied(contract: &'static str, actual: TransitionResult) -> ContractResult {
+    expect_eq(contract, actual, TransitionResult::Applied)
 }
 
-fn expect_stale(contract: &'static str, actual: backend::ApplyResult) -> ContractResult {
-    expect_eq(contract, actual, backend::ApplyResult::Stale)
+fn expect_stale(contract: &'static str, actual: TransitionResult) -> ContractResult {
+    expect_eq(contract, actual, TransitionResult::Stale)
 }
 
 fn default_task_config(contract: &'static str) -> ContractResult<task::TaskConfig> {

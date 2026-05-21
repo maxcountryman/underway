@@ -92,16 +92,16 @@ pub struct StoredSchedule {
 
 /// Result of applying a fenced backend transition.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum ApplyResult {
+pub enum TransitionResult {
     /// The transition was applied to the currently claimed attempt.
     Applied,
     /// The transition was stale and did not modify the current attempt.
     Stale,
 }
 
-impl ApplyResult {
+impl TransitionResult {
     /// Returns true when the transition applied.
-    pub const fn applied(self) -> bool {
+    pub const fn is_applied(self) -> bool {
         matches!(self, Self::Applied)
     }
 }
@@ -154,33 +154,33 @@ pub trait BackendTransaction: Send {
     fn mark_task_succeeded(
         &mut self,
         task: &ClaimedTask,
-    ) -> impl Future<Output = StdResult<ApplyResult, Self::Error>> + Send;
+    ) -> impl Future<Output = StdResult<TransitionResult, Self::Error>> + Send;
 
     /// Marks the claimed task waiting.
     fn mark_task_waiting(
         &mut self,
         task: &ClaimedTask,
-    ) -> impl Future<Output = StdResult<ApplyResult, Self::Error>> + Send;
+    ) -> impl Future<Output = StdResult<TransitionResult, Self::Error>> + Send;
 
     /// Records a task failure without terminalizing.
     fn record_task_failure(
         &mut self,
         task: &ClaimedTask,
         error: &task::Error,
-    ) -> impl Future<Output = StdResult<ApplyResult, Self::Error>> + Send;
+    ) -> impl Future<Output = StdResult<TransitionResult, Self::Error>> + Send;
 
     /// Requeues a task after delay.
     fn retry_task(
         &mut self,
         task: &ClaimedTask,
         delay: Span,
-    ) -> impl Future<Output = StdResult<ApplyResult, Self::Error>> + Send;
+    ) -> impl Future<Output = StdResult<TransitionResult, Self::Error>> + Send;
 
     /// Marks a task failed.
     fn mark_task_failed(
         &mut self,
         task: &ClaimedTask,
-    ) -> impl Future<Output = StdResult<ApplyResult, Self::Error>> + Send;
+    ) -> impl Future<Output = StdResult<TransitionResult, Self::Error>> + Send;
 
     /// Moves a task to a dead-letter queue.
     fn move_task_to_dlq(
@@ -188,7 +188,7 @@ pub trait BackendTransaction: Send {
         task_id: task::TaskId,
         from_queue: &str,
         dlq_name: &str,
-    ) -> impl Future<Output = StdResult<ApplyResult, Self::Error>> + Send;
+    ) -> impl Future<Output = StdResult<TransitionResult, Self::Error>> + Send;
 
     /// Cancels pending tasks for a workflow run.
     fn cancel_workflow(
@@ -246,7 +246,7 @@ pub trait BackendTransaction: Send {
         &mut self,
         call: &ClaimedActivityCall,
         output: serde_json::Value,
-    ) -> impl Future<Output = StdResult<ApplyResult, Self::Error>> + Send;
+    ) -> impl Future<Output = StdResult<TransitionResult, Self::Error>> + Send;
 
     /// Requeues an activity call after a retryable failure.
     fn retry_activity_call(
@@ -254,14 +254,14 @@ pub trait BackendTransaction: Send {
         call: &ClaimedActivityCall,
         error: activity::Error,
         delay: Span,
-    ) -> impl Future<Output = StdResult<ApplyResult, Self::Error>> + Send;
+    ) -> impl Future<Output = StdResult<TransitionResult, Self::Error>> + Send;
 
     /// Terminally fails an activity call.
     fn fail_activity_call(
         &mut self,
         call: &ClaimedActivityCall,
         error: activity::Error,
-    ) -> impl Future<Output = StdResult<ApplyResult, Self::Error>> + Send;
+    ) -> impl Future<Output = StdResult<TransitionResult, Self::Error>> + Send;
 
     /// Wakes a waiting workflow task after activity completion.
     fn wake_workflow_task(

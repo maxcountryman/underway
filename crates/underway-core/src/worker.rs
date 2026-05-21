@@ -197,12 +197,12 @@ where
 
 async fn finish_execution_transaction<B>(
     tx: B::Transaction<'_>,
-    applied: backend::ApplyResult,
+    transition: backend::TransitionResult,
 ) -> Result
 where
     B: backend::Backend,
 {
-    if applied.applied() {
+    if transition.is_applied() {
         tx.commit().await.map_err(Error::backend)
     } else {
         tx.rollback().await.map_err(Error::backend)
@@ -219,9 +219,9 @@ where
     T: task::Task<B>,
 {
     let mut tx = queue.backend.begin().await.map_err(Error::backend)?;
-    let applied =
+    let transition =
         handle_task_error(&mut tx, queue, claimed, &claimed.config.retry_policy(), err).await?;
-    if applied.applied() {
+    if transition.is_applied() {
         tx.commit().await.map_err(Error::backend)
     } else {
         tx.rollback().await.map_err(Error::backend)
@@ -234,18 +234,18 @@ async fn handle_task_error<B, T>(
     claimed: &backend::ClaimedTask,
     retry_policy: &task::RetryPolicy,
     err: &task::Error,
-) -> Result<backend::ApplyResult>
+) -> Result<backend::TransitionResult>
 where
     B: backend::Backend,
     T: task::Task<B>,
 {
     if matches!(err, task::Error::Fatal(_)) {
-        let applied = tx
+        let transition = tx
             .record_task_failure(claimed, err)
             .await
             .map_err(Error::backend)?;
-        if !applied.applied() {
-            return Ok(applied);
+        if !transition.is_applied() {
+            return Ok(transition);
         }
         if let Some(dlq_name) = &queue.dlq_name {
             return tx
@@ -256,12 +256,12 @@ where
         return tx.mark_task_failed(claimed).await.map_err(Error::backend);
     }
 
-    let applied = tx
+    let transition = tx
         .record_task_failure(claimed, err)
         .await
         .map_err(Error::backend)?;
-    if !applied.applied() {
-        return Ok(applied);
+    if !transition.is_applied() {
+        return Ok(transition);
     }
 
     if claimed.attempt_number < retry_policy.max_attempts {
@@ -416,38 +416,38 @@ mod tests {
         async fn mark_task_succeeded(
             &mut self,
             _task: &backend::ClaimedTask,
-        ) -> StdResult<backend::ApplyResult, Self::Error> {
+        ) -> StdResult<backend::TransitionResult, Self::Error> {
             Err(TestError)
         }
 
         async fn mark_task_waiting(
             &mut self,
             _task: &backend::ClaimedTask,
-        ) -> StdResult<backend::ApplyResult, Self::Error> {
-            Ok(backend::ApplyResult::Stale)
+        ) -> StdResult<backend::TransitionResult, Self::Error> {
+            Ok(backend::TransitionResult::Stale)
         }
 
         async fn record_task_failure(
             &mut self,
             _task: &backend::ClaimedTask,
             _error: &task::Error,
-        ) -> StdResult<backend::ApplyResult, Self::Error> {
-            Ok(backend::ApplyResult::Stale)
+        ) -> StdResult<backend::TransitionResult, Self::Error> {
+            Ok(backend::TransitionResult::Stale)
         }
 
         async fn retry_task(
             &mut self,
             _task: &backend::ClaimedTask,
             _delay: Span,
-        ) -> StdResult<backend::ApplyResult, Self::Error> {
-            Ok(backend::ApplyResult::Stale)
+        ) -> StdResult<backend::TransitionResult, Self::Error> {
+            Ok(backend::TransitionResult::Stale)
         }
 
         async fn mark_task_failed(
             &mut self,
             _task: &backend::ClaimedTask,
-        ) -> StdResult<backend::ApplyResult, Self::Error> {
-            Ok(backend::ApplyResult::Stale)
+        ) -> StdResult<backend::TransitionResult, Self::Error> {
+            Ok(backend::TransitionResult::Stale)
         }
 
         async fn move_task_to_dlq(
@@ -455,8 +455,8 @@ mod tests {
             _task_id: task::TaskId,
             _from_queue: &str,
             _dlq_name: &str,
-        ) -> StdResult<backend::ApplyResult, Self::Error> {
-            Ok(backend::ApplyResult::Stale)
+        ) -> StdResult<backend::TransitionResult, Self::Error> {
+            Ok(backend::TransitionResult::Stale)
         }
 
         async fn cancel_workflow(
@@ -518,8 +518,8 @@ mod tests {
             &mut self,
             _call: &backend::ClaimedActivityCall,
             _output: serde_json::Value,
-        ) -> StdResult<backend::ApplyResult, Self::Error> {
-            Ok(backend::ApplyResult::Stale)
+        ) -> StdResult<backend::TransitionResult, Self::Error> {
+            Ok(backend::TransitionResult::Stale)
         }
 
         async fn retry_activity_call(
@@ -527,16 +527,16 @@ mod tests {
             _call: &backend::ClaimedActivityCall,
             _error: activity::Error,
             _delay: Span,
-        ) -> StdResult<backend::ApplyResult, Self::Error> {
-            Ok(backend::ApplyResult::Stale)
+        ) -> StdResult<backend::TransitionResult, Self::Error> {
+            Ok(backend::TransitionResult::Stale)
         }
 
         async fn fail_activity_call(
             &mut self,
             _call: &backend::ClaimedActivityCall,
             _error: activity::Error,
-        ) -> StdResult<backend::ApplyResult, Self::Error> {
-            Ok(backend::ApplyResult::Stale)
+        ) -> StdResult<backend::TransitionResult, Self::Error> {
+            Ok(backend::TransitionResult::Stale)
         }
 
         async fn wake_workflow_task(

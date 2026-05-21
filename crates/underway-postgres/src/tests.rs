@@ -4,7 +4,8 @@ use jiff::Span;
 use sqlx::PgPool;
 use underway_core::{
     backend::{
-        ActivityCallCommand, ApplyResult, Backend, BackendTransaction, EnqueueTask, SchedulerLease,
+        ActivityCallCommand, Backend, BackendTransaction, EnqueueTask, SchedulerLease,
+        TransitionResult,
     },
     contracts as core_contracts,
     task::{RetryPolicy, TaskConfig},
@@ -163,7 +164,7 @@ async fn stale_task_transition_does_not_mutate_attempt_row(pool: PgPool) {
     let first = tx.claim_task(&queue_name).await.unwrap().unwrap();
     assert_eq!(
         tx.retry_task(&first, Span::new()).await.unwrap(),
-        ApplyResult::Applied
+        TransitionResult::Applied
     );
     tx.commit().await.unwrap();
 
@@ -172,7 +173,7 @@ async fn stale_task_transition_does_not_mutate_attempt_row(pool: PgPool) {
     assert_eq!(second.attempt_number, 2);
     assert_eq!(
         tx.mark_task_succeeded(&first).await.unwrap(),
-        ApplyResult::Stale
+        TransitionResult::Stale
     );
     tx.commit().await.unwrap();
 
@@ -317,7 +318,7 @@ async fn exhausted_stale_activity_fails_and_wakes_workflow(pool: PgPool) {
     let workflow_task = tx.claim_task(&queue_name).await.unwrap().unwrap();
     assert_eq!(
         tx.mark_task_waiting(&workflow_task).await.unwrap(),
-        ApplyResult::Applied
+        TransitionResult::Applied
     );
     tx.record_activity_call(
         &queue_name,
