@@ -1,0 +1,43 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                select last_heartbeat_at as \"last_heartbeat_at: i64\",\n                       state as \"state: TaskState\"\n                from underway.task\n                where id = $1\n                  and task_queue_name = $2\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "last_heartbeat_at: i64",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 1,
+        "name": "state: TaskState",
+        "type_info": {
+          "Custom": {
+            "name": "underway.task_state",
+            "kind": {
+              "Enum": [
+                "pending",
+                "in_progress",
+                "waiting",
+                "succeeded",
+                "cancelled",
+                "failed"
+              ]
+            }
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      true,
+      false
+    ]
+  },
+  "hash": "660c3fbacd342d637a6de79fbb2736bff695fe2048d971b07a1386505e301ce0"
+}

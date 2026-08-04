@@ -1352,18 +1352,13 @@ mod tests {
         let worker = Worker::new(queue.clone(), SleepTask);
         let worker_handle = tokio::spawn(async move { worker.run_every(1.second()).await });
 
-        // Ensure the worker has time to dequeue the task
-        tokio::time::sleep(StdDuration::from_secs(1)).await;
-
-        // Monitor last_heartbeat_at during task execution
-        let mut last_heartbeat_at = None;
+        // Wait for the worker to actually pick the task up. Sleeping a fixed
+        // amount here races with dequeue under load.
         let start_time = Instant::now();
-
-        while start_time.elapsed() < StdDuration::from_secs(6) {
-            // Fetch last_heartbeat_at from the database
-            let task_row = sqlx::query!(
+        loop {
+            let state = sqlx::query_scalar!(
                 r#"
-                select last_heartbeat_at as "last_heartbeat_at: i64"
+                select state as "state: TaskState"
                 from underway.task
                 where id = $1
                   and task_queue_name = $2
@@ -1374,19 +1369,71 @@ mod tests {
             .fetch_one(&pool)
             .await?;
 
+            if state == TaskState::InProgress {
+                break;
+            }
+
+            assert!(
+                start_time.elapsed() < StdDuration::from_secs(30),
+                "worker never dequeued the task"
+            );
+            tokio::time::sleep(StdDuration::from_millis(100)).await;
+        }
+
+        // Monitor last_heartbeat_at while the task is still executing.
+        //
+        // Polling happens faster than the heartbeat period, so consecutive reads
+        // may well land inside the same heartbeat window. Only require that
+        // heartbeats never move backwards, then assert that they advanced over
+        // the execution as a whole.
+        let mut first_heartbeat_at = None;
+        let mut last_heartbeat_at = None;
+        let start_time = Instant::now();
+
+        while start_time.elapsed() < StdDuration::from_secs(30) {
+            // Fetch last_heartbeat_at from the database
+            let task_row = sqlx::query!(
+                r#"
+                select last_heartbeat_at as "last_heartbeat_at: i64",
+                       state as "state: TaskState"
+                from underway.task
+                where id = $1
+                  and task_queue_name = $2
+                "#,
+                task_id as TaskId,
+                queue.name
+            )
+            .fetch_one(&pool)
+            .await?;
+
+            // Once the task stops running the heartbeat stops advancing by
+            // design, so there is nothing further to observe.
+            if task_row.state != TaskState::InProgress {
+                break;
+            }
+
             let current_heartbeat = task_row
                 .last_heartbeat_at
                 .expect("A heartbeat should be set");
 
             if let Some(prev_heartbeat) = last_heartbeat_at {
-                // Ensure last_heartbeat_at is being updated
-                assert!(current_heartbeat > prev_heartbeat);
+                // Ensure last_heartbeat_at is never rolled back
+                assert!(current_heartbeat >= prev_heartbeat);
             }
+            first_heartbeat_at.get_or_insert(current_heartbeat);
             last_heartbeat_at = Some(current_heartbeat);
 
             // Sleep before the next check
-            tokio::time::sleep(StdDuration::from_secs(1)).await;
+            tokio::time::sleep(StdDuration::from_millis(500)).await;
         }
+
+        // Ensure last_heartbeat_at was actually being updated as the task ran
+        let first_heartbeat_at = first_heartbeat_at.expect("A heartbeat should have been observed");
+        let last_heartbeat_at = last_heartbeat_at.expect("A heartbeat should have been observed");
+        assert!(
+            last_heartbeat_at > first_heartbeat_at,
+            "heartbeat did not advance while the task was executing"
+        );
 
         // Wait for the task to complete
         worker_handle.abort(); // Ensure the worker task is stopped
