@@ -519,14 +519,18 @@ impl Iterator for ZonedScheduleIterator<'_> {
     }
 }
 
+/// Zoned schedule errors.
 #[derive(Debug, thiserror::Error)]
 pub enum ZonedScheduleError {
+    /// Error returned by the `jiff` crate.
     #[error(transparent)]
     Jiff(#[from] jiff::Error),
 
+    /// Error returned by the `jiff-cron` crate.
     #[error(transparent)]
     Cron(#[from] jiff_cron::error::Error),
 
+    /// Error returned when a time zone or cron expression cannot be parsed.
     #[error("Parsing error: {0}")]
     Parse(String),
 }
