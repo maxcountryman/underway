@@ -14,9 +14,10 @@ jiff-cron = "0.1.0"
 jiff = { version = "0.1.13", features = ["serde"] }
 serde = "1.0.210"
 serde_json = "1.0.128"
-sqlx = { version = "0.8.2", features = [
+sqlx = { version = "0.9.0", features = [
   "postgres",
-  "runtime-tokio-rustls",
+  "runtime-tokio",
+  "tls-rustls-ring",
   "uuid",
   "json",
 ] }
