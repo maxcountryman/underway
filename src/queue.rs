@@ -1874,10 +1874,10 @@ async fn try_acquire_advisory_xact_lock(
 }
 
 #[instrument(skip(conn, lock), err)]
-pub(crate) async fn try_acquire_advisory_lock<'lock, C>(
+pub(crate) async fn try_acquire_advisory_lock<C>(
     conn: C,
-    lock: &'lock PgAdvisoryLock,
-) -> Result<Option<PgAdvisoryLockGuard<'lock, C>>>
+    lock: &PgAdvisoryLock,
+) -> Result<Option<PgAdvisoryLockGuard<C>>>
 where
     C: AsMut<PgConnection>,
 {

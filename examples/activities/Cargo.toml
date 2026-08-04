@@ -6,6 +6,6 @@ publish = false
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-sqlx = { version = "0.8.2", features = ["postgres", "runtime-tokio-rustls"] }
+sqlx = { version = "0.9.0", features = ["postgres", "runtime-tokio", "tls-rustls-ring"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
 underway = { path = "../.." }

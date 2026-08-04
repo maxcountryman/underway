@@ -1,5 +1,8 @@
 # Unreleased
 
+- Breaking: Upgrade `sqlx` from 0.8 to 0.9; consumers must upgrade their own `sqlx`
+  dependency in lockstep, since `PgPool` and friends are part of the public API. The
+  `runtime-tokio-rustls` feature is replaced by `runtime-tokio` plus `tls-rustls-ring`
 - Breaking: Remove `workflow::Context::tx`; step contexts no longer expose a worker transaction directly
 - Breaking: Workflow activities are now registered on `Workflow::builder()` before steps
 - Breaking: Remove manual activity keys; operation identity is now derived from workflow run ID, step index, and per-step operation order
