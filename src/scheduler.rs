@@ -519,14 +519,18 @@ impl Iterator for ZonedScheduleIterator<'_> {
     }
 }
 
+/// Zoned schedule errors.
 #[derive(Debug, thiserror::Error)]
 pub enum ZonedScheduleError {
+    /// Error returned by the `jiff` crate.
     #[error(transparent)]
     Jiff(#[from] jiff::Error),
 
+    /// Error returned by the `jiff-cron` crate.
     #[error(transparent)]
     Cron(#[from] jiff_cron::error::Error),
 
+    /// Error returned when a time zone or cron expression cannot be parsed.
     #[error("Parsing error: {0}")]
     Parse(String),
 }
@@ -634,12 +638,19 @@ mod tests {
         tokio::time::advance(StdDuration::from_secs(5)).await;
 
         handle.await.expect("Failed to run wait_until");
-        let elapsed: StdDuration = (&Zoned::now().with_time_zone(tz.to_owned()) - &next)
-            .try_into()
-            .unwrap();
+
+        // The important property is that it did not return early.
+        let now = Zoned::now().with_time_zone(tz.to_owned());
+        assert!(now >= next, "Returned before the target time");
+
+        // `wait_until` polls the wall clock, which tokio's paused timer does not
+        // advance, so it re-sleeps until real time catches up. How closely it
+        // lands past the target is down to scheduling, and a tight bound here
+        // just makes the test flaky on a loaded machine.
+        let elapsed: StdDuration = (&now - &next).try_into().unwrap();
         assert!(
-            elapsed < StdDuration::from_millis(10),
-            "Expected precise completion"
+            elapsed < StdDuration::from_secs(1),
+            "Expected completion near the target time, overshot by {elapsed:?}"
         );
     }
 

@@ -1,0 +1,37 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                select count(*)\n                from underway.task\n                where state = $1\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        {
+          "Custom": {
+            "name": "underway.task_state",
+            "kind": {
+              "Enum": [
+                "pending",
+                "in_progress",
+                "waiting",
+                "succeeded",
+                "cancelled",
+                "failed"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "6430ead27c298d892ff712bf3de1299232bc49637e1af532508a3ce8909b6cab"
+}

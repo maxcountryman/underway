@@ -2054,8 +2054,25 @@ mod tests {
 
         let runtime_handle = workflow.runtime().start();
 
-        // Give the workflow a moment to process.
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        // Wait for the step to run. A fixed delay races with the worker under
+        // load.
+        let start_time = std::time::Instant::now();
+        loop {
+            let current = state
+                .data
+                .lock()
+                .expect("Mutex should not be poisoned")
+                .clone();
+            if current == "bar" {
+                break;
+            }
+
+            assert!(
+                start_time.elapsed() < std::time::Duration::from_secs(30),
+                "workflow step did not run, state is still {current:?}"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
 
         assert_eq!(
             *state.data.lock().expect("Mutex should not be poisoned"),

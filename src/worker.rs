@@ -1257,38 +1257,76 @@ mod tests {
             .build()
             .await?;
 
-        // Start workers before queuing tasks
+        // Start workers before queuing tasks. Polling frequently means the test
+        // does not depend on the workers having subscribed to task changes
+        // before the tasks are enqueued.
         let queue = Arc::new(queue);
         let worker = Worker::new(queue.clone(), LongRunningTask);
         for _ in 0..2 {
             let worker = worker.clone();
-            tokio::spawn(async move { worker.run().await });
+            tokio::spawn(async move { worker.run_every(100.milliseconds()).await });
         }
 
-        // Wait briefly to ensure workers are listening
-        tokio::time::sleep(StdDuration::from_secs(1)).await;
-
-        // Enqueue some tasks now that the worker is listening
+        // Enqueue some tasks
         for _ in 0..5 {
             queue.enqueue(&pool, &LongRunningTask, &()).await?;
+        }
+
+        // A graceful shutdown only drains tasks a worker already picked up, so
+        // wait until nothing is pending before asking the workers to stop.
+        // Otherwise the shutdown notification races the dequeues and tasks that
+        // were never started are counted as missing.
+        let start_time = Instant::now();
+        loop {
+            let pending = sqlx::query_scalar!(
+                r#"
+                select count(*)
+                from underway.task
+                where state = $1
+                "#,
+                TaskState::Pending as _
+            )
+            .fetch_one(&pool)
+            .await?;
+
+            if pending == Some(0) {
+                break;
+            }
+
+            assert!(
+                start_time.elapsed() < StdDuration::from_secs(30),
+                "workers never dequeued every task, still pending: {pending:?}"
+            );
+            tokio::time::sleep(StdDuration::from_millis(50)).await;
         }
 
         // Initiate graceful shutdown
         graceful_shutdown(&pool).await?;
 
-        // Wait for tasks to be done
-        tokio::time::sleep(StdDuration::from_secs(2)).await;
+        // Wait for the in-flight tasks to drain
+        let start_time = Instant::now();
+        let succeeded = loop {
+            let succeeded = sqlx::query_scalar!(
+                r#"
+                select count(*)
+                from underway.task
+                where state = $1
+                "#,
+                TaskState::Succeeded as _
+            )
+            .fetch_one(&pool)
+            .await?;
 
-        let succeeded = sqlx::query_scalar!(
-            r#"
-            select count(*)
-            from underway.task
-            where state = $1
-            "#,
-            TaskState::Succeeded as _
-        )
-        .fetch_one(&pool)
-        .await?;
+            if succeeded == Some(5) {
+                break succeeded;
+            }
+
+            assert!(
+                start_time.elapsed() < StdDuration::from_secs(30),
+                "in-flight tasks did not finish after shutdown, succeeded: {succeeded:?}"
+            );
+            tokio::time::sleep(StdDuration::from_millis(50)).await;
+        };
         assert_eq!(succeeded, Some(5));
 
         // New tasks shouldn't be processed

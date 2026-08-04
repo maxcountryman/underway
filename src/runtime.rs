@@ -365,7 +365,9 @@ mod tests {
 
         let handle = runtime.start();
 
-        timeout(Duration::from_secs(10), async {
+        // Guards against a hang rather than measuring how quick this is. Ten
+        // seconds trips when the whole suite is competing for the pool.
+        timeout(Duration::from_secs(60), async {
             loop {
                 if outputs.lock().await.len() == 1 {
                     break;
@@ -604,7 +606,9 @@ mod tests {
         let runtime = workflow.runtime();
         let handle = runtime.start();
 
-        timeout(Duration::from_secs(10), async {
+        // Guards against a hang rather than measuring how quick this is. Ten
+        // seconds trips when the whole suite is competing for the pool.
+        timeout(Duration::from_secs(60), async {
             loop {
                 if outputs.lock().await.len() == 1 {
                     break;
