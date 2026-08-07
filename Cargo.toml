@@ -26,7 +26,7 @@ tokio = { version = "1.40.0", features = [
   "full",
 ] } # TODO: "full" shouldn't be required
 tracing = { version = "0.1.40", features = ["log"] }
-ulid = { version = "1.1.3", features = ["uuid"] }
+ulid = { version = "3.0.0", features = ["uuid"] }
 uuid = { version = "1.10.0", features = ["v4", "serde"] }
 num_cpus = "1.16.0"
 tokio-util = "0.7.12"
