@@ -15,7 +15,7 @@ jobs:
     env:
       SQLX_OFFLINE: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: |
           rustup toolchain install nightly --profile minimal --component rustfmt --component clippy
       - uses: Swatinem/rust-cache@v2
@@ -31,7 +31,7 @@ jobs:
     env:
       SQLX_OFFLINE: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: |
           rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@v2
@@ -47,7 +47,7 @@ jobs:
     env:
       SQLX_OFFLINE: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: |
           rustup toolchain install nightly --profile minimal
       - uses: Swatinem/rust-cache@v2
@@ -76,7 +76,7 @@ jobs:
     env:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/underway
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: |
           rustup toolchain install nightly --profile minimal
           cargo install sqlx-cli --no-default-features --features native-tls,postgres
