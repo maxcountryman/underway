@@ -10,7 +10,7 @@ repository = "https://github.com/maxcountryman/underway"
 documentation = "https://docs.rs/underway"
 
 [dependencies]
-jiff-cron = "0.1.0"
+jiff-cron = "0.3.0"
 jiff = { version = "0.1.13", features = ["serde"] }
 serde = "1.0.210"
 serde_json = "1.0.128"
