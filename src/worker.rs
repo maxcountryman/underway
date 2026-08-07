@@ -134,7 +134,7 @@ use sqlx::{
 };
 use tokio::{sync::Semaphore, task::JoinSet};
 use tokio_util::sync::CancellationToken;
-use tracing::instrument;
+use tracing::{instrument, Instrument as _};
 
 use crate::{
     queue::{
@@ -798,14 +798,6 @@ impl<T: Task + Sync> Worker<T> {
     /// # });
     /// # }
     /// ```
-    #[instrument(
-        skip(self),
-        fields(
-            queue.name = self.queue.name,
-            task.id = tracing::field::Empty,
-        ),
-        err
-    )]
     pub async fn process_next_task(&self) -> Result<Option<TaskId>> {
         let mut conn = self.queue.pool.acquire().await?;
 
@@ -814,78 +806,90 @@ impl<T: Task + Sync> Worker<T> {
         };
 
         let task_id = in_progress_task.id;
-        tracing::Span::current().record("task.id", task_id.as_hyphenated().to_string());
-
-        // Transaction scoped to the task execution.
-        let mut tx = conn.begin().await?;
-
-        // Acquire an advisory lock on either the concurrency key or the task ID.
-        if !in_progress_task.try_acquire_lock(&mut tx).await? {
-            return Ok(None);
+        let span = tracing::info_span!(
+            "process_next_task",
+            queue.name = self.queue.name,
+            task.id = %task_id.as_hyphenated(),
+        );
+        #[cfg(feature = "otel")]
+        if let Some(span_context) = in_progress_task.meta.span_context.as_ref() {
+            let _ = span_context.set_parent(&span);
         }
 
-        let input: T::Input = serde_json::from_value(in_progress_task.input.clone())?;
+        async {
+            // Transaction scoped to the task execution.
+            let mut tx = conn.begin().await?;
 
-        let timeout = pg_interval_to_span(&in_progress_task.timeout)
-            .try_into()
-            .expect("Task timeout should be compatible with std::time");
+            // Acquire an advisory lock on either the concurrency key or the task ID.
+            if !in_progress_task.try_acquire_lock(&mut tx).await? {
+                return Ok(None);
+            }
 
-        let heartbeat = pg_interval_to_span(&in_progress_task.heartbeat)
-            .try_into()
-            .expect("Task heartbeat should be compatible with std::time");
+            let input: T::Input = serde_json::from_value(in_progress_task.input.clone())?;
 
-        // Spawn a task to send heartbeats alongside task processing.
-        let heartbeat_task = tokio::spawn({
-            let pool = self.queue.pool.clone();
-            let in_progress_task = in_progress_task.clone();
-            async move {
-                let mut heartbeat_interval = tokio::time::interval(heartbeat);
-                heartbeat_interval.tick().await;
-                loop {
-                    tracing::trace!("Recording task heartbeat");
+            let timeout = pg_interval_to_span(&in_progress_task.timeout)
+                .try_into()
+                .expect("Task timeout should be compatible with std::time");
 
-                    // N.B.: Heartbeats are recorded outside of the transaction to ensure
-                    // visibility.
-                    if let Err(err) = in_progress_task.record_heartbeat(&pool).await {
-                        tracing::error!(err = %err, "Failed to record task heartbeat");
-                    };
+            let heartbeat = pg_interval_to_span(&in_progress_task.heartbeat)
+                .try_into()
+                .expect("Task heartbeat should be compatible with std::time");
 
+            // Spawn a task to send heartbeats alongside task processing.
+            let heartbeat_task = tokio::spawn({
+                let pool = self.queue.pool.clone();
+                let in_progress_task = in_progress_task.clone();
+                async move {
+                    let mut heartbeat_interval = tokio::time::interval(heartbeat);
                     heartbeat_interval.tick().await;
-                }
-            }
-        });
+                    loop {
+                        tracing::trace!("Recording task heartbeat");
 
-        // Execute savepoint, available directly to the task execute method.
-        let execute_tx = tx.begin().await?;
+                        // N.B.: Heartbeats are recorded outside of the transaction to ensure
+                        // visibility.
+                        if let Err(err) = in_progress_task.record_heartbeat(&pool).await {
+                            tracing::error!(err = %err, "Failed to record task heartbeat");
+                        };
 
-        tokio::select! {
-            result = self.task.execute(execute_tx, input) => {
-                match result {
-                    Ok(_) => {
-                        in_progress_task.mark_succeeded(&mut tx).await?;
-                    }
-
-                    Err(ref error) => {
-                        let retry_policy = &in_progress_task.retry_policy;
-                        self.handle_task_error(&mut tx, &in_progress_task, retry_policy, error)
-                            .await?;
+                        heartbeat_interval.tick().await;
                     }
                 }
+            });
+
+            // Execute savepoint, available directly to the task execute method.
+            let execute_tx = tx.begin().await?;
+
+            tokio::select! {
+                result = self.task.execute(execute_tx, input) => {
+                    match result {
+                        Ok(_) => {
+                            in_progress_task.mark_succeeded(&mut tx).await?;
+                        }
+
+                        Err(ref error) => {
+                            let retry_policy = &in_progress_task.retry_policy;
+                            self.handle_task_error(&mut tx, &in_progress_task, retry_policy, error)
+                                .await?;
+                        }
+                    }
+                }
+
+                // Handle timed-out task execution.
+                _ = tokio::time::sleep(timeout) => {
+                    tracing::error!("Task execution timed out");
+                    let retry_policy = &in_progress_task.retry_policy;
+                    self.handle_task_timeout(&mut tx, &in_progress_task, retry_policy, timeout).await?;
+                }
             }
 
-            // Handle timed-out task execution.
-            _ = tokio::time::sleep(timeout) => {
-                tracing::error!("Task execution timed out");
-                let retry_policy = &in_progress_task.retry_policy;
-                self.handle_task_timeout(&mut tx, &in_progress_task, retry_policy, timeout).await?;
-            }
+            heartbeat_task.abort();
+
+            tx.commit().await?;
+
+            Ok(Some(task_id))
         }
-
-        heartbeat_task.abort();
-
-        tx.commit().await?;
-
-        Ok(Some(task_id))
+        .instrument(span)
+        .await
     }
 
     async fn handle_task_error(
